@@ -189,20 +189,31 @@ impl PolarisDevice {
         let arg: PolarisRegisterGpuArg = reader.read()?;
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
-        inner.gpus.push(
-            PolarisGpu {
-                gpu_id: arg.gpu_id,
-                total_bytes: arg.total_bytes,
-                used_bytes: 0,
-                budget_bytes: arg.budget_bytes,
-                pressure_score: 0,
-                cpu_pool_total_bytes: arg.cpu_pool_bytes,
-                cpu_pool_used_bytes: 0,
-            },
-            GFP_KERNEL,
-        )?;
+
+        // Idempotent: if this GPU ID is already registered, update its
+        // parameters instead of creating a duplicate entry.
+        if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id) {
+            gpu.total_bytes = arg.total_bytes;
+            gpu.budget_bytes = arg.budget_bytes;
+            gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+            dev_info!(self.dev, "POLARIS: GPU {} re-registered\n", arg.gpu_id);
+        } else {
+            inner.gpus.push(
+                PolarisGpu {
+                    gpu_id: arg.gpu_id,
+                    total_bytes: arg.total_bytes,
+                    used_bytes: 0,
+                    budget_bytes: arg.budget_bytes,
+                    pressure_score: 0,
+                    cpu_pool_total_bytes: arg.cpu_pool_bytes,
+                    cpu_pool_used_bytes: 0,
+                },
+                GFP_KERNEL,
+            )?;
+            dev_info!(self.dev, "POLARIS: GPU {} registered\n", arg.gpu_id);
+        }
+
         self.registered_gpu.store(1, Relaxed);
-        dev_info!(self.dev, "POLARIS: GPU {} registered\n", arg.gpu_id);
         Ok(0)
     }
 
