@@ -9,7 +9,7 @@
 #   make kernel CC=clang               # build kernel module with clang
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
-CC   ?= clang
+CC   ?= cc
 
 .PHONY: all kernel userspace clean help rust-analyzer
 
