@@ -1,0 +1,43 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Kernel module
+kernel/*.o
+kernel/*.mod
+kernel/*.mod.c
+kernel/*.mod.o
+kernel/*.ko
+kernel/*.cmd
+kernel/.*.cmd
+kernel/.*.d
+kernel/*.order
+kernel/Module.symvers
+kernel/Makefile.generated
+kernel/modules.order
+kernel/tmp_*
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# rust-analyzer generated config (reproducible via make rust-analyzer)
+/rust-project.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Benchmark artifacts
+benchmarks/results/
+*.csv
+*.png
+*.pdf
