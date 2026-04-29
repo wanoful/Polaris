@@ -140,12 +140,16 @@ unsafe extern "C" fn polaris_stats_show(
         }
     }
 
-    let (mut total_gpu, mut used_gpu, mut cpu_total, mut cpu_used) = (0u64, 0u64, 0u64, 0u64);
+    let (mut total_gpu, mut used_gpu, mut cpu_total, mut cpu_used, mut unhealthy_gpus) =
+        (0u64, 0u64, 0u64, 0u64, 0u32);
     for g in &inner.gpus {
         total_gpu += g.total_bytes;
         used_gpu += g.used_bytes;
         cpu_total += g.cpu_pool_total_bytes;
         cpu_used += g.cpu_pool_used_bytes;
+        if !g.healthy {
+            unhealthy_gpus += 1;
+        }
     }
 
     let daemon = inner.daemon_attached;
@@ -171,6 +175,7 @@ blocks:         {blocks}
   evicted:      {evicted}
   pending:      {pending}
 gpus:           {gpus}
+  unhealthy:    {unhealthy}
 daemon:         {daemon}
 gpu_total_mib:  {gpu_total_mib}
 gpu_used_mib:   {gpu_used_mib}
@@ -187,6 +192,7 @@ pending_decs:   {decisions}
                 evicted = evicted,
                 pending = pending,
                 gpus = gpus,
+                unhealthy = unhealthy_gpus,
                 daemon = daemon,
                 gpu_total_mib = total_gpu / (1024 * 1024),
                 gpu_used_mib = used_gpu / (1024 * 1024),
@@ -445,6 +451,7 @@ impl PolarisDevice {
             gpu.total_bytes = arg.total_bytes;
             gpu.budget_bytes = arg.budget_bytes;
             gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+            gpu.healthy = true;
             dev_info!(self.dev, "POLARIS: GPU {} re-registered\n", arg.gpu_id);
         } else {
             inner.gpus.push(
@@ -456,6 +463,7 @@ impl PolarisDevice {
                     pressure_score: 0,
                     cpu_pool_total_bytes: arg.cpu_pool_bytes,
                     cpu_pool_used_bytes: 0,
+                    healthy: true,
                 },
                 GFP_KERNEL,
             )?;
@@ -472,6 +480,14 @@ impl PolarisDevice {
         let mut arg: PolarisSessionCreateArg = reader.read()?;
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
+
+        // G4: reject session creation on an unhealthy GPU.
+        if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == arg.home_gpu) {
+            if !gpu.healthy {
+                dev_err!(self.dev, "POLARIS: GPU {} is unhealthy, rejecting session\n", arg.home_gpu);
+                return Err(ENODEV);
+            }
+        }
 
         let session_id = inner.next_session_id;
         inner.next_session_id += 1;
@@ -562,6 +578,14 @@ impl PolarisDevice {
             ids
         };
         let parent_id = arg.parent_session_id;
+
+        // G4: reject branch if the parent's GPU is unhealthy.
+        if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == parent_gpu) {
+            if !gpu.healthy {
+                dev_err!(self.dev, "POLARIS: GPU {} unhealthy, rejecting SESSION_BRANCH\n", parent_gpu);
+                return Err(ENODEV);
+            }
+        }
         drop(parent);
 
         // COW: increment refcount on all parent blocks.
@@ -615,6 +639,19 @@ impl PolarisDevice {
         let block_id = inner.next_block_id;
         inner.next_block_id += 1;
 
+        // G4: check GPU health for the session's home GPU.
+        if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
+            if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == sess.home_gpu) {
+                if !gpu.healthy {
+                    dev_err!(self.dev, "POLARIS: GPU {} unhealthy, rejecting BLOCK_GROW\n", sess.home_gpu);
+                    return Err(ENODEV);
+                }
+            }
+        }
+
+        let dec_id = inner.next_decision_id;
+        inner.next_decision_id += 1;
+
         let block = PolarisBlock {
             block_id,
             session_id: arg.session_id,
@@ -631,10 +668,10 @@ impl PolarisDevice {
             phase: POLARIS_PHASE_PREFILL,
             last_touch_ns: 0,
             map_time_ns: 0,
+            retry_count: 0,
+            pending_decision_id: dec_id,
         };
 
-        let dec_id = inner.next_decision_id;
-        inner.next_decision_id += 1;
         inner.pending_decisions.push(
             PolarisDecision {
                 decision_id: dec_id,
@@ -771,25 +808,182 @@ impl PolarisDevice {
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
-        if arg.result != 0 {
-            dev_err!(
+        // Find the block tied to this decision by pending_decision_id.
+        let block_idx = match inner
+            .blocks
+            .iter()
+            .position(|b| b.pending_decision_id == arg.decision_id)
+        {
+            Some(idx) => idx,
+            None => {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: COMPLETE_OPERATION for unknown decision_id {}\n",
+                    arg.decision_id
+                );
+                return Ok(0);
+            }
+        };
+
+        // ── Success path ──
+        if arg.result == 0 {
+            let block = &mut inner.blocks[block_idx];
+            block.retry_count = 0;
+            block.pending_decision_id = 0;
+            match block.state {
+                PolarisBlockState::AllocPending => {
+                    block.state = PolarisBlockState::Resident;
+                    block.gpu_phys_handle = arg.output_handle;
+                }
+                PolarisBlockState::OffloadPending => {
+                    block.state = PolarisBlockState::CpuOffloaded;
+                    block.cpu_buf_addr = arg.output_cpu_addr;
+                }
+                PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
+                    block.state = PolarisBlockState::Resident;
+                    block.gpu_phys_handle = arg.output_handle;
+                }
+                PolarisBlockState::FreePending => {
+                    // block was successfully freed by daemon — remove it.
+                    // Defer removal: mark for deletion below.
+                    block.state = PolarisBlockState::Evicted;
+                }
+                _ => {}
+            }
+            // Update GPU used_bytes on successful Alloc/Reload/CowBreak.
+            if arg.output_handle != 0 {
+                let home = block.home_gpu;
+                if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == home) {
+                    gpu.used_bytes += block.size_bytes;
+                }
+            }
+            dev_info!(
                 self.dev,
-                "POLARIS: operation {} failed with {}\n",
+                "POLARIS: operation {} completed (handle=0x{:x})\n",
                 arg.decision_id,
-                arg.result
+                arg.output_handle
             );
             return Ok(0);
         }
 
-        for block in inner.blocks.iter_mut() {
-            if block.state == PolarisBlockState::AllocPending {
-                block.state = PolarisBlockState::Resident;
-                block.gpu_phys_handle = arg.output_handle;
-                break;
+        // ── Error handling contract (G4) ──
+        // Standard Linux errno values (negative i32 from daemon).
+        const E_NOMEM: i32 = -(bindings::ENOMEM as i32);
+        const E_NODEV: i32 = -(bindings::ENODEV as i32);
+        const E_INVAL: i32 = -(bindings::EINVAL as i32);
+        const E_FAULT: i32 = -(bindings::EFAULT as i32);
+
+        // Increment retry counter (borrow dropped before match body).
+        inner.blocks[block_idx].retry_count += 1;
+        let retries = inner.blocks[block_idx].retry_count;
+        let block_id = inner.blocks[block_idx].block_id;
+        let home_gpu = inner.blocks[block_idx].home_gpu;
+
+        match arg.result {
+            E_NOMEM => {
+                dev_warn!(
+                    self.dev,
+                    "POLARIS: ENOMEM on decision {} (block {}, retry {}/{})\n",
+                    arg.decision_id,
+                    block_id,
+                    retries,
+                    POLARIS_MAX_RETRIES,
+                );
+                if retries < POLARIS_MAX_RETRIES {
+                    self.requeue_decision(inner, block_idx);
+                } else {
+                    dev_err!(
+                        self.dev,
+                        "POLARIS: block {} evicted after {} ENOMEM failures\n",
+                        block_id,
+                        POLARIS_MAX_RETRIES,
+                    );
+                    inner.blocks[block_idx].state = PolarisBlockState::Evicted;
+                    inner.blocks[block_idx].pending_decision_id = 0;
+                }
+            }
+            E_NODEV => {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: ENODEV on decision {} — marking GPU {} unhealthy\n",
+                    arg.decision_id,
+                    home_gpu,
+                );
+                if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == home_gpu) {
+                    gpu.healthy = false;
+                }
+                inner.blocks[block_idx].state = PolarisBlockState::Evicted;
+                inner.blocks[block_idx].pending_decision_id = 0;
+            }
+            E_INVAL => {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: EINVAL on decision {} — marking block {} FAILED\n",
+                    arg.decision_id,
+                    block_id,
+                );
+                inner.blocks[block_idx].state = PolarisBlockState::Evicted;
+                inner.blocks[block_idx].pending_decision_id = 0;
+            }
+            E_FAULT => {
+                dev_warn!(
+                    self.dev,
+                    "POLARIS: EFAULT on decision {} (block {}, retry {})\n",
+                    arg.decision_id,
+                    block_id,
+                    retries,
+                );
+                if retries < 2 {
+                    // Policy: retry once.
+                    self.requeue_decision(inner, block_idx);
+                } else {
+                    dev_err!(
+                        self.dev,
+                        "POLARIS: block {} evicted after EFAULT retries\n",
+                        block_id,
+                    );
+                    inner.blocks[block_idx].state = PolarisBlockState::Evicted;
+                    inner.blocks[block_idx].pending_decision_id = 0;
+                }
+            }
+            other => {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: unknown failure {} on decision {} — evicting block {}\n",
+                    other,
+                    arg.decision_id,
+                    block_id,
+                );
+                inner.blocks[block_idx].state = PolarisBlockState::Evicted;
+                inner.blocks[block_idx].pending_decision_id = 0;
             }
         }
-        dev_info!(self.dev, "POLARIS: operation {} completed\n", arg.decision_id);
+
         Ok(0)
+    }
+
+    /// Re-queue an ALLOC decision for a block (G4 retry path).
+    fn requeue_decision(&self, inner: &mut PolarisInner, block_idx: usize) {
+        let block = &mut inner.blocks[block_idx];
+        let dec_id = inner.next_decision_id;
+        inner.next_decision_id += 1;
+        block.pending_decision_id = dec_id;
+
+        let _ = inner.pending_decisions.push(
+            PolarisDecision {
+                decision_id: dec_id,
+                op: PolarisDecisionOp::Alloc as u32,
+                gpu_id: block.home_gpu,
+                block_id: block.block_id,
+                session_id: block.session_id,
+                src_handle: 0,
+                dst_vaddr: 0,
+                size_bytes: block.size_bytes,
+                cpu_addr: 0,
+                _reserved: [0u64; 4],
+            },
+            GFP_KERNEL,
+        );
     }
 
     fn handle_get_global_stats(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {

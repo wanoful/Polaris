@@ -104,10 +104,27 @@ fn execute_decision(
         dec.decision_id, dec.op, dec.block_id, dec.session_id
     );
 
-    // Phase 1b: Replace this stub with real CUDA VMM calls.
-    // For now, we report success with a dummy handle.
-    let result: i32 = 0; // success
-    let output_handle: u64 = dec.block_id.wrapping_mul(0x1000); // dummy phys handle
+    // Set POLARIS_TEST_ERROR=1 to trigger error simulation for testing G4.
+    let test_err: i32 = std::env::var("POLARIS_TEST_ERROR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let (result, output_handle) = if test_err != 0 {
+        // Simulate various error codes based on block_id for G4 testing.
+        let err = match dec.block_id % 5 {
+            0 => -(libc::ENOMEM as i32),
+            1 => -(libc::ENODEV as i32),
+            2 => -(libc::EINVAL as i32),
+            3 => -(libc::EFAULT as i32),
+            _ => -(libc::EIO as i32),
+        };
+        eprintln!("polarisd: [TEST] simulating error {} for block {}", err, dec.block_id);
+        (err, 0)
+    } else {
+        // Normal path: success with dummy phys handle.
+        (0, dec.block_id.wrapping_mul(0x1000))
+    };
 
     let complete = PolarisCompleteOperationArg {
         decision_id: dec.decision_id,
@@ -119,6 +136,10 @@ fn execute_decision(
     ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
         .map_err(|e| format!("COMPLETE_OPERATION failed: errno {e}"))?;
 
-    eprintln!("polarisd: decision {} completed (handle=0x{output_handle:x})", dec.decision_id);
+    if result == 0 {
+        eprintln!("polarisd: decision {} completed (handle=0x{output_handle:x})", dec.decision_id);
+    } else {
+        eprintln!("polarisd: decision {} failed with result={}", dec.decision_id, result);
+    }
     Ok(())
 }

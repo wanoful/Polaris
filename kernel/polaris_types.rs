@@ -116,7 +116,17 @@ pub struct PolarisBlock {
     pub phase: u32,
     pub last_touch_ns: u64,
     pub map_time_ns: u64,
+    /// Number of consecutive COMPLETE_OPERATION failures for this block.
+    /// Reset to 0 on success. After MAX_RETRIES (=3) → EVICTED.
+    pub retry_count: u32,
+    /// The decision_id currently in-flight for this block. Set when a
+    /// decision is queued; cleared (set to 0) when the daemon reports
+    /// completion. Used to match COMPLETE_OPERATION results to blocks.
+    pub pending_decision_id: u64,
 }
+
+/// Maximum retries before a block is evicted (G4 contract).
+pub const POLARIS_MAX_RETRIES: u32 = 3;
 
 /// A session represents one LLM inference request.
 #[derive(Debug)]
@@ -141,6 +151,7 @@ pub struct PolarisGpu {
     pub pressure_score: u64,
     pub cpu_pool_total_bytes: u64,
     pub cpu_pool_used_bytes: u64,
+    pub healthy: bool,
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
