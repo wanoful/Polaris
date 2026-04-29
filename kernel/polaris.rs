@@ -16,6 +16,7 @@ mod polaris_types;
 use core::pin::Pin;
 
 use kernel::{
+    bindings,
     c_str,
     device::Device,
     fs::File,
@@ -52,6 +53,150 @@ kernel::sync::global_lock! {
     unsafe(uninit) static POLARIS_STATE: Mutex<Option<PolarisInner>> = None;
 }
 
+// ─── sysfs buffer writer ────────────────────────────────────────────────────
+
+/// Minimal `core::fmt::Write` impl over a fixed u8 buffer, for use in
+/// sysfs show functions where we have a `char *buf` from the kernel.
+struct BufWriter<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> BufWriter<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl core::fmt::Write for BufWriter<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let room = self.buf.len().saturating_sub(1).saturating_sub(self.pos);
+        let n = bytes.len().min(room);
+        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+        self.pos += n;
+        Ok(())
+    }
+}
+
+// ─── sysfs stats show function ──────────────────────────────────────────────
+
+// Null-terminated "stats" as a byte array so the pointer can be used
+// in a static. Using c_str!("stats").as_char_ptr() directly in a static
+// may not work if as_char_ptr is not const fn.
+const STATS_NAME_BYTES: &[u8] = b"stats\0";
+
+// Newtype wrapper so we can safely mark the kobj_attribute as Sync.
+// The attribute is write-once (at module init) then read-only forever;
+// all its fields (function pointers, name pointer) are immutable.
+// `unsafe impl Sync` is the standard kernel-Rust pattern for C structs
+// that are only accessed under the kernel's concurrency guarantees.
+struct PolarisStatsAttr(bindings::kobj_attribute);
+unsafe impl Sync for PolarisStatsAttr {}
+
+static POLARIS_STATS_ATTR: PolarisStatsAttr = PolarisStatsAttr(bindings::kobj_attribute {
+    attr: bindings::attribute {
+        name: STATS_NAME_BYTES.as_ptr() as *const kernel::ffi::c_char,
+        mode: 0o444,
+    },
+    show: Some(polaris_stats_show),
+    store: None,
+});
+
+unsafe extern "C" fn polaris_stats_show(
+    _kobj: *mut bindings::kobject,
+    _attr: *mut bindings::kobj_attribute,
+    buf: *mut kernel::ffi::c_char,
+) -> isize {
+    let guard = POLARIS_STATE.lock();
+    let inner = match guard.as_ref() {
+        Some(i) => i,
+        None => {
+            // Module not fully initialized yet.
+            return 0;
+        }
+    };
+
+    // Count block states.
+    let (mut resident, mut offloaded, mut evicted, mut pending) = (0u32, 0u32, 0u32, 0u32);
+    let (mut shared, mut private) = (0u64, 0u64);
+    for b in &inner.blocks {
+        match b.state {
+            PolarisBlockState::Resident => resident += 1,
+            PolarisBlockState::CpuOffloaded => offloaded += 1,
+            PolarisBlockState::Evicted => evicted += 1,
+            _ => pending += 1,
+        }
+        if b.flags & POLARIS_BLOCK_FLAG_SHARED != 0 {
+            shared += b.size_bytes;
+        } else {
+            private += b.size_bytes;
+        }
+    }
+
+    let (mut total_gpu, mut used_gpu, mut cpu_total, mut cpu_used) = (0u64, 0u64, 0u64, 0u64);
+    for g in &inner.gpus {
+        total_gpu += g.total_bytes;
+        used_gpu += g.used_bytes;
+        cpu_total += g.cpu_pool_total_bytes;
+        cpu_used += g.cpu_pool_used_bytes;
+    }
+
+    let daemon = inner.daemon_attached;
+    let sessions = inner.sessions.len();
+    let blocks = inner.blocks.len();
+    let gpus = inner.gpus.len();
+    let decisions = inner.pending_decisions.len();
+    drop(guard);
+
+    // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
+    // SAFETY: buf points to a valid kernel buffer of at least PAGE_SIZE bytes.
+    let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 4096) };
+    let len = {
+        let mut w = BufWriter::new(buf_slice);
+        let _ = core::fmt::write(
+            &mut w,
+            format_args!(
+                "\
+sessions:       {sessions}
+blocks:         {blocks}
+  resident:     {resident}
+  offloaded:    {offloaded}
+  evicted:      {evicted}
+  pending:      {pending}
+gpus:           {gpus}
+daemon:         {daemon}
+gpu_total_mib:  {gpu_total_mib}
+gpu_used_mib:   {gpu_used_mib}
+cpu_pool_mib:   {cpu_pool_mib}
+cpu_used_mib:   {cpu_used_mib}
+shared_mib:     {shared_mib}
+private_mib:    {private_mib}
+pending_decs:   {decisions}
+",
+                sessions = sessions,
+                blocks = blocks,
+                resident = resident,
+                offloaded = offloaded,
+                evicted = evicted,
+                pending = pending,
+                gpus = gpus,
+                daemon = daemon,
+                gpu_total_mib = total_gpu / (1024 * 1024),
+                gpu_used_mib = used_gpu / (1024 * 1024),
+                cpu_pool_mib = cpu_total / (1024 * 1024),
+                cpu_used_mib = cpu_used / (1024 * 1024),
+                shared_mib = shared / (1024 * 1024),
+                private_mib = private / (1024 * 1024),
+                decisions = decisions,
+            ),
+        );
+        w.pos
+    };
+    buf_slice[len] = 0; // null-terminate
+    len as isize
+}
+
 // ─── Module declaration ─────────────────────────────────────────────────────
 
 module! {
@@ -62,11 +207,53 @@ module! {
     license: "GPL",
 }
 
-#[pin_data]
+/// Create `/sys/kernel/polaris/stats` and return the kobject pointer.
+fn init_polaris_sysfs() -> Result<*mut bindings::kobject> {
+    // SAFETY: kernel_kobj is always valid. This is called only during module init.
+    let polaris_kobj = unsafe {
+        bindings::kobject_create_and_add(
+            c_str!("polaris").as_char_ptr(),
+            bindings::kernel_kobj,
+        )
+    };
+    if polaris_kobj.is_null() {
+        pr_err!("POLARIS: failed to create /sys/kernel/polaris kobject\n");
+        return Err(ENOMEM);
+    }
+
+    // SAFETY: polaris_kobj is valid; POLARIS_STATS_ATTR is a static with
+    // 'static lifetime (matches the kobject's lifetime).
+    let ret = unsafe {
+        bindings::sysfs_create_file_ns(
+            polaris_kobj,
+            &raw const POLARIS_STATS_ATTR.0.attr as *const bindings::attribute,
+            core::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        pr_err!("POLARIS: failed to create sysfs stats attribute (err {ret})\n");
+        // SAFETY: polaris_kobj was just created above.
+        unsafe { bindings::kobject_put(polaris_kobj) };
+        return Err(ENOMEM);
+    }
+
+    pr_info!("POLARIS: /sys/kernel/polaris/stats created\n");
+    Ok(polaris_kobj)
+}
+
+#[pin_data(PinnedDrop)]
 struct PolarisModule {
     #[pin]
     _miscdev: MiscDeviceRegistration<PolarisDevice>,
+    /// sysfs kobject created under /sys/kernel/polaris
+    polaris_kobj: *mut bindings::kobject,
 }
+
+// The raw pointer `polaris_kobj` is only touched during module init/exit
+// (single-threaded, before/after the module is live).  After init it is
+// read-only until exit.
+unsafe impl Send for PolarisModule {}
+unsafe impl Sync for PolarisModule {}
 
 impl kernel::InPlaceModule for PolarisModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
@@ -97,7 +284,30 @@ impl kernel::InPlaceModule for PolarisModule {
 
         try_pin_init!(Self {
             _miscdev <- MiscDeviceRegistration::<PolarisDevice>::register(options),
+            polaris_kobj: init_polaris_sysfs()?,
         })
+    }
+}
+
+#[pinned_drop]
+impl PinnedDrop for PolarisModule {
+    fn drop(self: Pin<&mut Self>) {
+        if !self.polaris_kobj.is_null() {
+            // SAFETY: The kobject was created in init and is valid.
+            // Order matters: remove files → del kobject from sysfs tree
+            // → put reference. kobject_del synchronously waits for all
+            // in-flight readers, so after it returns no one can call
+            // polaris_stats_show anymore.
+            unsafe {
+                bindings::sysfs_remove_file_ns(
+                    self.polaris_kobj,
+                    &raw const POLARIS_STATS_ATTR.0.attr as *const bindings::attribute,
+                    core::ptr::null(),
+                );
+                bindings::kobject_del(self.polaris_kobj);
+                bindings::kobject_put(self.polaris_kobj);
+            }
+        }
     }
 }
 
