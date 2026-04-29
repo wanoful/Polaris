@@ -7,17 +7,9 @@
 //! management decisions to the userspace daemon (polarisd) via an ioctl-based
 //! decision protocol.
 //!
-//! Architecture:
-//!   /dev/polaris  --  miscdevice, ioctl dispatch
-//!     POLARIS_REGISTER_GPU       -- daemon reports GPU capacity
-//!     POLARIS_SESSION_CREATE     -- workload creates a session
-//!     POLARIS_BLOCK_GROW         -- page-fault: request new KV block
-//!     POLARIS_GET_DECISION       -- daemon polls for work
-//!     POLARIS_COMPLETE_OPERATION -- daemon reports completion
-//!     ... (see polaris_types.rs for full list)
-
-// Note: #![no_std] and #![feature(arbitrary_self_types)] are injected
-// by the kernel build system. Do not redeclare them.
+//! All state is global: every open("/dev/polaris") shares the same block table,
+//! session table, GPU registry, and decision queue. This is the fundamental
+//! value of the kernel module — cross-process visibility.
 
 mod polaris_types;
 
@@ -29,13 +21,32 @@ use kernel::{
     fs::File,
     ioctl::_IOC_SIZE,
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
-    new_mutex,
     prelude::*,
-    sync::{aref::ARef, Mutex},
+    sync::aref::ARef,
     uaccess::UserSlice,
 };
 
 use polaris_types::*;
+
+// ─── Global shared state ────────────────────────────────────────────────────
+
+struct PolarisInner {
+    next_block_id: u64,
+    next_session_id: u64,
+    next_decision_id: u64,
+    gpus: KVec<PolarisGpu>,
+    blocks: KVec<PolarisBlock>,
+    sessions: KVec<PolarisSession>,
+    pending_decisions: KVec<PolarisDecision>,
+}
+
+// Global state protected by a kernel mutex.  Wrapped in Option because
+// KVec cannot be const-constructed; the real state is installed at module
+// init time and all handlers unwrap it.
+kernel::sync::global_lock! {
+    // SAFETY: Initialized in module init before any /dev/polaris open.
+    unsafe(uninit) static POLARIS_STATE: Mutex<Option<PolarisInner>> = None;
+}
 
 // ─── Module declaration ─────────────────────────────────────────────────────
 
@@ -57,6 +68,24 @@ impl kernel::InPlaceModule for PolarisModule {
     fn init(_module: &'static ThisModule) -> impl PinInit<Self, Error> {
         pr_info!("POLARIS: initializing kernel module\n");
 
+        // Initialize the C mutex backing the global lock.
+        // SAFETY: Called exactly once at module init, before any use.
+        unsafe { POLARIS_STATE.init() };
+
+        // Install the real shared state.
+        {
+            let mut guard = POLARIS_STATE.lock();
+            *guard = Some(PolarisInner {
+                next_block_id: 1,
+                next_session_id: 1,
+                next_decision_id: 1,
+                gpus: KVec::new(),
+                blocks: KVec::new(),
+                sessions: KVec::new(),
+                pending_decisions: KVec::new(),
+            });
+        }
+
         let options = MiscDeviceOptions {
             name: c_str!("polaris"),
         };
@@ -67,38 +96,10 @@ impl kernel::InPlaceModule for PolarisModule {
     }
 }
 
-// ─── Per-device inner state ─────────────────────────────────────────────────
-
-struct PolarisInner {
-    next_block_id: u64,
-    next_session_id: u64,
-    next_decision_id: u64,
-    gpus: KVec<PolarisGpu>,
-    blocks: KVec<PolarisBlock>,
-    sessions: KVec<PolarisSession>,
-    pending_decisions: KVec<PolarisDecision>,
-}
-
-impl PolarisInner {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            next_block_id: 1,
-            next_session_id: 1,
-            next_decision_id: 1,
-            gpus: KVec::new(),
-            blocks: KVec::new(),
-            sessions: KVec::new(),
-            pending_decisions: KVec::new(),
-        })
-    }
-}
-
-// ─── Device implementation ──────────────────────────────────────────────────
+// ─── Device (per open fd, but all share POLARIS_STATE) ──────────────────────
 
 #[pin_data(PinnedDrop)]
 struct PolarisDevice {
-    #[pin]
-    inner: Mutex<PolarisInner>,
     dev: ARef<Device>,
 }
 
@@ -113,7 +114,6 @@ impl MiscDevice for PolarisDevice {
         KBox::try_pin_init(
             try_pin_init! {
                 PolarisDevice {
-                    inner <- new_mutex!(PolarisInner::new()?),
                     dev: dev,
                 }
             },
@@ -125,6 +125,7 @@ impl MiscDevice for PolarisDevice {
         let user_ptr = UserPtr::from_addr(arg);
         let size = _IOC_SIZE(cmd);
 
+        // All handlers share the same global state via POLARIS_STATE.
         match cmd {
             POLARIS_REGISTER_GPU => me.handle_register_gpu(user_ptr, size),
             POLARIS_SESSION_CREATE => me.handle_session_create(user_ptr, size),
@@ -153,13 +154,14 @@ impl PinnedDrop for PolarisDevice {
     }
 }
 
-// ─── IOCTL handler methods ──────────────────────────────────────────────────
+// ─── IOCTL handler implementations ──────────────────────────────────────────
 
 impl PolarisDevice {
     fn handle_register_gpu(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisRegisterGpuArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
         inner.gpus.push(
             PolarisGpu {
                 gpu_id: arg.gpu_id,
@@ -179,7 +181,8 @@ impl PolarisDevice {
     fn handle_session_create(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisSessionCreateArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
 
         let session_id = inner.next_session_id;
         inner.next_session_id += 1;
@@ -199,6 +202,7 @@ impl PolarisDevice {
         )?;
 
         arg.session_id = session_id;
+        drop(guard); // release lock before writing back to userspace
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
         dev_info!(self.dev, "POLARIS: session {} created\n", session_id);
@@ -208,7 +212,8 @@ impl PolarisDevice {
     fn handle_session_destroy(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisSessionDestroyArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
         let sid = arg.session_id;
         inner.sessions.retain(|s| s.session_id != sid);
         inner.blocks.retain(|b| b.session_id != sid);
@@ -219,7 +224,8 @@ impl PolarisDevice {
     fn handle_session_get_stats(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisSessionGetStatsArg = reader.read()?;
-        let inner = self.inner.lock();
+        let guard = POLARIS_STATE.lock();
+        let inner = guard.as_ref().ok_or(ENODEV)?;
 
         match inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
             Some(session) => {
@@ -230,6 +236,7 @@ impl PolarisDevice {
             }
             None => return Err(ENOENT),
         }
+        drop(guard);
 
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
@@ -239,7 +246,8 @@ impl PolarisDevice {
     fn handle_session_branch(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisSessionBranchArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
 
         // Extract parent info (immutable borrow) before mutating.
         let parent = inner
@@ -258,7 +266,8 @@ impl PolarisDevice {
             }
             ids
         };
-        drop(parent); // end immutable borrow of inner.sessions
+        let parent_id = arg.parent_session_id;
+        drop(parent);
 
         // COW: increment refcount on all parent blocks.
         for &bid in &parent_block_ids {
@@ -279,25 +288,26 @@ impl PolarisDevice {
                 gpu_vas_size: parent_vas_size,
                 gpu_vas_cursor: parent_vas_cursor,
                 beam_width: parent_beam,
-                parent_session_id: arg.parent_session_id,
+                parent_session_id: parent_id,
                 block_ids: parent_block_ids,
             },
             GFP_KERNEL,
         )?;
 
         arg.child_session_id = child_id;
+        drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
-        dev_info!(self.dev, "POLARIS: session {} branched from {}\n", child_id, arg.parent_session_id);
+        dev_info!(self.dev, "POLARIS: session {} branched from {}\n", child_id, parent_id);
         Ok(0)
     }
 
     fn handle_block_grow(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisBlockGrowArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
 
-        // Validate session exists.
         if !inner.sessions.iter().any(|s| s.session_id == arg.session_id) {
             return Err(ENOENT);
         }
@@ -323,7 +333,6 @@ impl PolarisDevice {
             map_time_ns: 0,
         };
 
-        // Queue a decision for the daemon.
         let dec_id = inner.next_decision_id;
         inner.next_decision_id += 1;
         inner.pending_decisions.push(
@@ -343,13 +352,13 @@ impl PolarisDevice {
         )?;
         inner.blocks.push(block, GFP_KERNEL)?;
 
-        // Link block to session.
         if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
             session.block_ids.push(block_id, GFP_KERNEL)?;
         }
 
         arg.block_id = block_id;
         arg.ret_code = 0;
+        drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
         dev_info!(self.dev, "POLARIS: block {} allocated for session {}\n", block_id, arg.session_id);
@@ -359,7 +368,8 @@ impl PolarisDevice {
     fn handle_block_free(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisBlockFreeArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
         inner.blocks.retain(|b| {
             !(b.session_id == arg.session_id && b.token_start == arg.token_start)
         });
@@ -369,15 +379,16 @@ impl PolarisDevice {
     fn handle_block_touch(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisBlockTouchArg = reader.read()?;
-        let mut inner = self.inner.lock();
-        // TODO: use ktime_get_ns()
-        let now_ns: u64 = 0;
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+        // TODO: use ktime_get_ns() for real timestamp
+        let now: u64 = 0;
         for block in inner.blocks.iter_mut() {
             if block.session_id == arg.session_id {
                 let start = block.token_start as u64;
                 let end = start + block.token_count as u64;
                 if start >= arg.token_start && end <= arg.token_start + arg.token_count {
-                    block.last_touch_ns = now_ns;
+                    block.last_touch_ns = now;
                 }
             }
         }
@@ -387,7 +398,8 @@ impl PolarisDevice {
     fn handle_block_get_state(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisBlockGetStateArg = reader.read()?;
-        let inner = self.inner.lock();
+        let guard = POLARIS_STATE.lock();
+        let inner = guard.as_ref().ok_or(ENODEV)?;
 
         match inner
             .blocks
@@ -402,6 +414,7 @@ impl PolarisDevice {
             }
             None => return Err(ENOENT),
         }
+        drop(guard);
 
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
@@ -411,18 +424,16 @@ impl PolarisDevice {
     fn handle_get_decision(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisGetDecisionArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
 
         let count = core::cmp::min(inner.pending_decisions.len(), POLARIS_MAX_DECISIONS_PER_POLL);
         arg.count = count as u32;
 
-        // Copy decisions into the output struct, then clear consumed ones.
         for i in 0..count {
             arg.decisions[i] = inner.pending_decisions[i];
         }
-        // Remove consumed decisions.
         if count < inner.pending_decisions.len() {
-            // Shift remaining decisions to front.
             let remaining = inner.pending_decisions.len() - count;
             for i in 0..remaining {
                 inner.pending_decisions[i] = inner.pending_decisions[count + i];
@@ -432,14 +443,14 @@ impl PolarisDevice {
             inner.pending_decisions.clear();
         }
 
-        // Mark blocks that had decisions dispatched.
         for i in 0..count {
             let block_id = arg.decisions[i].block_id;
             if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
-                block.last_touch_ns = 0; // mark as dispatched
+                block.last_touch_ns = 0;
             }
         }
 
+        drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
         Ok(0)
@@ -448,7 +459,8 @@ impl PolarisDevice {
     fn handle_complete_operation(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisCompleteOperationArg = reader.read()?;
-        let mut inner = self.inner.lock();
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
 
         if arg.result != 0 {
             dev_err!(
@@ -460,7 +472,6 @@ impl PolarisDevice {
             return Ok(0);
         }
 
-        // Transition any AllocPending block to Resident with the returned handle.
         for block in inner.blocks.iter_mut() {
             if block.state == PolarisBlockState::AllocPending {
                 block.state = PolarisBlockState::Resident;
@@ -475,7 +486,8 @@ impl PolarisDevice {
     fn handle_get_global_stats(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisGetGlobalStatsArg = reader.read()?;
-        let inner = self.inner.lock();
+        let guard = POLARIS_STATE.lock();
+        let inner = guard.as_ref().ok_or(ENODEV)?;
 
         arg.total_gpus = inner.gpus.len() as u32;
         arg.total_sessions = inner.sessions.len() as u32;
@@ -510,6 +522,7 @@ impl PolarisDevice {
             cpu_total += gpu.cpu_pool_total_bytes;
             cpu_used += gpu.cpu_pool_used_bytes;
         }
+        drop(guard);
 
         arg.blocks_resident = resident;
         arg.blocks_offloaded = offloaded;
