@@ -12,7 +12,6 @@ set -euo pipefail
 # Resolve kernel directory
 KDIR="${KDIR:-}"
 for candidate in \
-    "/home/wano/workspace/os/WSL2-Linux-Kernel" \
     "/lib/modules/$(uname -r)/build" \
     "/lib/modules/$(uname -r)/source"; do
     if [ -f "$candidate/Kbuild" ] || [ -f "$candidate/Makefile" ]; then

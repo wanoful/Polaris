@@ -27,6 +27,9 @@ kernel/tmp_*
 # rust-analyzer generated config (reproducible via make rust-analyzer)
 /rust-project.json
 
+# rust-toolchain generated config (reproducible via make rust-toolchain)
+/rust-toolchain.toml
+
 # OS
 .DS_Store
 Thumbs.db

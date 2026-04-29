@@ -11,7 +11,7 @@
 KDIR ?= /lib/modules/$(shell uname -r)/build
 CC   ?= cc
 
-.PHONY: all kernel userspace clean help rust-analyzer
+.PHONY: all kernel userspace clean help rust-analyzer rust-toolchain
 
 help:
 	@echo "POLARIS Build System"
@@ -22,6 +22,7 @@ help:
 	@echo "  make all              Build everything"
 	@echo "  make clean            Clean all build artifacts"
 	@echo "  make rust-analyzer    Generate rust-project.json for IDE support"
+	@echo "  make rust-toolchain   Generate rust-toolchain.toml from kernel config"
 	@echo ""
 	@echo "Variables:"
 	@echo "  KDIR=<path>           Kernel source/build tree (default: /lib/modules/\$$(uname -r)/build)"
@@ -41,3 +42,6 @@ clean:
 
 rust-analyzer:
 	@bash ./benchmarks/scripts/gen-rust-project.sh
+
+rust-toolchain:
+	@bash ./benchmarks/scripts/gen-rust-toolchain.sh $(KDIR)
