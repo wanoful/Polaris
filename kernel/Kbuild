@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# POLARIS kernel module Kbuild
+#
+# The module is written in Rust using the Rust-for-Linux framework.
+# The main source is polaris.rs, which includes submodules via `mod` declarations.
+
+obj-m := polaris.o
