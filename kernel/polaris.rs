@@ -37,6 +37,7 @@ struct PolarisInner {
     next_block_id: u64,
     next_session_id: u64,
     next_decision_id: u64,
+    daemon_attached: u32,
     gpus: KVec<PolarisGpu>,
     blocks: KVec<PolarisBlock>,
     sessions: KVec<PolarisSession>,
@@ -82,6 +83,7 @@ impl kernel::InPlaceModule for PolarisModule {
                 next_block_id: 1,
                 next_session_id: 1,
                 next_decision_id: 1,
+                daemon_attached: 0,
                 gpus: KVec::new(),
                 blocks: KVec::new(),
                 sessions: KVec::new(),
@@ -153,15 +155,14 @@ impl MiscDevice for PolarisDevice {
     }
 }
 
-#[pinned_drop]
+    #[pinned_drop]
 impl PinnedDrop for PolarisDevice {
     fn drop(self: Pin<&mut Self>) {
         if self.registered_gpu.load(Relaxed) != 0 {
-            // Daemon fd closed — evict all pending blocks and clear the
-            // decision queue so workloads don't wait forever.
             dev_info!(self.dev, "POLARIS: daemon disconnected, evicting pending blocks\n");
             let mut guard = POLARIS_STATE.lock();
             if let Some(inner) = guard.as_mut() {
+                inner.daemon_attached = inner.daemon_attached.saturating_sub(1);
                 for block in inner.blocks.iter_mut() {
                     match block.state {
                         PolarisBlockState::AllocPending
@@ -214,6 +215,7 @@ impl PolarisDevice {
         }
 
         self.registered_gpu.store(1, Relaxed);
+        inner.daemon_attached += 1;
         Ok(0)
     }
 
@@ -353,6 +355,11 @@ impl PolarisDevice {
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
+        // Gate: refuse allocation when no daemon is attached.
+        if inner.daemon_attached == 0 {
+            return Err(ENODEV);
+        }
+
         if !inner.sessions.iter().any(|s| s.session_id == arg.session_id) {
             return Err(ENOENT);
         }
@@ -471,6 +478,15 @@ impl PolarisDevice {
         let mut arg: PolarisGetDecisionArg = reader.read()?;
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
+
+        // Gate: return empty list when no daemon is attached.
+        if inner.daemon_attached == 0 {
+            arg.count = 0;
+            drop(guard);
+            let mut writer = UserSlice::new(user_ptr, size).writer();
+            writer.write(&arg)?;
+            return Ok(0);
+        }
 
         let count = core::cmp::min(inner.pending_decisions.len(), POLARIS_MAX_DECISIONS_PER_POLL);
         arg.count = count as u32;
