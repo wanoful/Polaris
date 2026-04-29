@@ -1,0 +1,8 @@
+[package]
+name = "libpolaris"
+version = "0.1.0"
+edition = "2021"
+description = "POLARIS userspace bindings — ioctl definitions and client library"
+
+[dependencies]
+libc = "0.2"

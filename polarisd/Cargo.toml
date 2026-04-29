@@ -1,0 +1,13 @@
+[package]
+name = "polarisd"
+version = "0.1.0"
+edition = "2021"
+description = "POLARIS userspace daemon — executes CUDA VMM operations per kernel decisions"
+
+[[bin]]
+name = "polarisd"
+path = "src/main.rs"
+
+[dependencies]
+libpolaris = { path = "../libpolaris" }
+libc = "0.2"
