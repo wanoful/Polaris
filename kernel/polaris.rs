@@ -53,6 +53,12 @@ kernel::sync::global_lock! {
     unsafe(uninit) static POLARIS_STATE: Mutex<Option<PolarisInner>> = None;
 }
 
+// Set to 1 when the module begins its exit path.  Used by PolarisDevice's
+// PinnedDrop to skip module_put during forced unload (rmmod -f) — the
+// kernel has already zeroed the refcount, so calling module_put again
+// would trigger BUG().
+static MODULE_EXITING: Atomic<u32> = Atomic::new(0);
+
 // ─── sysfs buffer writer ────────────────────────────────────────────────────
 
 /// Minimal `core::fmt::Write` impl over a fixed u8 buffer, for use in
@@ -292,6 +298,11 @@ impl kernel::InPlaceModule for PolarisModule {
 #[pinned_drop]
 impl PinnedDrop for PolarisModule {
     fn drop(self: Pin<&mut Self>) {
+        // Mark that we're in the module exit path.  PolarisDevice drops
+        // that run as a side-effect of _miscdev being dropped during
+        // forced unload (rmmod -f) will see this and skip module_put.
+        MODULE_EXITING.store(1, Relaxed);
+
         if !self.polaris_kobj.is_null() {
             // SAFETY: The kobject was created in init and is valid.
             // Order matters: remove files → del kobject from sysfs tree
@@ -328,7 +339,7 @@ impl MiscDevice for PolarisDevice {
         let dev = ARef::from(misc.device());
         dev_info!(dev, "POLARIS: device opened\n");
 
-        KBox::try_pin_init(
+        let ptr = KBox::try_pin_init(
             try_pin_init! {
                 PolarisDevice {
                     dev: dev,
@@ -336,7 +347,21 @@ impl MiscDevice for PolarisDevice {
                 }
             },
             GFP_KERNEL,
-        )
+        )?;
+
+        // Keep the module loaded while this fd is open.  The kernel Rust
+        // miscdevice vtable cannot yet set fops->owner = THIS_MODULE (the
+        // const-eval limitation documented in gen_disk.rs), so we do it
+        // by hand.
+        // SAFETY: __this_module is valid for our lifetime; we are inside
+        // the module's own open handler, so the module is definitely live.
+        unsafe {
+            bindings::__module_get(
+                core::ptr::addr_of!(bindings::__this_module) as *mut bindings::module,
+            );
+        }
+
+        Ok(ptr)
     }
 
     fn ioctl(me: Pin<&PolarisDevice>, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
@@ -389,6 +414,19 @@ impl PinnedDrop for PolarisDevice {
             }
         }
         dev_info!(self.dev, "POLARIS: device closed\n");
+
+        // Release the module reference taken in open().  Skip during
+        // force-unload (MODULE_EXITING is set before _miscdev is dropped
+        // and triggers this path) — the kernel already zeroed the refcount
+        // and calling module_put would BUG().
+        if MODULE_EXITING.load(Relaxed) == 0 {
+            // SAFETY: __this_module is valid; we took a reference in open().
+            unsafe {
+                bindings::module_put(
+                    core::ptr::addr_of!(bindings::__this_module) as *mut bindings::module,
+                );
+            }
+        }
     }
 }
 
