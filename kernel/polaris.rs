@@ -22,7 +22,10 @@ use kernel::{
     ioctl::_IOC_SIZE,
     miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration},
     prelude::*,
-    sync::aref::ARef,
+    sync::{
+        aref::ARef,
+        atomic::{Atomic, Relaxed},
+    },
     uaccess::UserSlice,
 };
 
@@ -101,6 +104,8 @@ impl kernel::InPlaceModule for PolarisModule {
 #[pin_data(PinnedDrop)]
 struct PolarisDevice {
     dev: ARef<Device>,
+    /// Whether this fd registered a GPU (belongs to the daemon).
+    registered_gpu: Atomic<u32>,
 }
 
 #[vtable]
@@ -115,6 +120,7 @@ impl MiscDevice for PolarisDevice {
             try_pin_init! {
                 PolarisDevice {
                     dev: dev,
+                    registered_gpu: Atomic::new(0),
                 }
             },
             GFP_KERNEL,
@@ -150,6 +156,27 @@ impl MiscDevice for PolarisDevice {
 #[pinned_drop]
 impl PinnedDrop for PolarisDevice {
     fn drop(self: Pin<&mut Self>) {
+        if self.registered_gpu.load(Relaxed) != 0 {
+            // Daemon fd closed — evict all pending blocks and clear the
+            // decision queue so workloads don't wait forever.
+            dev_info!(self.dev, "POLARIS: daemon disconnected, evicting pending blocks\n");
+            let mut guard = POLARIS_STATE.lock();
+            if let Some(inner) = guard.as_mut() {
+                for block in inner.blocks.iter_mut() {
+                    match block.state {
+                        PolarisBlockState::AllocPending
+                        | PolarisBlockState::OffloadPending
+                        | PolarisBlockState::ReloadPending
+                        | PolarisBlockState::CowPending
+                        | PolarisBlockState::FreePending => {
+                            block.state = PolarisBlockState::Evicted;
+                        }
+                        _ => {}
+                    }
+                }
+                inner.pending_decisions.clear();
+            }
+        }
         dev_info!(self.dev, "POLARIS: device closed\n");
     }
 }
@@ -174,6 +201,7 @@ impl PolarisDevice {
             },
             GFP_KERNEL,
         )?;
+        self.registered_gpu.store(1, Relaxed);
         dev_info!(self.dev, "POLARIS: GPU {} registered\n", arg.gpu_id);
         Ok(0)
     }
@@ -215,6 +243,12 @@ impl PolarisDevice {
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
         let sid = arg.session_id;
+
+        // Check session exists before trying to remove.
+        if !inner.sessions.iter().any(|s| s.session_id == sid) {
+            return Err(ENOENT);
+        }
+
         inner.sessions.retain(|s| s.session_id != sid);
         inner.blocks.retain(|b| b.session_id != sid);
         dev_info!(self.dev, "POLARIS: session {} destroyed\n", sid);
