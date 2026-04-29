@@ -1,0 +1,21 @@
+{
+    // POLARIS uses both a Cargo workspace (for userspace tools) and
+    // a rust-project.json (for the kernel module). List both explicitly
+    // so rust-analyzer handles them together.
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+        "rust-project.json"
+    ],
+
+    // Ensure the kernel module files use the custom config, not Cargo.
+    "rust-analyzer.cargo.buildScripts.overrideCommand": null,
+    "rust-analyzer.check.overrideCommand": null,
+
+    // Exclude the kernel build artifacts from file watcher.
+    "files.watcherExclude": {
+        "**/kernel/*.o": true,
+        "**/kernel/*.ko": true,
+        "**/kernel/.*.cmd": true,
+        "**/kernel/Module.symvers": true
+    }
+}

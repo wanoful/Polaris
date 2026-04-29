@@ -1,0 +1,18 @@
+# Memory Pressure Benchmark
+# Phase 4b: Memory budget = 50% of demand scenario
+
+[workload]
+type = "memory_pressure"
+num_sessions = 10
+prompt_tokens_per_session = 4096
+output_tokens_per_session = 128
+
+[memory]
+gpu_budget_percent = 50
+cpu_pool_mib = 8192
+offload_enabled = true
+reload_enabled = true
+
+[policy]
+eviction = "phase_aware"
+compare_policies = ["fifo", "lru", "phase_aware"]

@@ -1,0 +1,24 @@
+# Long Context Benchmark
+# Phase 4b: Single long context (32K prompt) scenario
+
+[model]
+name = "llama-2-7b"
+num_layers = 32
+num_kv_heads = 32
+head_dim = 128
+dtype = "fp16"
+
+[workload]
+type = "long_context"
+prompt_tokens = 32768
+output_tokens = 512
+block_size_tokens = 16
+
+[memory]
+gpu_budget_mib = 8192
+cpu_pool_mib = 4096
+offload_enabled = true
+
+[policy]
+eviction = "lru"
+phase_aware = true

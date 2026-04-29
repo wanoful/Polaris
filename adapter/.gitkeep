@@ -1,0 +1,7 @@
+# POLARIS Adapters
+# Drop-in replacements for vLLM/SGLang block managers.
+# See Phase 4e — optional, only after Phase 4a–4d are complete.
+
+# vLLM BlockSpaceManager replacement:
+#   Copy polaris_block_manager.py into vllm/core/ and set the
+#   environment variable: VLLM_BLOCK_MANAGER=polaris

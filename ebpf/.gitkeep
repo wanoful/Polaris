@@ -1,0 +1,3 @@
+# eBPF Network Offload (Phase 5 — Optional)
+# XDP eBPF program for inference request delivery.
+# Implemented after Phase 4 is complete.

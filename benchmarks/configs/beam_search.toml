@@ -1,0 +1,17 @@
+# Beam Search Benchmark
+# Phase 4b: Beam search (width=8, 64 output tokens) scenario
+
+[workload]
+type = "beam_search"
+beam_width = 8
+prompt_tokens = 512
+output_tokens_per_beam = 64
+block_size_tokens = 16
+
+[memory]
+gpu_budget_mib = 8192
+cpu_pool_mib = 4096
+
+[policy]
+eviction = "lru"
+cow_enabled = true

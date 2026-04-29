@@ -1,0 +1,17 @@
+# Concurrent Requests Benchmark
+# Phase 4b: 100 concurrent short requests scenario
+
+[workload]
+type = "concurrent"
+num_sessions = 100
+prompt_tokens_per_session = 256
+output_tokens_per_session = 64
+block_size_tokens = 16
+
+[memory]
+gpu_budget_mib = 8192
+cpu_pool_mib = 4096
+offload_enabled = true
+
+[policy]
+eviction = "lru"
