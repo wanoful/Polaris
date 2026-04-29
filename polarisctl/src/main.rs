@@ -36,6 +36,9 @@ enum Commands {
         /// GPU virtual address space in bytes
         #[arg(long, default_value_t = 1024 * 1024 * 1024)]
         vas_bytes: u64,
+        /// Bytes per token (0 = use kernel default 524288)
+        #[arg(long, default_value = "0")]
+        bytes_per_token: u64,
     },
     /// Destroy a session
     DestroySession {
@@ -59,8 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Stats => cmd_stats(fd)?,
-        Commands::CreateSession { gpu, beam, vas_bytes } => {
-            cmd_create_session(fd, gpu, beam, vas_bytes)?
+        Commands::CreateSession { gpu, beam, vas_bytes, bytes_per_token } => {
+            cmd_create_session(fd, gpu, beam, vas_bytes, bytes_per_token)?
         }
         Commands::DestroySession { session_id } => cmd_destroy_session(fd, session_id)?,
         Commands::ListSessions => cmd_list_sessions(fd)?,
@@ -102,11 +105,13 @@ fn cmd_create_session(
     gpu: u32,
     beam: u32,
     vas_bytes: u64,
+    bytes_per_token: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut arg = PolarisSessionCreateArg {
         home_gpu: gpu,
         beam_width: beam,
         gpu_vas_bytes: vas_bytes,
+        bytes_per_token,
         ..Default::default()
     };
 

@@ -65,7 +65,8 @@ pub struct PolarisSessionCreateArg {
     pub home_gpu: u32,
     pub beam_width: u32,
     pub gpu_vas_bytes: u64,
-    pub _reserved: [u64; 4],
+    pub bytes_per_token: u64,
+    pub _reserved: [u64; 3],
 }
 
 #[repr(C)]

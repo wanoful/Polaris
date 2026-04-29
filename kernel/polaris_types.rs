@@ -96,6 +96,11 @@ pub const POLARIS_MAX_DECISIONS_PER_POLL: usize = 16;
 
 pub const POLARIS_GROW_FLAG_OVERWRITE: u32 = 1 << 0;
 
+/// Default bytes per token for LLaMA-2-7B (32 layers, 32 KV heads, head_dim=128, FP16).
+/// tokens * 2 (K+V) * 32 heads * 128 dim * 2 bytes = 524,288 bytes/token.
+/// Can be changed at runtime via /sys/kernel/polaris/bytes_per_token.
+pub const POLARIS_DEFAULT_BYTES_PER_TOKEN: u64 = 524_288;
+
 // ─── Kernel-Internal Data Structures ────────────────────────────────────────
 
 /// Represents a single KV Cache block — the GPU equivalent of a physical page.
@@ -137,6 +142,7 @@ pub struct PolarisSession {
     pub gpu_vas_size: u64,
     pub gpu_vas_cursor: u64,
     pub beam_width: u32,
+    pub bytes_per_token: u64,
     pub parent_session_id: u64,
     pub block_ids: KVec<u64>, // ordered list of block IDs in token order
 }
@@ -179,7 +185,8 @@ pub struct PolarisSessionCreateArg {
     pub home_gpu: u32,
     pub beam_width: u32,
     pub gpu_vas_bytes: u64,
-    pub _reserved: [u64; 4],
+    pub bytes_per_token: u64,
+    pub _reserved: [u64; 3],
 }
 
 /// Arg for POLARIS_SESSION_DESTROY.

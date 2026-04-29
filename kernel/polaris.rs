@@ -492,6 +492,12 @@ impl PolarisDevice {
         let session_id = inner.next_session_id;
         inner.next_session_id += 1;
 
+        let bpt = if arg.bytes_per_token > 0 {
+            arg.bytes_per_token
+        } else {
+            POLARIS_DEFAULT_BYTES_PER_TOKEN
+        };
+
         inner.sessions.push(
             PolarisSession {
                 session_id,
@@ -500,6 +506,7 @@ impl PolarisDevice {
                 gpu_vas_size: arg.gpu_vas_bytes,
                 gpu_vas_cursor: 0,
                 beam_width: arg.beam_width,
+                bytes_per_token: bpt,
                 parent_session_id: 0,
                 block_ids: KVec::new(),
             },
@@ -526,8 +533,27 @@ impl PolarisDevice {
             return Err(ENOENT);
         }
 
+        // Decrement used_bytes for Resident blocks belonging to this session.
+        let gpu_id = inner.sessions.iter()
+            .find(|s| s.session_id == sid)
+            .map(|s| s.home_gpu)
+            .unwrap_or(0);
+        let mut freed: u64 = 0;
+        for block in inner.blocks.iter() {
+            if block.session_id == sid && block.state == PolarisBlockState::Resident {
+                freed += block.size_bytes;
+            }
+        }
+
         inner.sessions.retain(|s| s.session_id != sid);
         inner.blocks.retain(|b| b.session_id != sid);
+
+        if freed > 0 {
+            if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
+                gpu.used_bytes = gpu.used_bytes.saturating_sub(freed);
+            }
+        }
+
         dev_info!(self.dev, "POLARIS: session {} destroyed\n", sid);
         Ok(0)
     }
@@ -570,6 +596,7 @@ impl PolarisDevice {
         let parent_vas_size = parent.gpu_vas_size;
         let parent_vas_cursor = parent.gpu_vas_cursor;
         let parent_beam = parent.beam_width;
+        let parent_bpt = parent.bytes_per_token;
         let parent_block_ids: KVec<u64> = {
             let mut ids = KVec::new();
             for &bid in &parent.block_ids {
@@ -586,7 +613,7 @@ impl PolarisDevice {
                 return Err(ENODEV);
             }
         }
-        drop(parent);
+        let _ = parent;
 
         // COW: increment refcount on all parent blocks.
         for &bid in &parent_block_ids {
@@ -607,6 +634,7 @@ impl PolarisDevice {
                 gpu_vas_size: parent_vas_size,
                 gpu_vas_cursor: parent_vas_cursor,
                 beam_width: parent_beam,
+                bytes_per_token: parent_bpt,
                 parent_session_id: parent_id,
                 block_ids: parent_block_ids,
             },
@@ -639,13 +667,29 @@ impl PolarisDevice {
         let block_id = inner.next_block_id;
         inner.next_block_id += 1;
 
-        // G4: check GPU health for the session's home GPU.
-        if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
-            if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == sess.home_gpu) {
-                if !gpu.healthy {
-                    dev_err!(self.dev, "POLARIS: GPU {} unhealthy, rejecting BLOCK_GROW\n", sess.home_gpu);
-                    return Err(ENODEV);
+        // G4: check GPU health for the session's home GPU and extract settings.
+        let (gpu_id, bpt) = {
+            let sess = inner.sessions.iter().find(|s| s.session_id == arg.session_id);
+            if let Some(sess) = sess {
+                if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == sess.home_gpu) {
+                    if !gpu.healthy {
+                        dev_err!(self.dev, "POLARIS: GPU {} unhealthy, rejecting BLOCK_GROW\n", sess.home_gpu);
+                        return Err(ENODEV);
+                    }
                 }
+                (sess.home_gpu, sess.bytes_per_token)
+            } else {
+                (0, POLARIS_DEFAULT_BYTES_PER_TOKEN)
+            }
+        };
+
+        let size_bytes = (arg.token_count as u64) * bpt;
+
+        // G4: check GPU budget before allocating.
+        if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == gpu_id) {
+            if gpu.used_bytes + size_bytes > gpu.budget_bytes {
+                dev_err!(self.dev, "POLARIS: GPU {} budget exceeded on BLOCK_GROW\n", gpu_id);
+                return Err(ENOMEM);
             }
         }
 
@@ -657,11 +701,11 @@ impl PolarisDevice {
             session_id: arg.session_id,
             token_start: arg.token_start,
             token_count: arg.token_count,
-            home_gpu: 0,
+            home_gpu: gpu_id,
             gpu_vaddr: 0,
             gpu_phys_handle: 0,
             cpu_buf_addr: 0,
-            size_bytes: 0,
+            size_bytes,
             refcount: 1,
             state: PolarisBlockState::AllocPending,
             flags: 0,
@@ -676,12 +720,12 @@ impl PolarisDevice {
             PolarisDecision {
                 decision_id: dec_id,
                 op: PolarisDecisionOp::Alloc as u32,
-                gpu_id: 0,
+                gpu_id,
                 block_id,
                 session_id: arg.session_id,
                 src_handle: 0,
                 dst_vaddr: 0,
-                size_bytes: block.size_bytes,
+                size_bytes,
                 cpu_addr: 0,
                 _reserved: [0u64; 4],
             },
@@ -707,9 +751,73 @@ impl PolarisDevice {
         let arg: PolarisBlockFreeArg = reader.read()?;
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
-        inner.blocks.retain(|b| {
-            !(b.session_id == arg.session_id && b.token_start == arg.token_start)
-        });
+
+        // Find the block by session_id and token_start.
+        let block_idx = inner
+            .blocks
+            .iter()
+            .position(|b| b.session_id == arg.session_id && b.token_start == arg.token_start)
+            .ok_or(ENOENT)?;
+
+        // Collect info before mutation.
+        let block_id = inner.blocks[block_idx].block_id;
+        let home_gpu = inner.blocks[block_idx].home_gpu;
+        let session_id = inner.blocks[block_idx].session_id;
+        let phys_handle = inner.blocks[block_idx].gpu_phys_handle;
+        let size_bytes = inner.blocks[block_idx].size_bytes;
+        let current_state = inner.blocks[block_idx].state;
+
+        // Decrement COW refcount.
+        inner.blocks[block_idx].refcount -= 1;
+
+        if inner.blocks[block_idx].refcount == 0 {
+            // No more sessions reference this block — release GPU resources.
+            if inner.daemon_attached > 0 && phys_handle != 0 {
+                let dec_id = inner.next_decision_id;
+                inner.next_decision_id += 1;
+
+                inner.blocks[block_idx].state = PolarisBlockState::FreePending;
+                inner.blocks[block_idx].pending_decision_id = dec_id;
+
+                inner.pending_decisions.push(
+                    PolarisDecision {
+                        decision_id: dec_id,
+                        op: PolarisDecisionOp::Free as u32,
+                        gpu_id: home_gpu,
+                        block_id,
+                        session_id,
+                        src_handle: phys_handle,
+                        dst_vaddr: 0,
+                        size_bytes,
+                        cpu_addr: 0,
+                        _reserved: [0u64; 4],
+                    },
+                    GFP_KERNEL,
+                )?;
+
+                dev_info!(self.dev, "POLARIS: block {} free queued (FREE decision {})\n", block_id, dec_id);
+            } else {
+                // No daemon or never mapped: remove the block directly.
+                if current_state == PolarisBlockState::Resident {
+                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == home_gpu) {
+                        gpu.used_bytes = gpu.used_bytes.saturating_sub(size_bytes);
+                    }
+                }
+                let _ = inner.blocks.remove(block_idx);
+                dev_info!(self.dev, "POLARIS: block {} freed directly\n", block_id);
+            }
+        } else {
+            dev_info!(
+                self.dev, "POLARIS: block {} refcount decremented to {}\n",
+                block_id, inner.blocks[block_idx].refcount
+            );
+        }
+
+        // Remove from session's block_ids list.
+        if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+            session.block_ids.retain(|bid| *bid != block_id);
+        }
+
         Ok(0)
     }
 
@@ -718,8 +826,7 @@ impl PolarisDevice {
         let arg: PolarisBlockTouchArg = reader.read()?;
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
-        // TODO: use ktime_get_ns() for real timestamp
-        let now: u64 = 0;
+        let now = unsafe { bindings::ktime_get_mono_fast_ns() };
         for block in inner.blocks.iter_mut() {
             if block.session_id == arg.session_id {
                 let start = block.token_start as u64;
@@ -827,35 +934,51 @@ impl PolarisDevice {
 
         // ── Success path ──
         if arg.result == 0 {
-            let block = &mut inner.blocks[block_idx];
-            block.retry_count = 0;
-            block.pending_decision_id = 0;
-            match block.state {
-                PolarisBlockState::AllocPending => {
-                    block.state = PolarisBlockState::Resident;
-                    block.gpu_phys_handle = arg.output_handle;
+            let prev_state;
+            let gpu_id;
+            let sz;
+            {
+                let block = &mut inner.blocks[block_idx];
+                block.retry_count = 0;
+                block.pending_decision_id = 0;
+                prev_state = block.state;
+                gpu_id = block.home_gpu;
+                sz = block.size_bytes;
+                match block.state {
+                    PolarisBlockState::AllocPending => {
+                        block.state = PolarisBlockState::Resident;
+                        block.gpu_phys_handle = arg.output_handle;
+                    }
+                    PolarisBlockState::OffloadPending => {
+                        block.state = PolarisBlockState::CpuOffloaded;
+                        block.cpu_buf_addr = arg.output_cpu_addr;
+                    }
+                    PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
+                        block.state = PolarisBlockState::Resident;
+                        block.gpu_phys_handle = arg.output_handle;
+                    }
+                    PolarisBlockState::FreePending => {
+                        block.state = PolarisBlockState::Evicted;
+                    }
+                    _ => {}
                 }
-                PolarisBlockState::OffloadPending => {
-                    block.state = PolarisBlockState::CpuOffloaded;
-                    block.cpu_buf_addr = arg.output_cpu_addr;
+            }
+
+            // Update GPU used_bytes based on the state transition.
+            match prev_state {
+                PolarisBlockState::AllocPending
+                | PolarisBlockState::ReloadPending
+                | PolarisBlockState::CowPending => {
+                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
+                        gpu.used_bytes += sz;
+                    }
                 }
-                PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
-                    block.state = PolarisBlockState::Resident;
-                    block.gpu_phys_handle = arg.output_handle;
-                }
-                PolarisBlockState::FreePending => {
-                    // block was successfully freed by daemon — remove it.
-                    // Defer removal: mark for deletion below.
-                    block.state = PolarisBlockState::Evicted;
+                PolarisBlockState::OffloadPending | PolarisBlockState::FreePending => {
+                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
+                        gpu.used_bytes = gpu.used_bytes.saturating_sub(sz);
+                    }
                 }
                 _ => {}
-            }
-            // Update GPU used_bytes on successful Alloc/Reload/CowBreak.
-            if arg.output_handle != 0 {
-                let home = block.home_gpu;
-                if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == home) {
-                    gpu.used_bytes += block.size_bytes;
-                }
             }
             dev_info!(
                 self.dev,
