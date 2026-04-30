@@ -39,6 +39,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 
+# Local pacman rustc for kernel builds (Arch)
+/.tools/pacman-rustc/
+
 # Benchmark artifacts
 benchmarks/results/
 *.csv
