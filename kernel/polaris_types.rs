@@ -2,13 +2,17 @@
 
 //! Core data types for the POLARIS kernel module.
 //!
-//! This module defines:
-//! - IOCTL command codes (used by both kernel and userspace)
-//! - IOCTL argument structs (C-compatible, #[repr(C)])
-//! - Kernel-internal data structures (block table, session table, GPU registry)
-//! - Decision protocol types
+//! The kernel↔userspace ABI types (ioctl argument structs, enums, and constants)
+//! live in `polaris_abi.rs`.  This module re-exports them and adds kernel-only
+//! extensions: `impl_flags!` wrappers, kernel-internal management structs, and
+//! `FromBytes`/`AsBytes` trait impls.
+
+#[path = "polaris_abi.rs"]
+mod polaris_abi;
+pub use polaris_abi::*;
 
 use kernel::prelude::*;
+use kernel::impl_flags;
 
 // ─── IOCTL Command Codes ────────────────────────────────────────────────────
 
@@ -51,55 +55,33 @@ pub const POLARIS_COMPLETE_OPERATION: u32 =
 pub const POLARIS_GET_GLOBAL_STATS: u32 =
     kernel::ioctl::_IOWR::<PolarisGetGlobalStatsArg>(POLARIS_IOCTL_MAGIC, 0x0C);
 
-// ─── Block States ───────────────────────────────────────────────────────────
+// ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u32)]
-pub enum PolarisBlockState {
-    FreePending = 0,
-    Resident = 1,
-    AllocPending = 2,
-    Unmapped = 3,
-    CpuOffloaded = 4,
-    OffloadPending = 5,
-    ReloadPending = 6,
-    CowPending = 7,
-    Evicted = 8,
-}
+impl_flags!(
+    /// Bitmask of flags attached to a KV block.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct PolarisBlockFlags(u32);
 
-// ─── Block Flags ────────────────────────────────────────────────────────────
+    /// Individual block flag.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PolarisBlockFlag {
+        /// refcount > 1, this block is COW-shared across sessions.
+        Shared = 1 << 0,
+    }
+);
 
-pub const POLARIS_BLOCK_FLAG_SHARED: u32 = 1 << 0;
+impl_flags!(
+    /// Bitmask of flags passed to BLOCK_GROW.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct PolarisGrowFlags(u32);
 
-// ─── Phase Constants ────────────────────────────────────────────────────────
-
-pub const POLARIS_PHASE_PREFILL: u32 = 1;
-pub const POLARIS_PHASE_DECODE: u32 = 2;
-
-// ─── Decision Opcodes ───────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u32)]
-pub enum PolarisDecisionOp {
-    Alloc = 0,
-    Free = 1,
-    Map = 2,
-    Unmap = 3,
-    Offload = 4,
-    Reload = 5,
-    CowBreak = 6,
-}
-
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-pub const POLARIS_MAX_DECISIONS_PER_POLL: usize = 16;
-
-pub const POLARIS_GROW_FLAG_OVERWRITE: u32 = 1 << 0;
-
-/// Default bytes per token for LLaMA-2-7B (32 layers, 32 KV heads, head_dim=128, FP16).
-/// tokens * 2 (K+V) * 32 heads * 128 dim * 2 bytes = 524,288 bytes/token.
-/// Can be changed at runtime via /sys/kernel/polaris/bytes_per_token.
-pub const POLARIS_DEFAULT_BYTES_PER_TOKEN: u64 = 524_288;
+    /// Individual BLOCK_GROW flag.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PolarisGrowFlag {
+        /// Allow overlapping an existing shared block (triggers COW break).
+        Overwrite = 1 << 0,
+    }
+);
 
 // ─── Kernel-Internal Data Structures ────────────────────────────────────────
 
@@ -117,8 +99,8 @@ pub struct PolarisBlock {
     pub size_bytes: u64,
     pub refcount: u64,
     pub state: PolarisBlockState,
-    pub flags: u32,
-    pub phase: u32,
+    pub flags: PolarisBlockFlags,
+    pub phase: PolarisPhase,
     pub last_touch_ns: u64,
     pub map_time_ns: u64,
     /// Number of consecutive COMPLETE_OPERATION failures for this block.
@@ -158,171 +140,6 @@ pub struct PolarisGpu {
     pub cpu_pool_total_bytes: u64,
     pub cpu_pool_used_bytes: u64,
     pub healthy: bool,
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// IOCTL Argument Structs (C-compatible, #[repr(C)] — cross the user/kernel boundary)
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Arg for POLARIS_REGISTER_GPU (daemon → kernel).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisRegisterGpuArg {
-    pub gpu_id: u32,
-    pub total_bytes: u64,
-    pub budget_bytes: u64,
-    pub cpu_pool_bytes: u64,
-    pub numa_node: u32,
-    pub _reserved: u32,
-    pub _reserved2: [u64; 2],
-}
-
-/// Arg for POLARIS_SESSION_CREATE (workload → kernel).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisSessionCreateArg {
-    pub session_id: u64,
-    pub home_gpu: u32,
-    pub beam_width: u32,
-    pub gpu_vas_bytes: u64,
-    pub bytes_per_token: u64,
-    pub _reserved: [u64; 3],
-}
-
-/// Arg for POLARIS_SESSION_DESTROY.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisSessionDestroyArg {
-    pub session_id: u64,
-    pub _reserved: [u64; 4],
-}
-
-/// Arg for POLARIS_SESSION_GET_STATS.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisSessionGetStatsArg {
-    pub session_id: u64,
-    pub home_gpu: u32,
-    pub beam_width: u32,
-    pub num_blocks: u32,
-    pub _reserved: u32,
-    pub total_bytes: u64,
-    pub _reserved2: [u64; 2],
-}
-
-/// Arg for POLARIS_SESSION_BRANCH (COW fork).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisSessionBranchArg {
-    pub parent_session_id: u64,
-    pub child_session_id: u64,
-    pub _reserved: [u64; 4],
-}
-
-/// Arg for POLARIS_BLOCK_GROW (page-fault entry).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisBlockGrowArg {
-    pub session_id: u64,
-    pub token_start: u32,
-    pub token_count: u32,
-    pub flags: u32,
-    pub _reserved: u32,
-    pub block_id: u64,
-    pub ret_code: i32,
-    pub _reserved2: u32,
-    pub _reserved3: [u64; 2],
-}
-
-/// Arg for POLARIS_BLOCK_FREE.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisBlockFreeArg {
-    pub session_id: u64,
-    pub token_start: u32,
-    pub token_count: u32,
-    pub _reserved: [u64; 4],
-}
-
-/// Arg for POLARIS_BLOCK_TOUCH (updates LRU timestamp).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisBlockTouchArg {
-    pub session_id: u64,
-    pub token_start: u64,
-    pub token_count: u64,
-    pub _reserved: [u64; 4],
-}
-
-/// Arg for POLARIS_BLOCK_GET_STATE.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisBlockGetStateArg {
-    pub session_id: u64,
-    pub token_start: u32,
-    pub token_count: u32,
-    pub block_id: u64,
-    pub state: u32,
-    pub refcount: u64,
-    pub gpu_vaddr: u64,
-    pub _reserved: [u64; 2],
-}
-
-/// A single decision queued by the kernel for daemon execution.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct PolarisDecision {
-    pub decision_id: u64,
-    pub op: u32,
-    pub gpu_id: u32,
-    pub block_id: u64,
-    pub session_id: u64,
-    pub src_handle: u64,
-    pub dst_vaddr: u64,
-    pub size_bytes: u64,
-    pub cpu_addr: u64,
-    pub _reserved: [u64; 4],
-}
-
-/// Arg for POLARIS_GET_DECISION (daemon polls this).
-#[repr(C)]
-pub struct PolarisGetDecisionArg {
-    pub count: u32,
-    pub _reserved: u32,
-    pub decisions: [PolarisDecision; POLARIS_MAX_DECISIONS_PER_POLL],
-}
-
-/// Arg for POLARIS_COMPLETE_OPERATION (daemon reports result).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisCompleteOperationArg {
-    pub decision_id: u64,
-    pub result: i32,
-    pub _reserved: u32,
-    pub output_handle: u64,
-    pub output_cpu_addr: u64,
-    pub _reserved2: [u64; 2],
-}
-
-/// Arg for POLARIS_GET_GLOBAL_STATS.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PolarisGetGlobalStatsArg {
-    pub total_gpus: u32,
-    pub total_sessions: u32,
-    pub total_blocks: u32,
-    pub blocks_resident: u32,
-    pub blocks_offloaded: u32,
-    pub blocks_evicted: u32,
-    pub shared_gpu_bytes: u64,
-    pub private_gpu_bytes: u64,
-    pub cow_break_count: u64,
-    pub cow_copy_bytes: u64,
-    pub total_gpu_bytes: u64,
-    pub used_gpu_bytes: u64,
-    pub cpu_pool_total: u64,
-    pub cpu_pool_used: u64,
-    pub _reserved: [u64; 4],
 }
 
 // ─── Trait impls for user/kernel boundary crossing ───────────────────────────

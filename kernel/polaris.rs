@@ -133,7 +133,7 @@ unsafe extern "C" fn polaris_stats_show(
             PolarisBlockState::Evicted => evicted += 1,
             _ => pending += 1,
         }
-        if b.flags & POLARIS_BLOCK_FLAG_SHARED != 0 {
+        if b.flags.contains(PolarisBlockFlag::Shared) {
             shared += b.size_bytes;
         } else {
             private += b.size_bytes;
@@ -619,7 +619,7 @@ impl PolarisDevice {
         for &bid in &parent_block_ids {
             if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == bid) {
                 block.refcount += 1;
-                block.flags |= POLARIS_BLOCK_FLAG_SHARED;
+                block.flags |= PolarisBlockFlag::Shared;
             }
         }
 
@@ -708,8 +708,8 @@ impl PolarisDevice {
             size_bytes,
             refcount: 1,
             state: PolarisBlockState::AllocPending,
-            flags: 0,
-            phase: POLARIS_PHASE_PREFILL,
+            flags: PolarisBlockFlags::empty(),
+            phase: PolarisPhase::Prefill,
             last_touch_ns: 0,
             map_time_ns: 0,
             retry_count: 0,
@@ -1136,7 +1136,7 @@ impl PolarisDevice {
                 PolarisBlockState::Evicted => evicted += 1,
                 _ => {}
             }
-            if block.flags & POLARIS_BLOCK_FLAG_SHARED != 0 {
+            if block.flags.contains(PolarisBlockFlag::Shared) {
                 shared += block.size_bytes;
             } else {
                 private += block.size_bytes;
