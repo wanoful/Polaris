@@ -43,6 +43,9 @@ CORE_EDITION="2024"
 # Generate base rust-project.json via kernel script
 python3 "$KDIR/scripts/generate_rust_analyzer.py" \
     --cfgs "core=$CORE_CFGS" \
+    --cfgs 'proc_macro2=feature="proc-macro" wrap_proc_macro proc_macro_span_file proc_macro_span_location' \
+    --cfgs 'quote=feature="proc-macro"' \
+    --cfgs 'syn=feature="clone-impls" feature="derive" feature="full" feature="parsing" feature="printing" feature="proc-macro" feature="visit-mut"' \
     "$CORE_EDITION" \
     "$KDIR" \
     "$KDIR" \
