@@ -65,7 +65,7 @@ setup-pacman-rustc:
 	@bash ./scripts/setup-pacman-rustc.sh --rustup-link
 
 rust-analyzer:
-	@bash ./benchmarks/scripts/gen-rust-project.sh
+	@bash ./scripts/gen-rust-project.sh
 
 rust-toolchain:
-	@bash ./benchmarks/scripts/gen-rust-toolchain.sh $(KDIR)
+	@bash ./scripts/gen-rust-toolchain.sh $(KDIR)
