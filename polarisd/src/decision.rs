@@ -204,10 +204,18 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
 
         // ─── OFFLOAD (Phase 2a stub): unmap only, no data copy ─────
         x if x == PolarisDecisionOp::Offload as u32 => {
-            if let Some(va) = gpu.get_va_alloc(dec.block_id) {
-                let _ = cuda_vmm::unmap_memory(va.vaddr, va.size);
-                gpu.used_bytes = gpu.used_bytes.saturating_sub(va.size);
-                eprintln!("polarisd: OFFLOAD block {} (stub: unmap, no copy)", dec.block_id);
+            // Extract VA info first (avoid borrowing va_allocs across mutable calls).
+            let va_info = gpu.get_va_alloc(dec.block_id).map(|v| (v.vaddr, v.size));
+            if let Some((vaddr, size)) = va_info {
+                let _ = cuda_vmm::unmap_memory(vaddr, size);
+                gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
+                // Return VA to the pool; phys handle stays tracked for reload.
+                gpu.va_allocs.remove(&dec.block_id);
+                gpu.vas.free(vaddr, size);
+                eprintln!(
+                    "polarisd: OFFLOAD block {} (stub: unmap VA {:#x}, no data copy)",
+                    dec.block_id, vaddr
+                );
             }
         }
 

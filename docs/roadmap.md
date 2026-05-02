@@ -462,14 +462,16 @@ equivalent to OS page fault handling.
 
 - Discover GPU via CUDA and NVML
 - Report GPU memory capacity, free memory to the kernel module
+- Reserve a single global GPU VA pool at startup (`cuMemAddressReserve`)
+  — all blocks across all sessions are mapped into this pool. Per-session
+  reservation adds unnecessary daemon round-trips and fragments VA space.
+  GPU VA is vast (40+ bits), so a single 64 GiB reservation is safe.
 - Execute kernel decisions:
   - `cuMemCreate`: allocate physical GPU memory handle
-  - `cuMemAddressReserve`: on session creation, reserve a GPU VA range
-  - `cuMemMap`: map a physical handle into the reserved GPU VA range
-  - `cuMemUnmap`: unmap — equivalent of page-out
+  - `cuMemMap`: map a physical handle into a sub-range of the global VA pool
+  - `cuMemUnmap`: unmap the sub-range — equivalent of page-out
   - `cuMemSetAccess`: set read/write access for a GPU on a VA range
   - `cuMemRelease`: free physical memory handle
-  - `cuMemAddressFree`: free GPU VA reservation
 - Poll `POLARIS_GET_DECISION` and execute the returned operation list
 - Report completion via `POLARIS_COMPLETE_OPERATION`
 
@@ -503,11 +505,9 @@ equivalent to OS page fault handling.
  └──────────────────────┘                  └─────────────────┘
 ```
 
-If GPU memory budget is exceeded at step 3, the kernel first selects a
-victim block (via configured eviction policy), queues an `OFFLOAD` or
-`EVICT` decision, waits for completion, and only then proceeds with
-allocation. The original `BLOCK_GROW` ioctl returns `-ENOMEM` if the
-budget cannot be satisfied after eviction.
+When GPU memory budget is exceeded at step 3, the kernel returns `-ENOMEM`
+to the caller.  Full victim selection, offload, and eviction under memory
+pressure is implemented in Phase 2.
 
 **Error path (step 7 fails):** If `cuMemCreate` returns OUT_OF_MEMORY,
 daemon reports `result=-ENOMEM` via `COMPLETE_OPERATION`. Kernel retries
