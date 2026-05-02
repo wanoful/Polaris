@@ -1,14 +1,9 @@
-// POLARIS Daemon (polarisd)
-//
-// Responsibilities:
-//   1. Open /dev/polaris
-//   2. Discover GPUs via CUDA/NVML and register them with the kernel
-//   3. Enter decision loop: poll POLARIS_GET_DECISION, execute, report COMPLETE_OPERATION
-//   4. Handle daemon lifecycle (systemd integration, crash recovery)
-//
-// Phase 1b will add real CUDA VMM operations (cuMemCreate, cuMemMap, etc.).
-// For now, this skeleton registers a dummy GPU and polls decisions.
+mod cuda_vmm;
+mod decision;
+mod gpu;
+mod nvml;
 
+use gpu::GpuState;
 use libc::c_int;
 use libpolaris::ioctl;
 use libpolaris::types::*;
@@ -30,42 +25,111 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fd = file.as_raw_fd() as c_int;
     eprintln!("polarisd: /dev/polaris opened (fd={fd})");
 
-    // Register a dummy GPU (Phase 1b will use real CUDA/NVML).
-    register_dummy_gpu(fd)?;
+    // Discover GPUs via NVML.
+    let gpu_infos = nvml::discover_gpus()?;
 
-    // Enter the decision loop.
-    eprintln!("polarisd: entering decision loop");
-    decision_loop(fd)?;
+    if gpu_infos.is_empty() {
+        return Err("No GPUs discovered via NVML".into());
+    }
 
-    Ok(())
-}
+    // For Phase 1b, use the first GPU.
+    let info = &gpu_infos[0];
+    eprintln!("polarisd: using GPU {} ({})", info.index, info.name);
 
-/// Register a dummy GPU with the kernel.
-/// Phase 1b: Replace with real CUDA discovery via nvml-rs or cudarc.
-fn register_dummy_gpu(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
-    let arg = PolarisRegisterGpuArg {
-        gpu_id: 0,
-        total_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB
-        budget_bytes: 6 * 1024 * 1024 * 1024, // 6 GiB budget
-        cpu_pool_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB CPU pool
+    // Initialize CUDA.
+    cuda_vmm::init(0)?;
+    eprintln!("polarisd: CUDA driver initialized");
+
+    // Get CUDA device handle.
+    let dev = cuda_vmm::get_device(info.index as i32)?;
+    let dev_name = cuda_vmm::device_get_name(dev)?;
+    eprintln!("polarisd: CUDA device: {dev_name}");
+
+    // Create CUDA context.
+    let ctx = cuda_vmm::create_context(dev)?;
+    eprintln!("polarisd: CUDA context created");
+
+    // Push context for VMM setup.
+    cuda_vmm::push_context(ctx)?;
+
+    // Get allocation granularity.
+    let granule = cuda_vmm::get_allocation_granularity()?;
+    eprintln!("polarisd: allocation granularity = {granule} bytes ({} MiB)", granule / (1024 * 1024));
+
+    // Reserve GPU virtual address space (configurable via POLARIS_VA_RESERVE_GIB).
+    let vas_size = cuda_vmm::va_reserve_size();
+    let vas_base = cuda_vmm::reserve_va(vas_size)?;
+    eprintln!(
+        "polarisd: reserved GPU VA range {vas_base:#x}..{:#x} ({} GiB)",
+        vas_base + vas_size,
+        vas_size / (1024 * 1024 * 1024)
+    );
+
+    cuda_vmm::pop_context()?;
+
+    // Compute budget (use 75% of total GPU memory for KV cache).
+    let budget_bytes = info.total_memory * 3 / 4;
+    // CPU pool: 2x GPU memory for offload (Phase 2 feature, but reserve it now).
+    let cpu_pool_bytes = info.total_memory * 2;
+
+    // Register GPU with the kernel module.
+    let reg_arg = PolarisRegisterGpuArg {
+        gpu_id: info.index,
+        total_bytes: info.total_memory,
+        budget_bytes,
+        cpu_pool_bytes,
         numa_node: 0,
         ..Default::default()
     };
-
-    ioctl::ioctl_write(fd, ioctl::POLARIS_REGISTER_GPU, &arg)
+    ioctl::ioctl_write(fd, ioctl::POLARIS_REGISTER_GPU, &reg_arg)
         .map_err(|e| format!("REGISTER_GPU failed: errno {e}"))?;
 
-    eprintln!("polarisd: GPU 0 registered (8 GiB total, 6 GiB budget, 4 GiB CPU pool)");
+    eprintln!(
+        "polarisd: GPU {} registered (total={} MiB, budget={} MiB, cpu_pool={} MiB)",
+        info.index,
+        info.total_memory / (1024 * 1024),
+        budget_bytes / (1024 * 1024),
+        cpu_pool_bytes / (1024 * 1024),
+    );
+
+    // Build per-GPU state.
+    let mut gpu_state = GpuState::new(
+        info.index,
+        info.index as i32,
+        ctx,
+        vas_base,
+        vas_size,
+        granule,
+        info.total_memory,
+        budget_bytes,
+        cpu_pool_bytes,
+    );
+
+    // Load test error mode from env.
+    let test_err: i32 = std::env::var("POLARIS_TEST_ERROR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    if test_err != 0 {
+        eprintln!("polarisd: [TEST] error injection mode enabled (POLARIS_TEST_ERROR={test_err})");
+    }
+
+    // Enter the decision loop.
+    eprintln!("polarisd: entering decision loop");
+    decision_loop(fd, &mut gpu_state, test_err)?;
+
     Ok(())
 }
 
-/// Poll for decisions from the kernel and execute them.
-/// Phase 1b: Will execute real CUDA VMM operations.
-fn decision_loop(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
+fn decision_loop(
+    fd: c_int,
+    gpu: &mut GpuState,
+    test_err: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut decision_arg = PolarisGetDecisionArg::default();
 
     loop {
-        // Poll the kernel for pending decisions.
         match ioctl::ioctl_read(fd, ioctl::POLARIS_GET_DECISION, &mut decision_arg) {
             Ok(()) => {
                 let count = decision_arg.count as usize;
@@ -73,13 +137,43 @@ fn decision_loop(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("polarisd: received {count} decision(s)");
                     for i in 0..count {
                         let dec = &decision_arg.decisions[i];
-                        execute_decision(fd, dec)?;
+                        let exec = decision::execute(fd, dec, gpu, test_err);
+
+                        let complete = PolarisCompleteOperationArg {
+                            decision_id: dec.decision_id,
+                            result: exec.result,
+                            output_handle: exec.output_handle,
+                            output_cpu_addr: exec.output_cpu_addr,
+                            ..Default::default()
+                        };
+
+                        if let Err(e) = ioctl::ioctl_write(
+                            fd,
+                            ioctl::POLARIS_COMPLETE_OPERATION,
+                            &complete,
+                        ) {
+                            eprintln!(
+                                "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
+                                dec.decision_id
+                            );
+                        }
+
+                        if exec.result == 0 {
+                            eprintln!(
+                                "polarisd: decision {} completed (handle=0x{:x})",
+                                dec.decision_id, exec.output_handle
+                            );
+                        } else {
+                            eprintln!(
+                                "polarisd: decision {} failed with result={}",
+                                dec.decision_id, exec.result
+                            );
+                        }
                     }
                 }
             }
             Err(e) => {
                 eprintln!("polarisd: GET_DECISION error: errno {e}");
-                // If kernel module is unloaded or daemon is detached, exit.
                 if e == libc::ENODEV as i32 {
                     eprintln!("polarisd: no daemon attached, exiting");
                     break;
@@ -87,59 +181,8 @@ fn decision_loop(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Sleep briefly to avoid busy-waiting.
         thread::sleep(Duration::from_millis(10));
     }
 
-    Ok(())
-}
-
-/// Execute a single decision and report completion.
-fn execute_decision(
-    fd: c_int,
-    dec: &PolarisDecision,
-) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!(
-        "polarisd: executing decision {} op={} block_id={} session_id={}",
-        dec.decision_id, dec.op, dec.block_id, dec.session_id
-    );
-
-    // Set POLARIS_TEST_ERROR=1 to trigger error simulation for testing G4.
-    let test_err: i32 = std::env::var("POLARIS_TEST_ERROR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
-    let (result, output_handle) = if test_err != 0 {
-        // Simulate various error codes based on block_id for G4 testing.
-        let err = match dec.block_id % 5 {
-            0 => -(libc::ENOMEM as i32),
-            1 => -(libc::ENODEV as i32),
-            2 => -(libc::EINVAL as i32),
-            3 => -(libc::EFAULT as i32),
-            _ => -(libc::EIO as i32),
-        };
-        eprintln!("polarisd: [TEST] simulating error {} for block {}", err, dec.block_id);
-        (err, 0)
-    } else {
-        // Normal path: success with dummy phys handle.
-        (0, dec.block_id.wrapping_mul(0x1000))
-    };
-
-    let complete = PolarisCompleteOperationArg {
-        decision_id: dec.decision_id,
-        result,
-        output_handle,
-        ..Default::default()
-    };
-
-    ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
-        .map_err(|e| format!("COMPLETE_OPERATION failed: errno {e}"))?;
-
-    if result == 0 {
-        eprintln!("polarisd: decision {} completed (handle=0x{output_handle:x})", dec.decision_id);
-    } else {
-        eprintln!("polarisd: decision {} failed with result={}", dec.decision_id, result);
-    }
     Ok(())
 }
