@@ -15,7 +15,7 @@ use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "polaris-workload", about = "POLARIS workload generator")]
@@ -105,7 +105,6 @@ fn run_synthetic_kv(fd: c_int, num_blocks: u32, tokens_per_block: u32) -> Result
         .map_err(|e| format!("SESSION_CREATE: errno {e}"))?;
     let sid = session_arg.session_id;
     eprintln!("Session created: id={sid}");
-    std::thread::sleep(Duration::from_millis(100));
 
     let start = Instant::now();
 
@@ -120,7 +119,6 @@ fn run_synthetic_kv(fd: c_int, num_blocks: u32, tokens_per_block: u32) -> Result
         ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow_arg)
             .map_err(|e| format!("BLOCK_GROW: errno {e}"))?;
         eprintln!("  Block {} allocated (id={})", i, grow_arg.block_id);
-        std::thread::sleep(Duration::from_millis(10));
     }
 
     let elapsed = start.elapsed();

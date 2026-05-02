@@ -412,6 +412,14 @@ impl PinnedDrop for PolarisDevice {
                         | PolarisBlockState::CowPending
                         | PolarisBlockState::FreePending => {
                             block.state = PolarisBlockState::Evicted;
+                            block.pending_decision_id = 0;
+                            // Wake any synchronous BLOCK_GROW waiter.
+                            let comp_ptr = block.completion_ptr;
+                            block.completion_ptr = core::ptr::null_mut();
+                            if !comp_ptr.is_null() {
+                                // SAFETY: comp_ptr was set by BLOCK_GROW; stack frame still alive.
+                                unsafe { bindings::complete(comp_ptr); }
+                            }
                         }
                         _ => {}
                     }
@@ -793,6 +801,7 @@ impl PolarisDevice {
             map_time_ns: 0,
             retry_count: 0,
             pending_decision_id: dec_id,
+            completion_ptr: core::ptr::null_mut(),
         };
 
         inner.pending_decisions.push(
@@ -817,11 +826,72 @@ impl PolarisDevice {
         }
 
         arg.block_id = block_id;
-        arg.ret_code = 0;
+
+        // Synchronous page-fault: wait for the daemon to complete this decision.
+        // Use a stack-allocated kernel completion — COMPLETE_OPERATION signals
+        // it via complete(), then the waiter wakes and reads the block state.
+        //
+        // Stack allocation is safe because wait_for_completion_* blocks the
+        // calling thread inside this function frame until signalled.
+        let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
+        // SAFETY: `comp` is a valid, zeroed `struct completion`.
+        unsafe { bindings::init_completion(&raw mut comp); }
+
+        // Store the pointer while we hold the lock — COMPLETE_OPERATION
+        // acquires the same lock and can safely read/write it.
+        {
+            if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
+                b.completion_ptr = &raw mut comp;
+            }
+        }
         drop(guard);
+
+        // Wait with a 5-second timeout (interruptible so the process can be killed).
+        // SAFETY: `comp` lives on this stack frame; the waiter is this thread.
+        let wait_ret = unsafe {
+            bindings::wait_for_completion_interruptible_timeout(
+                &raw mut comp,
+                bindings::__msecs_to_jiffies(5000),
+            )
+        };
+
+        // Re-acquire lock and read the result.
+        let mut g = POLARIS_STATE.lock();
+        let inner = g.as_mut().ok_or(ENODEV)?;
+        let outcome = if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
+            // Clear the completion pointer — completed or timed out, no one will signal it again.
+            b.completion_ptr = core::ptr::null_mut();
+            match b.state {
+                PolarisBlockState::Resident => 0i32,
+                PolarisBlockState::Evicted => -(bindings::ENOMEM as i32),
+                _ => {
+                    if wait_ret == 0 {
+                        // Timed out — mark evicted for consistency.
+                        dev_err!(self.dev, "POLARIS: block {} timed out waiting for daemon\n", block_id);
+                        b.state = PolarisBlockState::Evicted;
+                        b.pending_decision_id = 0;
+                        -(bindings::ETIMEDOUT as i32)
+                    } else if wait_ret < 0 {
+                        dev_info!(self.dev, "POLARIS: block {} wait interrupted (ret={})\n", block_id, wait_ret);
+                        -(bindings::EINTR as i32)
+                    } else {
+                        dev_err!(self.dev, "POLARIS: block {} in unexpected state {:?} after completion\n", block_id, b.state);
+                        -(bindings::EIO as i32)
+                    }
+                }
+            }
+        } else {
+            dev_err!(self.dev, "POLARIS: block {} vanished during wait\n", block_id);
+            -(bindings::EIO as i32)
+        };
+        drop(g);
+
+        arg.ret_code = outcome;
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
-        dev_info!(self.dev, "POLARIS: block {} allocated for session {}\n", block_id, arg.session_id);
+        if outcome == 0 {
+            dev_info!(self.dev, "POLARIS: block {} resident for session {}\n", block_id, arg.session_id);
+        }
         Ok(0)
     }
 
@@ -1011,11 +1081,12 @@ impl PolarisDevice {
             }
         };
 
-        // ── Success path ──
+            // ── Success path ──
         if arg.result == 0 {
             let prev_state;
             let gpu_id;
             let sz;
+            let comp_ptr: *mut bindings::completion;
             {
                 let block = &mut inner.blocks[block_idx];
                 block.retry_count = 0;
@@ -1041,6 +1112,15 @@ impl PolarisDevice {
                     }
                     _ => {}
                 }
+                // Capture the completion pointer before the mutable borrow ends.
+                comp_ptr = block.completion_ptr;
+                block.completion_ptr = core::ptr::null_mut();
+            }
+            // Signal any synchronous waiter (BLOCK_GROW) that the decision is done.
+            // SAFETY: comp_ptr was written by BLOCK_GROW while holding the same lock.
+            // The stack frame holding the completion is still alive (waiter sleeps in it).
+            if !comp_ptr.is_null() {
+                unsafe { bindings::complete(comp_ptr); }
             }
 
             // Update GPU used_bytes based on the state transition.
@@ -1173,6 +1253,20 @@ impl PolarisDevice {
                 );
                 inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                 inner.blocks[block_idx].pending_decision_id = 0;
+            }
+        }
+
+        // Signal any BLOCK_GROW waiter blocked on this completion if the block
+        // reached a terminal state.  Retry paths (ENOMEM/EFAULT with retries
+        // remaining) keep the AllocPending state and a new pending_decision_id —
+        // the waiter should NOT be woken yet.
+        if inner.blocks[block_idx].state == PolarisBlockState::Evicted {
+            let comp_ptr = inner.blocks[block_idx].completion_ptr;
+            inner.blocks[block_idx].completion_ptr = core::ptr::null_mut();
+            if !comp_ptr.is_null() {
+                // SAFETY: comp_ptr was written by BLOCK_GROW while holding the
+                // same lock.  The stack frame is still alive.
+                unsafe { bindings::complete(comp_ptr); }
             }
         }
 

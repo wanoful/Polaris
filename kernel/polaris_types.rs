@@ -110,10 +110,19 @@ pub struct PolarisBlock {
     /// decision is queued; cleared (set to 0) when the daemon reports
     /// completion. Used to match COMPLETE_OPERATION results to blocks.
     pub pending_decision_id: u64,
+    /// Stack-allocated completion pointer used by synchronous BLOCK_GROW.
+    /// Set before dropping the lock, consumed by COMPLETE_OPERATION.
+    /// NULL when no waiter is pending.
+    pub completion_ptr: *mut kernel::bindings::completion,
 }
 
 /// Maximum retries before a block is evicted (G4 contract).
 pub const POLARIS_MAX_RETRIES: u32 = 3;
+
+// SAFETY: All PolarisBlock fields are accessed exclusively under the
+// POLARIS_STATE mutex.  completion_ptr is set and cleared under the same
+// lock and never accessed from interrupt context.
+unsafe impl Send for PolarisBlock {}
 
 /// A session represents one LLM inference request.
 #[derive(Debug)]
