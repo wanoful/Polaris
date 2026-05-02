@@ -1,0 +1,31 @@
+[Unit]
+Description=POLARIS CUDA VMM Daemon
+Documentation=https://github.com/wanoful/Polaris/
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/polarisd
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+Environment=POLARIS_VA_RESERVE_GIB=64
+
+# Prevent the daemon from being OOM-killed under memory pressure.
+# The daemon is critical infrastructure — if killed, all inference
+# workloads fail with -ENODEV.
+OOMScoreAdjust=-500
+
+# CUDA VMM requires locked memory for GPU VA page table operations.
+# systemd defaults to 64 KiB, which causes cuMemAddressReserve to
+# fail with CUDA_ERROR_OUT_OF_MEMORY.
+LimitMEMLOCK=infinity
+
+# The process needs: GPU VA reserve (64 GiB) + CPU pinned pool (~16 GiB)
+# + CUDA driver overhead + code/lib heap/stack.  A fixed 64 GiB limit
+# is too small — leave it unbounded.
+LimitAS=infinity
+
+[Install]
+WantedBy=multi-user.target

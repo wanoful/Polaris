@@ -29,6 +29,7 @@ pub struct GpuState {
     pub budget_bytes: u64,
     pub cpu_pool_bytes: u64,
     pub cpu_pool_used_bytes: u64,
+    pub cpu_pool_base: u64,
     pub device_ordinal: i32,
     pub context: CudaContext,
     pub vas: GpuVaPool,
@@ -163,6 +164,7 @@ impl GpuState {
         total_bytes: u64,
         budget_bytes: u64,
         cpu_pool_bytes: u64,
+        cpu_pool_base: u64,
     ) -> Self {
         Self {
             gpu_id,
@@ -171,6 +173,7 @@ impl GpuState {
             budget_bytes,
             cpu_pool_bytes,
             cpu_pool_used_bytes: 0,
+            cpu_pool_base,
             device_ordinal,
             context,
             vas: GpuVaPool::new(vas_base, vas_size),

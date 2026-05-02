@@ -1,6 +1,7 @@
 mod cuda_vmm;
 mod decision;
 mod gpu;
+mod lifecycle;
 mod nvml;
 
 use gpu::GpuState;
@@ -65,12 +66,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vas_size / (1024 * 1024 * 1024)
     );
 
-    cuda_vmm::pop_context()?;
-
     // Compute budget (use 75% of total GPU memory for KV cache).
     let budget_bytes = info.total_memory * 3 / 4;
     // CPU pool: 2x GPU memory for offload (Phase 2 feature, but reserve it now).
     let cpu_pool_bytes = info.total_memory * 2;
+
+    // Pre-allocate CPU pinned memory pool for block offloads.
+    let cpu_pool_base = match cuda_vmm::allocate_host(cpu_pool_bytes) {
+        Ok(ptr) => {
+            eprintln!(
+                "polarisd: allocated CPU pinned memory pool: {} MiB at {ptr:#x}",
+                cpu_pool_bytes / (1024 * 1024)
+            );
+            ptr
+        }
+        Err(e) => {
+            eprintln!(
+                "polarisd: WARNING CPU pinned memory pool allocation failed: {e}"
+            );
+            eprintln!(
+                "polarisd:   GPU↔CPU offload will not be available."
+            );
+            eprintln!(
+                "polarisd:   Check available host memory and try reducing the pool size."
+            );
+            0u64
+        }
+    };
+
+    cuda_vmm::pop_context()?;
 
     // Register GPU with the kernel module.
     let reg_arg = PolarisRegisterGpuArg {
@@ -103,6 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info.total_memory,
         budget_bytes,
         cpu_pool_bytes,
+        cpu_pool_base,
     );
 
     // Load test error mode from env.
@@ -115,9 +140,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("polarisd: [TEST] error injection mode enabled (POLARIS_TEST_ERROR={test_err})");
     }
 
+    // Reconcile state with the kernel module.
+    lifecycle::reconcile();
+
+    // Notify systemd that the daemon is ready to serve requests.
+    lifecycle::notify_ready();
+
     // Enter the decision loop.
     eprintln!("polarisd: entering decision loop");
     decision_loop(fd, &mut gpu_state, test_err)?;
+
+    // Notify systemd that the daemon is stopping cleanly.
+    lifecycle::notify_stopping();
 
     Ok(())
 }

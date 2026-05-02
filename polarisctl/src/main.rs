@@ -141,7 +141,6 @@ fn cmd_list_sessions(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     ioctl::ioctl_read(fd, ioctl::POLARIS_GET_GLOBAL_STATS, &mut stats)
         .map_err(|e| format!("GET_GLOBAL_STATS failed: errno {e}"))?;
 
-    println!("Total sessions: {}", stats.total_sessions);
-    println!("(Full session listing requires sysfs support — Phase 1c)");
+    println!("Total sessions: {}. Use --stats for per-session details.", stats.total_sessions);
     Ok(())
 }

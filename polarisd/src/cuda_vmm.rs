@@ -170,3 +170,20 @@ pub fn release_physical(phys_handle: u64) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn allocate_host(size: u64) -> Result<u64, String> {
+    let mut ptr: *mut std::os::raw::c_void = std::ptr::null_mut();
+    let res = unsafe { sys::cuMemAllocHost_v2(&mut ptr, size as usize) };
+    if res != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuMemAllocHost({size}) failed: error code {res:?}"));
+    }
+    Ok(ptr as u64)
+}
+
+pub fn free_host(ptr: u64) -> Result<(), String> {
+    let res = unsafe { sys::cuMemFreeHost(ptr as *mut std::os::raw::c_void) };
+    if res != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuMemFreeHost({ptr:#x}) failed: error code {res:?}"));
+    }
+    Ok(())
+}
