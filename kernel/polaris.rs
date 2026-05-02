@@ -528,31 +528,110 @@ impl PolarisDevice {
         let inner = guard.as_mut().ok_or(ENODEV)?;
         let sid = arg.session_id;
 
-        // Check session exists before trying to remove.
         if !inner.sessions.iter().any(|s| s.session_id == sid) {
             return Err(ENOENT);
         }
 
-        // Decrement used_bytes for Resident blocks belonging to this session.
-        let gpu_id = inner.sessions.iter()
+        let gpu_id = inner
+            .sessions
+            .iter()
             .find(|s| s.session_id == sid)
             .map(|s| s.home_gpu)
             .unwrap_or(0);
-        let mut freed: u64 = 0;
-        for block in inner.blocks.iter() {
-            if block.session_id == sid && block.state == PolarisBlockState::Resident {
-                freed += block.size_bytes;
+
+        // Collect info before any mutation (avoids double-borrow with
+        // pending_decisions.push inside the loop).
+        struct ToFree {
+            idx: usize,
+            block_id: u64,
+            phys_handle: u64,
+            size_bytes: u64,
+            state: PolarisBlockState,
+            refcount: u64,
+        }
+        let mut to_free: KVec<ToFree> = KVec::new();
+        for idx in 0..inner.blocks.len() {
+            let b = &inner.blocks[idx];
+            if b.session_id == sid {
+                to_free.push(
+                    ToFree {
+                        idx,
+                        block_id: b.block_id,
+                        phys_handle: b.gpu_phys_handle,
+                        size_bytes: b.size_bytes,
+                        state: b.state,
+                        refcount: b.refcount,
+                    },
+                    GFP_KERNEL,
+                )?;
             }
         }
 
+        // Now mutate: queue FREE or clean up directly.
+        for tf in &mut to_free {
+            let block = &mut inner.blocks[tf.idx];
+            let phys_handle = tf.phys_handle;
+            let block_id = tf.block_id;
+            let sz = tf.size_bytes;
+
+            if tf.refcount > 1 {
+                block.refcount -= 1;
+                dev_info!(
+                    self.dev,
+                    "POLARIS: session {} destroy: block {} refcount decremented to {}\n",
+                    sid, block_id, block.refcount
+                );
+                continue;
+            }
+
+            if inner.daemon_attached > 0 && phys_handle != 0 {
+                let dec_id = inner.next_decision_id;
+                inner.next_decision_id += 1;
+
+                block.state = PolarisBlockState::FreePending;
+                block.pending_decision_id = dec_id;
+
+                inner.pending_decisions.push(
+                    PolarisDecision {
+                        decision_id: dec_id,
+                        op: PolarisDecisionOp::Free as u32,
+                        gpu_id,
+                        block_id,
+                        session_id: sid,
+                        src_handle: phys_handle,
+                        dst_vaddr: 0,
+                        size_bytes: sz,
+                        cpu_addr: 0,
+                        _reserved: [0u64; 4],
+                    },
+                    GFP_KERNEL,
+                )?;
+
+                dev_info!(
+                    self.dev,
+                    "POLARIS: session {} destroy: block {} free queued (FREE {})\n",
+                    sid, block_id, dec_id
+                );
+            } else {
+                // No daemon or never mapped — remove directly.
+                if tf.state == PolarisBlockState::Resident {
+                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
+                        gpu.used_bytes = gpu.used_bytes.saturating_sub(sz);
+                    }
+                }
+                dev_info!(
+                    self.dev,
+                    "POLARIS: session {} destroy: block {} freed directly\n",
+                    sid, block_id
+                );
+            }
+        }
+
+        // Remove session entry. FreePending blocks stay in the table for
+        // the daemon to complete; non-FreePending blocks for this session
+        // are removed.
         inner.sessions.retain(|s| s.session_id != sid);
-        inner.blocks.retain(|b| b.session_id != sid);
-
-        if freed > 0 {
-            if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
-                gpu.used_bytes = gpu.used_bytes.saturating_sub(freed);
-            }
-        }
+        inner.blocks.retain(|b| !(b.session_id == sid && b.state != PolarisBlockState::FreePending));
 
         dev_info!(self.dev, "POLARIS: session {} destroyed\n", sid);
         Ok(0)
@@ -965,6 +1044,9 @@ impl PolarisDevice {
             }
 
             // Update GPU used_bytes based on the state transition.
+            let mut should_remove = false;
+            let mut sid_to_clean = 0u64;
+            let mut bid_to_clean = 0u64;
             match prev_state {
                 PolarisBlockState::AllocPending
                 | PolarisBlockState::ReloadPending
@@ -977,8 +1059,20 @@ impl PolarisDevice {
                     if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
                         gpu.used_bytes = gpu.used_bytes.saturating_sub(sz);
                     }
+                    if prev_state == PolarisBlockState::FreePending {
+                        sid_to_clean = inner.blocks[block_idx].session_id;
+                        bid_to_clean = inner.blocks[block_idx].block_id;
+                        should_remove = true;
+                    }
                 }
                 _ => {}
+            }
+
+            if should_remove {
+                let _ = inner.blocks.remove(block_idx);
+                if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == sid_to_clean) {
+                    session.block_ids.retain(|bid| *bid != bid_to_clean);
+                }
             }
             dev_info!(
                 self.dev,
