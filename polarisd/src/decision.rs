@@ -105,7 +105,9 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
 
             if let Err(e) = cuda_vmm::map_memory(vaddr, phys, size) {
                 eprintln!("polarisd: cuMemMap failed for block {}: {e}", dec.block_id);
-                let _ = cuda_vmm::release_physical(phys);
+                if let Err(re) = cuda_vmm::release_physical(phys) {
+                    eprintln!("polarisd: cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
+                }
                 return ExecutionResult {
                     result: -(libc::EINVAL as i32),
                     output_handle: 0,
@@ -116,7 +118,9 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
             if let Err(e) = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal) {
                 eprintln!("polarisd: cuMemSetAccess failed for block {}: {e}", dec.block_id);
                 let _ = cuda_vmm::unmap_memory(vaddr, size);
-                let _ = cuda_vmm::release_physical(phys);
+                if let Err(re) = cuda_vmm::release_physical(phys) {
+                    eprintln!("polarisd: cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
+                }
                 return ExecutionResult {
                     result: -(libc::EINVAL as i32),
                     output_handle: 0,
@@ -147,14 +151,18 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
                 let vaddr = va.vaddr;
                 let size = va.size;
                 let _ = cuda_vmm::unmap_memory(vaddr, size);
-                let _ = cuda_vmm::release_physical(phys);
+                if let Err(e) = cuda_vmm::release_physical(phys) {
+                    eprintln!("polarisd: FREE cuMemRelease failed for block {}: {e}", dec.block_id);
+                }
                 gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
                 eprintln!(
                     "polarisd: FREE block {} -> phys={phys:#x} va={vaddr:#x}",
                     dec.block_id
                 );
             } else if phys != 0 {
-                let _ = cuda_vmm::release_physical(phys);
+                if let Err(e) = cuda_vmm::release_physical(phys) {
+                    eprintln!("polarisd: FREE cuMemRelease failed for block {}: {e}", dec.block_id);
+                }
                 eprintln!("polarisd: FREE block {} -> phys={phys:#x} (no VA track)", dec.block_id);
             }
 

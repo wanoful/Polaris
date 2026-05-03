@@ -122,6 +122,13 @@ pub struct PolarisBlock {
 /// Maximum retries before a block is evicted (G4 contract).
 pub const POLARIS_MAX_RETRIES: u32 = 3;
 
+/// Maximum number of decisions that can be queued in pending_decisions.
+/// When the queue reaches this limit, BLOCK_GROW and SESSION_DESTROY return
+/// ENOMEM to the caller. At 10 ms daemon poll interval, 1024 decisions is
+/// over 60 seconds of work — hitting this cap means the daemon is stuck or
+/// crashed.
+pub const POLARIS_MAX_PENDING_DECISIONS: usize = 1024;
+
 // SAFETY: All PolarisBlock fields are accessed exclusively under the
 // POLARIS_STATE mutex.  completion_ptr is set and cleared under the same
 // lock and never accessed from interrupt context.

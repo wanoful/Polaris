@@ -579,6 +579,19 @@ impl PolarisDevice {
         }
 
         // Now mutate: queue FREE or clean up directly.
+        // G6: if the pending decision queue is full, handle FREE decisions
+        // directly (skip daemon FREE).  The blocks' phys handles will be
+        // orphaned, but this prevents kernel OOM.  The daemon's CUDA context
+        // cleanup on exit handles the orphaned handles.
+        let queue_full = inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS;
+        if queue_full {
+            dev_warn!(
+                self.dev,
+                "POLARIS: pending decision queue full ({}), cleaning up session {} blocks directly\n",
+                inner.pending_decisions.len(), sid
+            );
+        }
+
         for tf in &mut to_free {
             let block = &mut inner.blocks[tf.idx];
             let phys_handle = tf.phys_handle;
@@ -595,7 +608,7 @@ impl PolarisDevice {
                 continue;
             }
 
-            if inner.daemon_attached > 0 && phys_handle != 0 {
+            if !queue_full && inner.daemon_attached > 0 && phys_handle != 0 {
                 let dec_id = inner.next_decision_id;
                 inner.next_decision_id += 1;
 
@@ -624,7 +637,7 @@ impl PolarisDevice {
                     sid, block_id, dec_id
                 );
             } else {
-                // No daemon or never mapped — remove directly.
+                // No daemon or queue full or never mapped — remove directly.
                 if tf.state == PolarisBlockState::Resident {
                     if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
                         gpu.used_bytes = gpu.used_bytes.saturating_sub(sz);
@@ -834,61 +847,65 @@ impl PolarisDevice {
                 }
 
                 // Find a victim to offload to make room for this reload.
+                // Combined victim selection + CPU pool capacity check:
+                // iterate through victims until we find one that fits in the CPU pool.
+                // Prefer OTHER sessions (session_id != self), then fall back to any.
                 let vid;
                 {
                     let inner = guard.as_mut().ok_or(ENODEV)?;
-                    let mut victim: Option<u64> = None;
+                    let mut victim: Option<(u64, u64, u32)> = None; // (block_id, size, gpu_id)
+
+                    // Pass 1: other sessions, must fit in CPU pool.
                     for b in inner.blocks.iter() {
-                        if b.state == PolarisBlockState::Resident
+                        if b.session_id != arg.session_id
+                            && b.state == PolarisBlockState::Resident
                             && b.refcount <= 1
                             && b.pending_decision_id == 0
                             && b.block_id != bid
                         {
-                            victim = Some(b.block_id);
-                            break;
+                            let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
+                                Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
+                                None => false,
+                            };
+                            if fits {
+                                victim = Some((b.block_id, b.size_bytes, b.home_gpu));
+                                break;
+                            }
+                        }
+                    }
+                    // Pass 2: any session, must fit in CPU pool.
+                    if victim.is_none() {
+                        for b in inner.blocks.iter() {
+                            if b.state == PolarisBlockState::Resident
+                                && b.refcount <= 1
+                                && b.pending_decision_id == 0
+                                && b.block_id != bid
+                            {
+                                let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
+                                    Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
+                                    None => false,
+                                };
+                                if fits {
+                                    victim = Some((b.block_id, b.size_bytes, b.home_gpu));
+                                    break;
+                                }
+                            }
                         }
                     }
                     vid = victim;
                 }
 
-                let victim_id = match vid {
-                    Some(v) => v,
+                let (victim_id, victim_sz, victim_gpu) = match vid {
+                    Some((id, sz, gpu)) => (id, sz, gpu),
                     None => {
                         dev_err!(
                             self.dev,
-                            "POLARIS: cannot reload block {} — budget exceeded with no offload victims\n",
+                            "POLARIS: cannot reload block {} — budget exceeded, no offload victim fits in CPU pool\n",
                             bid,
                         );
                         return Err(ENOMEM);
                     }
                 };
-
-                let (victim_sz, victim_gpu) = {
-                    let inner = guard.as_mut().ok_or(ENODEV)?;
-                    let b = match inner.blocks.iter().find(|b| b.block_id == victim_id) {
-                        Some(b) => b,
-                        None => return Err(ENOENT),
-                    };
-                    (b.size_bytes, b.home_gpu)
-                };
-
-                let pool_ok;
-                {
-                    let inner = guard.as_mut().ok_or(ENODEV)?;
-                    pool_ok = match inner.gpus.iter().find(|g| g.gpu_id == victim_gpu) {
-                        Some(g) => g.cpu_pool_used_bytes + victim_sz <= g.cpu_pool_total_bytes,
-                        None => false,
-                    };
-                }
-
-                if !pool_ok {
-                    dev_err!(
-                        self.dev,
-                        "POLARIS: CPU pool exhausted, cannot offload victim {} for reload of {}\n",
-                        victim_id, bid,
-                    );
-                    return Err(ENOMEM);
-                }
 
                 // Queue OFFLOAD and wait.
                 {
@@ -897,6 +914,7 @@ impl PolarisDevice {
                         Some(b) => b,
                         None => return Err(ENOENT),
                     };
+                    let src_phys = block.gpu_phys_handle;
                     block.state = PolarisBlockState::OffloadPending;
                     let dec_id = inner.next_decision_id;
                     inner.next_decision_id += 1;
@@ -909,7 +927,7 @@ impl PolarisDevice {
                             gpu_id: victim_gpu,
                             block_id: victim_id,
                             session_id: block.session_id,
-                            src_handle: 0,
+                            src_handle: src_phys,
                             dst_vaddr: 0,
                             size_bytes: victim_sz,
                             cpu_addr: 0,
@@ -1023,15 +1041,16 @@ impl PolarisDevice {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
                 if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == bid) {
                     b.completion_ptr = core::ptr::null_mut();
-                    if b.state != PolarisBlockState::Resident {
-                        dev_err!(
-                            self.dev,
-                            "POLARIS: pre-decode RELOAD for block {} failed (state={:?})\n",
-                            bid, b.state
-                        );
-                        b.state = PolarisBlockState::Evicted;
-                        b.pending_decision_id = 0;
-                    }
+                        if b.state != PolarisBlockState::Resident {
+                            dev_err!(
+                                self.dev,
+                                "POLARIS: pre-decode RELOAD for block {} failed (state={:?})\n",
+                                bid, b.state
+                            );
+                            b.state = PolarisBlockState::Evicted;
+                            b.pending_decision_id = 0;
+                            return Err(ENOMEM);
+                        }
                 }
             }
         }
@@ -1061,72 +1080,58 @@ impl PolarisDevice {
             }
 
             // Select a victim to offload.
-            let victim_id;
+            // Combined victim selection + CPU pool capacity check:
+            // iterate through victims until we find one that fits in the CPU pool.
+            let victim;
             {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
-                let mut vid: Option<u64> = None;
-                // Phase 2a: prefer OTHER sessions first. Offloading a block
-                // from the calling session causes thrash — the next BLOCK_GROW
-                // will reload it via the pre-decode residency check.
+                let mut vid: Option<(u64, u64, u32)> = None; // (block_id, size, gpu_id)
+
+                // Pass 1: prefer OTHER sessions that fit in CPU pool.
                 for b in inner.blocks.iter() {
                     if b.session_id != arg.session_id
                         && b.state == PolarisBlockState::Resident
                         && b.refcount <= 1
                         && b.pending_decision_id == 0
                     {
-                        vid = Some(b.block_id);
-                        break;
+                        let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
+                            Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
+                            None => false,
+                        };
+                        if fits {
+                            vid = Some((b.block_id, b.size_bytes, b.home_gpu));
+                            break;
+                        }
                     }
                 }
-                // Fallback: any session (including self) if no cross-session victim.
+                // Pass 2: any session that fits in CPU pool.
                 if vid.is_none() {
                     for b in inner.blocks.iter() {
                         if b.state == PolarisBlockState::Resident
                             && b.refcount <= 1
                             && b.pending_decision_id == 0
                         {
-                            vid = Some(b.block_id);
-                            break;
+                            let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
+                                Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
+                                None => false,
+                            };
+                            if fits {
+                                vid = Some((b.block_id, b.size_bytes, b.home_gpu));
+                                break;
+                            }
                         }
                     }
                 }
-                victim_id = vid;
+                victim = vid;
             }
 
-            let victim_id = match victim_id {
-                Some(vid) => vid,
+            let (victim_id, victim_sz, victim_gpu) = match victim {
+                Some((id, sz, gpu)) => (id, sz, gpu),
                 None => {
-                    dev_err!(self.dev, "POLARIS: GPU {} budget exceeded, no offload victim available\n", gpu_id);
+                    dev_err!(self.dev, "POLARIS: GPU {} budget exceeded, no offload victim fits in CPU pool\n", gpu_id);
                     return Err(ENOMEM);
                 }
             };
-
-            // Check CPU pool capacity.
-            let pool_ok;
-            let victim_sz;
-            let victim_gpu;
-            {
-                let inner = guard.as_mut().ok_or(ENODEV)?;
-                let b = match inner.blocks.iter().find(|b| b.block_id == victim_id) {
-                    Some(b) => b,
-                    None => return Err(ENOENT),
-                };
-                victim_sz = b.size_bytes;
-                victim_gpu = b.home_gpu;
-                pool_ok = match inner.gpus.iter().find(|g| g.gpu_id == victim_gpu) {
-                    Some(g) => g.cpu_pool_used_bytes + victim_sz <= g.cpu_pool_total_bytes,
-                    None => false,
-                };
-            }
-
-            if !pool_ok {
-                dev_err!(
-                    self.dev,
-                    "POLARIS: CPU pool exhausted for offload, cannot offload block {}\n",
-                    victim_id,
-                );
-                return Err(ENOMEM);
-            }
 
             // Queue OFFLOAD for the victim.
             {
@@ -1135,6 +1140,7 @@ impl PolarisDevice {
                     Some(b) => b,
                     None => return Err(ENOENT),
                 };
+                let src_phys = block.gpu_phys_handle;
                 block.state = PolarisBlockState::OffloadPending;
                 let dec_id = inner.next_decision_id;
                 inner.next_decision_id += 1;
@@ -1147,7 +1153,7 @@ impl PolarisDevice {
                         gpu_id: victim_gpu,
                         block_id: victim_id,
                         session_id: block.session_id,
-                        src_handle: 0,
+                        src_handle: src_phys,
                         dst_vaddr: 0,
                         size_bytes: victim_sz,
                         cpu_addr: 0,
@@ -1200,6 +1206,20 @@ impl PolarisDevice {
         }
 
         // ── Allocate new block ───────────────────────────────────────────
+        // G6: reject BLOCK_GROW when the pending decision queue is full.
+        // This prevents the kernel from OOM-ing when the daemon is stuck.
+        {
+            let inner = guard.as_mut().ok_or(ENODEV)?;
+            if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: pending decision queue full ({}), rejecting BLOCK_GROW\n",
+                    inner.pending_decisions.len()
+                );
+                return Err(ENOMEM);
+            }
+        }
+
         let block_id;
         let dec_id;
         {
@@ -1342,7 +1362,9 @@ impl PolarisDevice {
 
         if inner.blocks[block_idx].refcount == 0 {
             // No more sessions reference this block — release GPU resources.
-            if inner.daemon_attached > 0 && phys_handle != 0
+            // G6: if the pending decision queue is full, clean up directly.
+            let queue_full = inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS;
+            if !queue_full && inner.daemon_attached > 0 && phys_handle != 0
                 && current_state != PolarisBlockState::FreePending
             {
                 let dec_id = inner.next_decision_id;
@@ -1369,7 +1391,7 @@ impl PolarisDevice {
 
                 dev_info!(self.dev, "POLARIS: block {} free queued (FREE decision {})\n", block_id, dec_id);
             } else {
-                // No daemon or never mapped: remove the block directly.
+                // No daemon, queue full, or never mapped: remove the block directly.
                 if current_state == PolarisBlockState::Resident {
                     if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == home_gpu) {
                         gpu.used_bytes = gpu.used_bytes.saturating_sub(size_bytes);
