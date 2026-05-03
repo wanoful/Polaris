@@ -1,5 +1,6 @@
 use crate::cuda_vmm;
 use crate::gpu::GpuState;
+use crate::offload::CpuPool;
 use libc::c_int;
 use libpolaris::types::*;
 
@@ -14,6 +15,7 @@ pub fn execute(
     _fd: c_int,
     dec: &PolarisDecision,
     gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
     test_err: i32,
 ) -> ExecutionResult {
     if test_err != 0 {
@@ -60,14 +62,14 @@ pub fn execute(
         };
     }
 
-    let outcome = dispatch(dec, gpu);
+    let outcome = dispatch(dec, gpu, cpu_pool);
 
     let _ = cuda_vmm::pop_context();
 
     outcome
 }
 
-fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
+fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -> ExecutionResult {
     let mut result: i32 = 0;
     let mut output_handle: u64 = 0;
     let output_cpu_addr: u64 = dec.cpu_addr;
@@ -133,7 +135,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             );
         }
 
-        // ─── FREE: cuMemUnmap + cuMemRelease ────────────────────────
+        // ─── FREE: cuMemUnmap + cuMemRelease + CPU pool cleanup ───────
         x if x == PolarisDecisionOp::Free as u32 => {
             let phys = if dec.src_handle != 0 {
                 dec.src_handle
@@ -154,6 +156,13 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             } else if phys != 0 {
                 let _ = cuda_vmm::release_physical(phys);
                 eprintln!("polarisd: FREE block {} -> phys={phys:#x} (no VA track)", dec.block_id);
+            }
+
+            // Free the CPU buffer if this block was offloaded.
+            if let Some(cpu_addr) = cpu_pool.untrack(dec.block_id) {
+                let sz = dec.size_bytes.max(1);
+                cpu_pool.free(cpu_addr, sz);
+                eprintln!("polarisd: FREE block {} -> released CPU buffer {cpu_addr:#x}", dec.block_id);
             }
 
             gpu.remove_block(dec.block_id);
@@ -202,54 +211,28 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             }
         }
 
-        // ─── OFFLOAD (Phase 2a stub): unmap only, no data copy ─────
+        // ─── OFFLOAD: copy GPU→CPU, unmap VA, report CPU buffer addr ──
         x if x == PolarisDecisionOp::Offload as u32 => {
-            // Extract VA info first (avoid borrowing va_allocs across mutable calls).
-            let va_info = gpu.get_va_alloc(dec.block_id).map(|v| (v.vaddr, v.size));
-            if let Some((vaddr, size)) = va_info {
-                let _ = cuda_vmm::unmap_memory(vaddr, size);
-                gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
-                // Return VA to the pool; phys handle stays tracked for reload.
-                gpu.va_allocs.remove(&dec.block_id);
-                gpu.vas.free(vaddr, size);
-                eprintln!(
-                    "polarisd: OFFLOAD block {} (stub: unmap VA {:#x}, no data copy)",
-                    dec.block_id, vaddr
-                );
-            }
+            let (res, handle, cpu_addr) = crate::offload::execute_offload(dec, gpu, cpu_pool);
+            result = res;
+            output_handle = handle;
+            return ExecutionResult {
+                result,
+                output_handle,
+                output_cpu_addr: cpu_addr,
+            };
         }
 
-        // ─── RELOAD (Phase 2a stub): alloc + map, no data copy ─────
+        // ─── RELOAD: alloc + map + copy CPU→GPU, report new phys handle ──
         x if x == PolarisDecisionOp::Reload as u32 => {
-            let size = snap_up(dec.size_bytes, gpu.granule);
-            let vaddr = match gpu.vas.allocate(size, gpu.granule) {
-                Some(va) => va,
-                None => {
-                    return ExecutionResult {
-                        result: -(libc::ENOMEM as i32),
-                        output_handle: 0,
-                        output_cpu_addr: 0,
-                    };
-                }
+            let (res, handle, cpu_addr) = crate::offload::execute_reload(dec, gpu, cpu_pool);
+            result = res;
+            output_handle = handle;
+            return ExecutionResult {
+                result,
+                output_handle,
+                output_cpu_addr: cpu_addr,
             };
-            match cuda_vmm::create_physical(size, gpu.device_ordinal) {
-                Ok(h) => {
-                    let _ = cuda_vmm::map_memory(vaddr, h, size);
-                    let _ = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal);
-                    gpu.track_handle(dec.block_id, h);
-                    gpu.track_va(dec.block_id, vaddr, size);
-                    gpu.used_bytes += size;
-                    output_handle = h;
-                    eprintln!(
-                        "polarisd: RELOAD block {} (stub: alloc+map, no copy)",
-                        dec.block_id
-                    );
-                }
-                Err(e) => {
-                    eprintln!("polarisd: RELOAD failed: {e}");
-                    result = -(libc::ENOMEM as i32);
-                }
-            }
         }
 
         // ─── COW_BREAK (Phase 3 stub): alloc new + map ─────────────

@@ -187,3 +187,33 @@ pub fn free_host(ptr: u64) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Copy data from GPU device memory to host (pinned) memory.
+pub fn copy_device_to_host(dst_host: u64, src_device: u64, byte_count: usize) -> Result<(), String> {
+    let res = unsafe {
+        sys::cuMemcpyDtoH_v2(
+            dst_host as *mut std::os::raw::c_void,
+            src_device as sys::CUdeviceptr,
+            byte_count,
+        )
+    };
+    if res != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuMemcpyDtoH({dst_host:#x}, {src_device:#x}, {byte_count}) failed: error code {res:?}"));
+    }
+    Ok(())
+}
+
+/// Copy data from host (pinned) memory to GPU device memory.
+pub fn copy_host_to_device(dst_device: u64, src_host: u64, byte_count: usize) -> Result<(), String> {
+    let res = unsafe {
+        sys::cuMemcpyHtoD_v2(
+            dst_device as sys::CUdeviceptr,
+            src_host as *const std::os::raw::c_void,
+            byte_count,
+        )
+    };
+    if res != CUresult::CUDA_SUCCESS {
+        return Err(format!("cuMemcpyHtoD({dst_device:#x}, {src_host:#x}, {byte_count}) failed: error code {res:?}"));
+    }
+    Ok(())
+}

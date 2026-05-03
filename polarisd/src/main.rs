@@ -3,6 +3,7 @@ mod decision;
 mod gpu;
 mod lifecycle;
 mod nvml;
+mod offload;
 
 use gpu::GpuState;
 use libc::c_int;
@@ -131,6 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cpu_pool_base,
     );
 
+    // Build CPU pool allocator from the pre-allocated pinned memory.
+    let mut cpu_pool = offload::CpuPool::new(cpu_pool_base, cpu_pool_bytes);
+
     // Load test error mode from env.
     let test_err: i32 = std::env::var("POLARIS_TEST_ERROR")
         .ok()
@@ -149,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enter the decision loop.
     eprintln!("polarisd: entering decision loop");
-    decision_loop(fd, &mut gpu_state, test_err)?;
+    decision_loop(fd, &mut gpu_state, &mut cpu_pool, test_err)?;
 
     // Notify systemd that the daemon is stopping cleanly.
     lifecycle::notify_stopping();
@@ -160,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn decision_loop(
     fd: c_int,
     gpu: &mut GpuState,
+    cpu_pool: &mut offload::CpuPool,
     test_err: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut decision_arg = PolarisGetDecisionArg::default();
@@ -172,7 +177,7 @@ fn decision_loop(
                     eprintln!("polarisd: received {count} decision(s)");
                     for i in 0..count {
                         let dec = &decision_arg.decisions[i];
-                        let exec = decision::execute(fd, dec, gpu, test_err);
+                        let exec = decision::execute(fd, dec, gpu, cpu_pool, test_err);
 
                         let complete = PolarisCompleteOperationArg {
                             decision_id: dec.decision_id,
