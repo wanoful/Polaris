@@ -1065,9 +1065,11 @@ impl PolarisDevice {
             {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
                 let mut vid: Option<u64> = None;
-                // First pass: same session.
+                // Phase 2a: prefer OTHER sessions first. Offloading a block
+                // from the calling session causes thrash — the next BLOCK_GROW
+                // will reload it via the pre-decode residency check.
                 for b in inner.blocks.iter() {
-                    if b.session_id == arg.session_id
+                    if b.session_id != arg.session_id
                         && b.state == PolarisBlockState::Resident
                         && b.refcount <= 1
                         && b.pending_decision_id == 0
@@ -1076,7 +1078,7 @@ impl PolarisDevice {
                         break;
                     }
                 }
-                // Second pass: any session.
+                // Fallback: any session (including self) if no cross-session victim.
                 if vid.is_none() {
                     for b in inner.blocks.iter() {
                         if b.state == PolarisBlockState::Resident
