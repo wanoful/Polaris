@@ -388,6 +388,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_GET_DECISION => me.handle_get_decision(user_ptr, size),
             POLARIS_COMPLETE_OPERATION => me.handle_complete_operation(user_ptr, size),
             POLARIS_GET_GLOBAL_STATS => me.handle_get_global_stats(user_ptr, size),
+            POLARIS_LIST_SESSIONS => me.handle_list_sessions(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -751,9 +752,6 @@ impl PolarisDevice {
             return Err(ENOENT);
         }
 
-        let block_id = inner.next_block_id;
-        inner.next_block_id += 1;
-
         // G4: check GPU health for the session's home GPU and extract settings.
         let (gpu_id, bpt) = {
             let sess = inner.sessions.iter().find(|s| s.session_id == arg.session_id);
@@ -772,13 +770,25 @@ impl PolarisDevice {
 
         let size_bytes = (arg.token_count as u64) * bpt;
 
-        // G4: check GPU budget before allocating.
+        // G4: check GPU budget before allocating, accounting for in-flight blocks.
+        let pending = inner.blocks.iter()
+            .filter(|b| b.home_gpu == gpu_id)
+            .filter(|b| matches!(b.state,
+                PolarisBlockState::AllocPending
+                | PolarisBlockState::ReloadPending
+                | PolarisBlockState::CowPending))
+            .map(|b| b.size_bytes)
+            .sum::<u64>();
+
         if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == gpu_id) {
-            if gpu.used_bytes + size_bytes > gpu.budget_bytes {
+            if gpu.used_bytes + pending + size_bytes > gpu.budget_bytes {
                 dev_err!(self.dev, "POLARIS: GPU {} budget exceeded on BLOCK_GROW\n", gpu_id);
                 return Err(ENOMEM);
             }
         }
+
+        let block_id = inner.next_block_id;
+        inner.next_block_id += 1;
 
         let dec_id = inner.next_decision_id;
         inner.next_decision_id += 1;
@@ -921,7 +931,9 @@ impl PolarisDevice {
 
         if inner.blocks[block_idx].refcount == 0 {
             // No more sessions reference this block — release GPU resources.
-            if inner.daemon_attached > 0 && phys_handle != 0 {
+            if inner.daemon_attached > 0 && phys_handle != 0
+                && current_state != PolarisBlockState::FreePending
+            {
                 let dec_id = inner.next_decision_id;
                 inner.next_decision_id += 1;
 
@@ -976,11 +988,12 @@ impl PolarisDevice {
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
         let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+        let touch_end = arg.token_start + arg.token_count;
         for block in inner.blocks.iter_mut() {
             if block.session_id == arg.session_id {
                 let start = block.token_start as u64;
                 let end = start + block.token_count as u64;
-                if start >= arg.token_start && end <= arg.token_start + arg.token_count {
+                if start < touch_end && end > arg.token_start {
                     block.last_touch_ns = now;
                 }
             }
@@ -1045,10 +1058,11 @@ impl PolarisDevice {
             inner.pending_decisions.clear();
         }
 
+        let now = unsafe { bindings::ktime_get_mono_fast_ns() };
         for i in 0..count {
             let block_id = arg.decisions[i].block_id;
             if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
-                block.last_touch_ns = 0;
+                block.last_touch_ns = now;
             }
         }
 
@@ -1098,6 +1112,7 @@ impl PolarisDevice {
                     PolarisBlockState::AllocPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
+                        block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
                     }
                     PolarisBlockState::OffloadPending => {
                         block.state = PolarisBlockState::CpuOffloaded;
@@ -1106,6 +1121,7 @@ impl PolarisDevice {
                     PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
+                        block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
                     }
                     PolarisBlockState::FreePending => {
                         block.state = PolarisBlockState::Evicted;
@@ -1273,17 +1289,26 @@ impl PolarisDevice {
         Ok(0)
     }
 
-    /// Re-queue an ALLOC decision for a block (G4 retry path).
+    /// Re-queue a decision for a block (G4 retry path).
+    /// Preserves the original operation type based on block state.
     fn requeue_decision(&self, inner: &mut PolarisInner, block_idx: usize) {
         let block = &mut inner.blocks[block_idx];
         let dec_id = inner.next_decision_id;
         inner.next_decision_id += 1;
         block.pending_decision_id = dec_id;
 
+        let op = match block.state {
+            PolarisBlockState::AllocPending => PolarisDecisionOp::Alloc as u32,
+            PolarisBlockState::OffloadPending => PolarisDecisionOp::Offload as u32,
+            PolarisBlockState::ReloadPending => PolarisDecisionOp::Reload as u32,
+            PolarisBlockState::CowPending => PolarisDecisionOp::CowBreak as u32,
+            _ => PolarisDecisionOp::Alloc as u32,
+        };
+
         let _ = inner.pending_decisions.push(
             PolarisDecision {
                 decision_id: dec_id,
-                op: PolarisDecisionOp::Alloc as u32,
+                op,
                 gpu_id: block.home_gpu,
                 block_id: block.block_id,
                 session_id: block.session_id,
@@ -1347,6 +1372,24 @@ impl PolarisDevice {
         arg.used_gpu_bytes = used_gpu;
         arg.cpu_pool_total = cpu_total;
         arg.cpu_pool_used = cpu_used;
+
+        let mut writer = UserSlice::new(user_ptr, size).writer();
+        writer.write(&arg)?;
+        Ok(0)
+    }
+
+    fn handle_list_sessions(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let mut arg: PolarisListSessionsArg = reader.read()?;
+        let guard = POLARIS_STATE.lock();
+        let inner = guard.as_ref().ok_or(ENODEV)?;
+
+        let count = core::cmp::min(inner.sessions.len(), POLARIS_MAX_SESSIONS_PER_LIST);
+        arg.count = count as u32;
+        for (i, session) in inner.sessions.iter().take(count).enumerate() {
+            arg.session_ids[i] = session.session_id;
+        }
+        drop(guard);
 
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;

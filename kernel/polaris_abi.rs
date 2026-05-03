@@ -57,6 +57,7 @@ pub const POLARIS_GROW_FLAG_OVERWRITE: u32 = 1 << 0;
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 pub const POLARIS_MAX_DECISIONS_PER_POLL: usize = 16;
+pub const POLARIS_MAX_SESSIONS_PER_LIST: usize = 64;
 pub const POLARIS_DEFAULT_BYTES_PER_TOKEN: u64 = 524_288;
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -210,4 +211,22 @@ pub struct PolarisGetGlobalStatsArg {
     pub cpu_pool_total: u64,
     pub cpu_pool_used: u64,
     pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PolarisListSessionsArg {
+    pub count: u32,
+    pub _reserved: u32,
+    pub session_ids: [u64; POLARIS_MAX_SESSIONS_PER_LIST],
+}
+
+impl Default for PolarisListSessionsArg {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            _reserved: 0,
+            session_ids: [0u64; POLARIS_MAX_SESSIONS_PER_LIST],
+        }
+    }
 }

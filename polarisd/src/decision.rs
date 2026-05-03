@@ -111,7 +111,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
                 };
             }
 
-            if let Err(e) = cuda_vmm::set_access(vaddr, size) {
+            if let Err(e) = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal) {
                 eprintln!("polarisd: cuMemSetAccess failed for block {}: {e}", dec.block_id);
                 let _ = cuda_vmm::unmap_memory(vaddr, size);
                 let _ = cuda_vmm::release_physical(phys);
@@ -167,7 +167,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             } else if let Err(e) = cuda_vmm::map_memory(dec.dst_vaddr, dec.src_handle, size) {
                 eprintln!("polarisd: MAP failed: {e}");
                 result = -(libc::EINVAL as i32);
-            } else if let Err(e) = cuda_vmm::set_access(dec.dst_vaddr, size) {
+            } else if let Err(e) = cuda_vmm::set_access(dec.dst_vaddr, size, gpu.device_ordinal) {
                 eprintln!("polarisd: MAP set_access failed: {e}");
                 let _ = cuda_vmm::unmap_memory(dec.dst_vaddr, size);
                 result = -(libc::EINVAL as i32);
@@ -235,7 +235,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             match cuda_vmm::create_physical(size, gpu.device_ordinal) {
                 Ok(h) => {
                     let _ = cuda_vmm::map_memory(vaddr, h, size);
-                    let _ = cuda_vmm::set_access(vaddr, size);
+                    let _ = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal);
                     gpu.track_handle(dec.block_id, h);
                     gpu.track_va(dec.block_id, vaddr, size);
                     gpu.used_bytes += size;
@@ -268,7 +268,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState) -> ExecutionResult {
             match cuda_vmm::create_physical(size, gpu.device_ordinal) {
                 Ok(h) => {
                     let _ = cuda_vmm::map_memory(vaddr, h, size);
-                    let _ = cuda_vmm::set_access(vaddr, size);
+                    let _ = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal);
                     gpu.track_handle(dec.block_id, h);
                     gpu.track_va(dec.block_id, vaddr, size);
                     gpu.used_bytes += size;

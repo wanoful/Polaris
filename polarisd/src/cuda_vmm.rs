@@ -78,12 +78,12 @@ fn make_device_location(dev_ordinal: i32) -> CUmemLocation {
     }
 }
 
-pub fn get_allocation_granularity() -> Result<u64, String> {
+pub fn get_allocation_granularity(dev_ordinal: i32) -> Result<u64, String> {
     let mut granule: usize = 0;
     let prop = CUmemAllocationProp {
         type_: CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
         requestedHandleTypes: CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_NONE,
-        location: make_device_location(0),
+        location: make_device_location(dev_ordinal),
         win32HandleMetaData: std::ptr::null_mut(),
         allocFlags: unsafe { std::mem::zeroed() },
     };
@@ -143,9 +143,9 @@ pub fn map_memory(vaddr: u64, phys_handle: u64, size: u64) -> Result<(), String>
     Ok(())
 }
 
-pub fn set_access(vaddr: u64, size: u64) -> Result<(), String> {
+pub fn set_access(vaddr: u64, size: u64, dev_ordinal: i32) -> Result<(), String> {
     let desc = CUmemAccessDesc {
-        location: make_device_location(0),
+        location: make_device_location(dev_ordinal),
         flags: CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
     };
     let res = unsafe { sys::cuMemSetAccess(vaddr, size as usize, &desc, 1) };

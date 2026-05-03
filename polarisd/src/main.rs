@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cuda_vmm::push_context(ctx)?;
 
     // Get allocation granularity.
-    let granule = cuda_vmm::get_allocation_granularity()?;
+    let granule = cuda_vmm::get_allocation_granularity(info.index as i32)?;
     eprintln!("polarisd: allocation granularity = {granule} bytes ({} MiB)", granule / (1024 * 1024));
 
     // Reserve GPU virtual address space (configurable via POLARIS_VA_RESERVE_GIB).
@@ -72,13 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_pool_bytes = info.total_memory * 2;
 
     // Pre-allocate CPU pinned memory pool for block offloads.
-    let cpu_pool_base = match cuda_vmm::allocate_host(cpu_pool_bytes) {
+    let (cpu_pool_bytes, cpu_pool_base) = match cuda_vmm::allocate_host(cpu_pool_bytes) {
         Ok(ptr) => {
+            let cpb = info.total_memory * 2;
             eprintln!(
                 "polarisd: allocated CPU pinned memory pool: {} MiB at {ptr:#x}",
-                cpu_pool_bytes / (1024 * 1024)
+                cpb / (1024 * 1024)
             );
-            ptr
+            (cpb, ptr)
         }
         Err(e) => {
             eprintln!(
@@ -90,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "polarisd:   Check available host memory and try reducing the pool size."
             );
-            0u64
+            (0u64, 0u64)
         }
     };
 

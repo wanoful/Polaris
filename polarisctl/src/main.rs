@@ -136,11 +136,29 @@ fn cmd_destroy_session(fd: c_int, session_id: u64) -> Result<(), Box<dyn std::er
 }
 
 fn cmd_list_sessions(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
-    // Use GET_GLOBAL_STATS to count sessions, then attempt to fetch each.
-    let mut stats = PolarisGetGlobalStatsArg::default();
-    ioctl::ioctl_read(fd, ioctl::POLARIS_GET_GLOBAL_STATS, &mut stats)
-        .map_err(|e| format!("GET_GLOBAL_STATS failed: errno {e}"))?;
+    let mut arg = PolarisListSessionsArg::default();
+    ioctl::ioctl_read(fd, ioctl::POLARIS_LIST_SESSIONS, &mut arg)
+        .map_err(|e| format!("LIST_SESSIONS failed: errno {e}"))?;
 
-    println!("Total sessions: {}. Use --stats for per-session details.", stats.total_sessions);
+    let count = arg.count as usize;
+    println!("Sessions: {count}");
+    for i in 0..count {
+        let sid = arg.session_ids[i];
+        let mut info = PolarisSessionGetStatsArg {
+            session_id: sid,
+            ..Default::default()
+        };
+        match ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_GET_STATS, &mut info) {
+            Ok(()) => {
+                println!(
+                    "  id={} gpu={} beam={} blocks={} vas_bytes={}",
+                    sid, info.home_gpu, info.beam_width, info.num_blocks, info.total_bytes
+                );
+            }
+            Err(e) => {
+                println!("  id={} (error fetching details: errno {e})", sid);
+            }
+        }
+    }
     Ok(())
 }

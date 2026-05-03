@@ -81,6 +81,9 @@ pub const POLARIS_COMPLETE_OPERATION: u32 =
 pub const POLARIS_GET_GLOBAL_STATS: u32 =
     iowr!(MAGIC, 0x0C, PolarisGetGlobalStatsArg);
 
+pub const POLARIS_LIST_SESSIONS: u32 =
+    iowr!(MAGIC, 0x0D, PolarisListSessionsArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.

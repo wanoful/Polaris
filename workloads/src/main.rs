@@ -118,6 +118,10 @@ fn run_synthetic_kv(fd: c_int, num_blocks: u32, tokens_per_block: u32) -> Result
         };
         ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow_arg)
             .map_err(|e| format!("BLOCK_GROW: errno {e}"))?;
+        if grow_arg.ret_code != 0 {
+            eprintln!("  Block {} allocation failed (ret_code={})", i, grow_arg.ret_code);
+            return Err(format!("BLOCK_GROW {} failed with {}", i, grow_arg.ret_code).into());
+        }
         eprintln!("  Block {} allocated (id={})", i, grow_arg.block_id);
     }
 
@@ -174,6 +178,9 @@ fn run_beam_search(fd: c_int, beam_width: u32, decode_steps: u32) -> Result<(), 
         };
         ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow)
             .map_err(|e| format!("BLOCK_GROW: errno {e}"))?;
+        if grow.ret_code != 0 {
+            return Err(format!("BLOCK_GROW block {} for parent failed with {}", i, grow.ret_code).into());
+        }
     }
     eprintln!("Prompt blocks allocated for parent");
 
@@ -244,6 +251,9 @@ fn run_concurrent(fd: c_int, num_sessions: u32, blocks_per_session: u32) -> Resu
                 ..Default::default()
             };
             ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow).ok();
+            if grow.ret_code != 0 {
+                eprintln!("  Session {} block {} allocation failed (ret_code={})", s, i, grow.ret_code);
+            }
         }
 
         if (s + 1) % 10 == 0 {
