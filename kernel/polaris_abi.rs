@@ -35,7 +35,20 @@ pub enum PolarisPhase {
     Decode = 2,
 }
 
-// ─── Decision Opcodes ───────────────────────────────────────────────────────
+// ─── Eviction Policy (Phase 2b) ─────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum PolarisEvictionPolicy {
+    /// Victim = block with the oldest map_time_ns.
+    Fifo = 0,
+    /// Victim = block with the oldest last_touch_ns.
+    Lru = 1,
+    /// Victim = highest scoring function value (prefill preferred, decode/recent protected).
+    PhaseAware = 2,
+}
+
+// ─── Decision Opcodes ───────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u32)]
@@ -210,7 +223,19 @@ pub struct PolarisGetGlobalStatsArg {
     pub used_gpu_bytes: u64,
     pub cpu_pool_total: u64,
     pub cpu_pool_used: u64,
-    pub _reserved: [u64; 4],
+    pub eviction_policy: u32,
+    pub _policy_pad: u32,
+    pub offload_count: u64,
+    pub reload_count: u64,
+    pub total_evictions: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisSetPolicyArg {
+    pub policy: u32,
+    pub _reserved: u32,
+    pub _reserved2: [u64; 2],
 }
 
 #[repr(C)]

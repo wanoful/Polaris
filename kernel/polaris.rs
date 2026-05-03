@@ -12,6 +12,7 @@
 //! value of the kernel module — cross-process visibility.
 
 mod polaris_types;
+mod polaris_policy;
 
 use core::pin::Pin;
 
@@ -34,7 +35,7 @@ use polaris_types::*;
 
 // ─── Global shared state ────────────────────────────────────────────────────
 
-struct PolarisInner {
+pub(crate) struct PolarisInner {
     next_block_id: u64,
     next_session_id: u64,
     next_decision_id: u64,
@@ -43,6 +44,10 @@ struct PolarisInner {
     blocks: KVec<PolarisBlock>,
     sessions: KVec<PolarisSession>,
     pending_decisions: KVec<PolarisDecision>,
+    eviction_policy: PolarisEvictionPolicy,
+    offload_count: u64,
+    reload_count: u64,
+    total_evictions: u64,
 }
 
 // Global state protected by a kernel mutex.  Wrapped in Option because
@@ -157,6 +162,10 @@ unsafe extern "C" fn polaris_stats_show(
     let blocks = inner.blocks.len();
     let gpus = inner.gpus.len();
     let decisions = inner.pending_decisions.len();
+    let policy: u32 = inner.eviction_policy as u32;
+    let offload_cnt = inner.offload_count;
+    let reload_cnt = inner.reload_count;
+    let evictions = inner.total_evictions;
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -177,6 +186,10 @@ blocks:         {blocks}
 gpus:           {gpus}
   unhealthy:    {unhealthy}
 daemon:         {daemon}
+policy:         {policy} (0=fifo,1=lru,2=phase_aware)
+offloads:       {offload_cnt}
+reloads:        {reload_cnt}
+evictions:      {evictions}
 gpu_total_mib:  {gpu_total_mib}
 gpu_used_mib:   {gpu_used_mib}
 cpu_pool_mib:   {cpu_pool_mib}
@@ -194,6 +207,10 @@ pending_decs:   {decisions}
                 gpus = gpus,
                 unhealthy = unhealthy_gpus,
                 daemon = daemon,
+                policy = policy,
+                offload_cnt = offload_cnt,
+                reload_cnt = reload_cnt,
+                evictions = evictions,
                 gpu_total_mib = total_gpu / (1024 * 1024),
                 gpu_used_mib = used_gpu / (1024 * 1024),
                 cpu_pool_mib = cpu_total / (1024 * 1024),
@@ -287,6 +304,10 @@ impl kernel::InPlaceModule for PolarisModule {
                 blocks: KVec::new(),
                 sessions: KVec::new(),
                 pending_decisions: KVec::new(),
+                eviction_policy: PolarisEvictionPolicy::Fifo,
+                offload_count: 0,
+                reload_count: 0,
+                total_evictions: 0,
             });
         }
 
@@ -389,6 +410,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_COMPLETE_OPERATION => me.handle_complete_operation(user_ptr, size),
             POLARIS_GET_GLOBAL_STATS => me.handle_get_global_stats(user_ptr, size),
             POLARIS_LIST_SESSIONS => me.handle_list_sessions(user_ptr, size),
+            POLARIS_SET_POLICY => me.handle_set_policy(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -847,56 +869,13 @@ impl PolarisDevice {
                 }
 
                 // Find a victim to offload to make room for this reload.
-                // Combined victim selection + CPU pool capacity check:
-                // iterate through victims until we find one that fits in the CPU pool.
-                // Prefer OTHER sessions (session_id != self), then fall back to any.
-                let vid;
-                {
+                let vid = {
                     let inner = guard.as_mut().ok_or(ENODEV)?;
-                    let mut victim: Option<(u64, u64, u32)> = None; // (block_id, size, gpu_id)
-
-                    // Pass 1: other sessions, must fit in CPU pool.
-                    for b in inner.blocks.iter() {
-                        if b.session_id != arg.session_id
-                            && b.state == PolarisBlockState::Resident
-                            && b.refcount <= 1
-                            && b.pending_decision_id == 0
-                            && b.block_id != bid
-                        {
-                            let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
-                                Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
-                                None => false,
-                            };
-                            if fits {
-                                victim = Some((b.block_id, b.size_bytes, b.home_gpu));
-                                break;
-                            }
-                        }
-                    }
-                    // Pass 2: any session, must fit in CPU pool.
-                    if victim.is_none() {
-                        for b in inner.blocks.iter() {
-                            if b.state == PolarisBlockState::Resident
-                                && b.refcount <= 1
-                                && b.pending_decision_id == 0
-                                && b.block_id != bid
-                            {
-                                let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
-                                    Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
-                                    None => false,
-                                };
-                                if fits {
-                                    victim = Some((b.block_id, b.size_bytes, b.home_gpu));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    vid = victim;
-                }
+                    polaris_policy::select_victim(inner, arg.session_id)
+                };
 
                 let (victim_id, victim_sz, victim_gpu) = match vid {
-                    Some((id, sz, gpu)) => (id, sz, gpu),
+                    Some((_, id, sz, gpu)) => (id, sz, gpu),
                     None => {
                         dev_err!(
                             self.dev,
@@ -1079,54 +1058,14 @@ impl PolarisDevice {
                 break;
             }
 
-            // Select a victim to offload.
-            // Combined victim selection + CPU pool capacity check:
-            // iterate through victims until we find one that fits in the CPU pool.
-            let victim;
-            {
+            // Select a victim to offload using the current eviction policy.
+            let victim = {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
-                let mut vid: Option<(u64, u64, u32)> = None; // (block_id, size, gpu_id)
-
-                // Pass 1: prefer OTHER sessions that fit in CPU pool.
-                for b in inner.blocks.iter() {
-                    if b.session_id != arg.session_id
-                        && b.state == PolarisBlockState::Resident
-                        && b.refcount <= 1
-                        && b.pending_decision_id == 0
-                    {
-                        let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
-                            Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
-                            None => false,
-                        };
-                        if fits {
-                            vid = Some((b.block_id, b.size_bytes, b.home_gpu));
-                            break;
-                        }
-                    }
-                }
-                // Pass 2: any session that fits in CPU pool.
-                if vid.is_none() {
-                    for b in inner.blocks.iter() {
-                        if b.state == PolarisBlockState::Resident
-                            && b.refcount <= 1
-                            && b.pending_decision_id == 0
-                        {
-                            let fits = match inner.gpus.iter().find(|g| g.gpu_id == b.home_gpu) {
-                                Some(g) => g.cpu_pool_used_bytes + b.size_bytes <= g.cpu_pool_total_bytes,
-                                None => false,
-                            };
-                            if fits {
-                                vid = Some((b.block_id, b.size_bytes, b.home_gpu));
-                                break;
-                            }
-                        }
-                    }
-                }
-                victim = vid;
-            }
+                polaris_policy::select_victim(inner, arg.session_id)
+            };
 
             let (victim_id, victim_sz, victim_gpu) = match victim {
-                Some((id, sz, gpu)) => (id, sz, gpu),
+                Some((_, id, sz, gpu)) => (id, sz, gpu),
                 None => {
                     dev_err!(self.dev, "POLARIS: GPU {} budget exceeded, no offload victim fits in CPU pool\n", gpu_id);
                     return Err(ENOMEM);
@@ -1557,18 +1496,26 @@ impl PolarisDevice {
                         block.state = PolarisBlockState::CpuOffloaded;
                         block.cpu_buf_addr = arg.output_cpu_addr;
                         // Phys handle was released by the daemon during offload.
-                        // Zero it so future FREE decisions don't send a stale handle.
                         block.gpu_phys_handle = 0;
                     }
                     PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
                         block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
-                        // The old CPU buffer is no longer valid after reload.
                         block.cpu_buf_addr = 0;
                     }
                     PolarisBlockState::FreePending => {
                         block.state = PolarisBlockState::Evicted;
+                    }
+                    _ => {}
+                }
+                // Track per-policy statistics.
+                match prev_state {
+                    PolarisBlockState::OffloadPending => {
+                        inner.offload_count = inner.offload_count.saturating_add(1);
+                    }
+                    PolarisBlockState::ReloadPending => {
+                        inner.reload_count = inner.reload_count.saturating_add(1);
                     }
                     _ => {}
                 }
@@ -1733,6 +1680,7 @@ impl PolarisDevice {
         // remaining) keep the AllocPending state and a new pending_decision_id —
         // the waiter should NOT be woken yet.
         if inner.blocks[block_idx].state == PolarisBlockState::Evicted {
+            inner.total_evictions = inner.total_evictions.saturating_add(1);
             let comp_ptr = inner.blocks[block_idx].completion_ptr;
             inner.blocks[block_idx].completion_ptr = core::ptr::null_mut();
             if !comp_ptr.is_null() {
@@ -1817,6 +1765,10 @@ impl PolarisDevice {
             cpu_total += gpu.cpu_pool_total_bytes;
             cpu_used += gpu.cpu_pool_used_bytes;
         }
+        let policy = inner.eviction_policy as u32;
+        let offload_cnt = inner.offload_count;
+        let reload_cnt = inner.reload_count;
+        let evictions = inner.total_evictions;
         drop(guard);
 
         arg.blocks_resident = resident;
@@ -1828,9 +1780,45 @@ impl PolarisDevice {
         arg.used_gpu_bytes = used_gpu;
         arg.cpu_pool_total = cpu_total;
         arg.cpu_pool_used = cpu_used;
+        arg.eviction_policy = policy;
+        arg.offload_count = offload_cnt;
+        arg.reload_count = reload_cnt;
+        arg.total_evictions = evictions;
 
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
+        Ok(0)
+    }
+
+    fn handle_set_policy(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let arg: PolarisSetPolicyArg = reader.read()?;
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+
+        match arg.policy {
+            0 => inner.eviction_policy = PolarisEvictionPolicy::Fifo,
+            1 => inner.eviction_policy = PolarisEvictionPolicy::Lru,
+            2 => inner.eviction_policy = PolarisEvictionPolicy::PhaseAware,
+            _ => {
+                dev_err!(
+                    self.dev,
+                    "POLARIS: unknown eviction policy {} (valid: 0=fifo, 1=lru, 2=phase_aware)\n",
+                    arg.policy
+                );
+                return Err(EINVAL);
+            }
+        }
+
+        // Reset per-policy counters on policy switch.
+        inner.offload_count = 0;
+        inner.reload_count = 0;
+
+        dev_info!(
+            self.dev,
+            "POLARIS: eviction policy set to {:?}\n",
+            inner.eviction_policy
+        );
         Ok(0)
     }
 

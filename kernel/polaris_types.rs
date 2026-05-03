@@ -58,6 +58,9 @@ pub const POLARIS_GET_GLOBAL_STATS: u32 =
 pub const POLARIS_LIST_SESSIONS: u32 =
     kernel::ioctl::_IOWR::<PolarisListSessionsArg>(POLARIS_IOCTL_MAGIC, 0x0D);
 
+pub const POLARIS_SET_POLICY: u32 =
+    kernel::ioctl::_IOW::<PolarisSetPolicyArg>(POLARIS_IOCTL_MAGIC, 0x0E);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -212,6 +215,9 @@ unsafe impl kernel::transmute::AsBytes for PolarisGetGlobalStatsArg {}
 // Since PolarisDecision: FromBytes, the array and struct are also FromBytes.
 unsafe impl kernel::transmute::FromBytes for PolarisGetDecisionArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisGetDecisionArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisSetPolicyArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisSetPolicyArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisListSessionsArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisListSessionsArg {}

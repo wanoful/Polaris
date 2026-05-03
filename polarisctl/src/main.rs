@@ -47,6 +47,11 @@ enum Commands {
     },
     /// List all sessions
     ListSessions,
+    /// Set eviction policy (0=FIFO, 1=LRU, 2=PhaseAware)
+    SetPolicy {
+        /// Policy: 0=FIFO, 1=LRU, 2=phase_aware
+        policy: u32,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -67,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::DestroySession { session_id } => cmd_destroy_session(fd, session_id)?,
         Commands::ListSessions => cmd_list_sessions(fd)?,
+        Commands::SetPolicy { policy } => cmd_set_policy(fd, policy)?,
     }
 
     Ok(())
@@ -77,6 +83,13 @@ fn cmd_stats(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     ioctl::ioctl_read(fd, ioctl::POLARIS_GET_GLOBAL_STATS, &mut arg)
         .map_err(|e| format!("GET_GLOBAL_STATS failed: errno {e}"))?;
 
+    let policy_str = match arg.eviction_policy {
+        0 => "FIFO",
+        1 => "LRU",
+        2 => "Phase-Aware",
+        _ => "Unknown",
+    };
+
     println!("POLARIS Global Statistics");
     println!("=========================");
     println!("GPUs:              {}", arg.total_gpus);
@@ -85,6 +98,10 @@ fn cmd_stats(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Resident:        {}", arg.blocks_resident);
     println!("  Offloaded:       {}", arg.blocks_offloaded);
     println!("  Evicted:         {}", arg.blocks_evicted);
+    println!("Policy:            {}", policy_str);
+    println!("  Offloads:        {}", arg.offload_count);
+    println!("  Reloads:         {}", arg.reload_count);
+    println!("  Evictions:       {}", arg.total_evictions);
     println!("GPU memory:");
     println!("  Total:           {} MiB", arg.total_gpu_bytes / (1024 * 1024));
     println!("  Used:            {} MiB", arg.used_gpu_bytes / (1024 * 1024));
@@ -160,5 +177,22 @@ fn cmd_list_sessions(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_set_policy(fd: c_int, policy: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let name = match policy {
+        0 => "FIFO",
+        1 => "LRU",
+        2 => "Phase-Aware",
+        _ => return Err(format!("invalid policy {policy} — valid: 0=FIFO, 1=LRU, 2=phase_aware").into()),
+    };
+    let arg = PolarisSetPolicyArg {
+        policy,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SET_POLICY, &arg)
+        .map_err(|e| format!("SET_POLICY failed: errno {e}"))?;
+    println!("Eviction policy set to: {name} ({policy})");
     Ok(())
 }
