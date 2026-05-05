@@ -199,6 +199,15 @@ impl GpuState {
         self.va_allocs.get(&block_id)
     }
 
+    /// Find a block_id by its physical handle (reverse lookup).
+    /// Used by COW_BREAK to locate the source block's VA and metadata.
+    pub fn find_block_by_phys(&self, phys_handle: u64) -> Option<u64> {
+        self.phys_handles
+            .iter()
+            .find(|(_, &ph)| ph == phys_handle)
+            .map(|(&bid, _)| bid)
+    }
+
     /// Remove block tracking and return its VA to the pool.
     pub fn remove_block(&mut self, block_id: u64) {
         self.phys_handles.remove(&block_id);

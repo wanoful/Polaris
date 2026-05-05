@@ -48,6 +48,8 @@ pub(crate) struct PolarisInner {
     offload_count: u64,
     reload_count: u64,
     total_evictions: u64,
+    cow_break_count: u64,
+    cow_copy_bytes: u64,
 }
 
 // Global state protected by a kernel mutex.  Wrapped in Option because
@@ -166,6 +168,8 @@ unsafe extern "C" fn polaris_stats_show(
     let offload_cnt = inner.offload_count;
     let reload_cnt = inner.reload_count;
     let evictions = inner.total_evictions;
+    let cow_cnt = inner.cow_break_count;
+    let cow_bytes = inner.cow_copy_bytes;
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -190,6 +194,8 @@ policy:         {policy} (0=fifo,1=lru,2=phase_aware)
 offloads:       {offload_cnt}
 reloads:        {reload_cnt}
 evictions:      {evictions}
+cow_breaks:     {cow_cnt}
+cow_copy_mib:   {cow_copy_mib}
 gpu_total_mib:  {gpu_total_mib}
 gpu_used_mib:   {gpu_used_mib}
 cpu_pool_mib:   {cpu_pool_mib}
@@ -211,6 +217,8 @@ pending_decs:   {decisions}
                 offload_cnt = offload_cnt,
                 reload_cnt = reload_cnt,
                 evictions = evictions,
+                cow_cnt = cow_cnt,
+                cow_copy_mib = cow_bytes / (1024 * 1024),
                 gpu_total_mib = total_gpu / (1024 * 1024),
                 gpu_used_mib = used_gpu / (1024 * 1024),
                 cpu_pool_mib = cpu_total / (1024 * 1024),
@@ -308,6 +316,8 @@ impl kernel::InPlaceModule for PolarisModule {
                 offload_count: 0,
                 reload_count: 0,
                 total_evictions: 0,
+                cow_break_count: 0,
+                cow_copy_bytes: 0,
             });
         }
 
@@ -598,6 +608,37 @@ impl PolarisDevice {
                     },
                     GFP_KERNEL,
                 )?;
+            }
+        }
+
+        // Second pass: for COW child sessions, the block table is scanned
+        // by session_id which misses shared blocks (their session_id is the
+        // parent's).  Walk the session's block_ids list to find these
+        // COW-shared blocks and decrement their refcounts.
+        {
+            let session = inner.sessions.iter().find(|s| s.session_id == sid);
+            if let Some(sess) = session {
+                for &bid in &sess.block_ids {
+                    // Skip blocks already collected in the first pass.
+                    if to_free.iter().any(|tf| tf.block_id == bid) {
+                        continue;
+                    }
+                    if let Some(idx) = inner.blocks.iter().position(|b| b.block_id == bid) {
+                        let b = &inner.blocks[idx];
+                        to_free.push(
+                            ToFree {
+                                idx,
+                                block_id: b.block_id,
+                                phys_handle: b.gpu_phys_handle,
+                                size_bytes: b.size_bytes,
+                                state: b.state,
+                                refcount: b.refcount,
+                                had_cpu_buf: b.cpu_buf_addr != 0,
+                            },
+                            GFP_KERNEL,
+                        )?;
+                    }
+                }
             }
         }
 
@@ -1039,7 +1080,318 @@ impl PolarisDevice {
             }
         }
 
-        // ── Budget check + offload loop ──────────────────────────────────
+        // ── Phase 3: COW overlap detection ─────────────────────────────
+        // We use a flag to route control flow: needs_cow_break.
+        let mut needs_cow_break = false;
+        let mut cb_old_block_id: u64 = 0;
+        let mut cb_old_phys: u64 = 0;
+        let mut cb_old_size: u64 = 0;
+        let mut cb_old_token_start: u32 = 0;
+        let mut cb_old_token_count: u32 = 0;
+        let mut cb_old_phase: PolarisPhase = PolarisPhase::Prefill;
+        {
+            let inner = guard.as_mut().ok_or(ENODEV)?;
+            let mut grow_flags = PolarisGrowFlags::empty();
+            if arg.flags & POLARIS_GROW_FLAG_OVERWRITE != 0 {
+                grow_flags |= PolarisGrowFlag::Overwrite;
+            }
+            let token_end = arg.token_start + arg.token_count;
+
+            // Scan session's block_ids for an overlapping block.
+            let mut overlap_idx: Option<usize> = None;
+            if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
+                for &bid in &sess.block_ids {
+                    if let Some(idx) = inner.blocks.iter().position(|b| b.block_id == bid) {
+                        let b = &inner.blocks[idx];
+                        let b_end = b.token_start + b.token_count;
+                        if arg.token_start < b_end && b.token_start < token_end {
+                            overlap_idx = Some(idx);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            match overlap_idx {
+                None => { /* fall through to normal ALLOC path */ }
+                Some(oi) => {
+                    if !grow_flags.contains(PolarisGrowFlag::Overwrite) {
+                        dev_err!(
+                            self.dev,
+                            "POLARIS: BLOCK_GROW overlap without OVERWRITE flag (session={}, tokens={}..{})\n",
+                            arg.session_id, arg.token_start, token_end
+                        );
+                        return Err(EINVAL);
+                    }
+
+                    let old_refcount = inner.blocks[oi].refcount;
+                    let old_block_id = inner.blocks[oi].block_id;
+
+                    if old_refcount <= 1 {
+                        // Private ─ in-place overwrite.
+                        arg.block_id = old_block_id;
+                        arg.ret_code = 0;
+                        drop(guard);
+                        let mut writer = UserSlice::new(user_ptr, size).writer();
+                        writer.write(&arg)?;
+                        dev_info!(
+                            self.dev,
+                            "POLARIS: in-place overwrite block {} for session {}\n",
+                            old_block_id, arg.session_id
+                        );
+                        return Ok(0);
+                    }
+
+                    // Shared block (refcount > 1): COW break needed.
+                    dev_info!(
+                        self.dev,
+                        "POLARIS: COW_BREAK trigger ─ session={} overwriting shared block {} (refcount={})\n",
+                        arg.session_id, old_block_id, old_refcount
+                    );
+
+                    // Decrement old refcount; clear Shared if it drops to 1.
+                    inner.blocks[oi].refcount -= 1;
+                    if inner.blocks[oi].refcount == 1 {
+                        inner.blocks[oi].flags ^= PolarisBlockFlag::Shared;
+                    }
+
+                    cb_old_block_id = old_block_id;
+                    cb_old_phys = inner.blocks[oi].gpu_phys_handle;
+                    cb_old_size = inner.blocks[oi].size_bytes;
+                    cb_old_token_start = inner.blocks[oi].token_start;
+                    cb_old_token_count = inner.blocks[oi].token_count;
+                    cb_old_phase = inner.blocks[oi].phase;
+                    needs_cow_break = true;
+                }
+            }
+        } // guard (inner borrow) dropped
+
+        // ── COW BREAK execution ─────────────────────────────────────────────────
+        if needs_cow_break {
+            let cow_size = cb_old_size;
+
+            // Budget check + offload for the new private block.
+            loop {
+                let has_budget;
+                {
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    let pending = inner.blocks.iter()
+                        .filter(|b| b.home_gpu == gpu_id)
+                        .filter(|b| matches!(b.state,
+                            PolarisBlockState::AllocPending
+                            | PolarisBlockState::ReloadPending
+                            | PolarisBlockState::CowPending))
+                        .map(|b| b.size_bytes)
+                        .sum::<u64>();
+
+                    has_budget = match inner.gpus.iter().find(|g| g.gpu_id == gpu_id) {
+                        Some(g) => g.used_bytes + pending + cow_size <= g.budget_bytes,
+                        None => false,
+                    };
+                }
+                if has_budget {
+                    break;
+                }
+
+                let victim = {
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    polaris_policy::select_victim(inner, arg.session_id, gpu_id)
+                };
+
+                let (victim_id, victim_sz, victim_gpu) = match victim {
+                    Some((_, id, sz, gpu)) => (id, sz, gpu),
+                    None => {
+                        dev_err!(self.dev, "POLARIS: COW_BREAK budget exceeded, no victim available\n");
+                        return Err(ENOMEM);
+                    }
+                };
+
+                {
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    let block = match inner.blocks.iter_mut().find(|b| b.block_id == victim_id) {
+                        Some(b) => b,
+                        None => return Err(ENOENT),
+                    };
+                    let src_phys = block.gpu_phys_handle;
+                    block.state = PolarisBlockState::OffloadPending;
+                    let dec_id = inner.next_decision_id;
+                    inner.next_decision_id += 1;
+                    block.pending_decision_id = dec_id;
+
+                    inner.pending_decisions.push(
+                        PolarisDecision {
+                            decision_id: dec_id,
+                            op: PolarisDecisionOp::Offload as u32,
+                            gpu_id: victim_gpu,
+                            block_id: victim_id,
+                            session_id: block.session_id,
+                            src_handle: src_phys,
+                            dst_vaddr: 0,
+                            size_bytes: victim_sz,
+                            cpu_addr: 0,
+                            _reserved: [0u64; 4],
+                        },
+                        GFP_KERNEL,
+                    )?;
+                }
+
+                let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
+                unsafe { bindings::init_completion(&raw mut comp); }
+
+                {
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == victim_id) {
+                        b.completion_ptr = &raw mut comp;
+                    }
+                }
+                drop(guard);
+
+                unsafe {
+                    bindings::wait_for_completion_interruptible_timeout(
+                        &raw mut comp,
+                        bindings::__msecs_to_jiffies(5000),
+                    );
+                }
+
+                guard = POLARIS_STATE.lock();
+                {
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == victim_id) {
+                        b.completion_ptr = core::ptr::null_mut();
+                        if b.state != PolarisBlockState::CpuOffloaded {
+                            dev_err!(self.dev, "POLARIS: OFFLOAD for COW_BREAK victim {} failed, aborting\n", victim_id);
+                            return Err(ENOMEM);
+                        }
+                    }
+                }
+            }
+
+            // Queue full check.
+            {
+                let inner = guard.as_mut().ok_or(ENODEV)?;
+                if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+                    dev_err!(self.dev, "POLARIS: pending decision queue full, rejecting COW_BREAK\n");
+                    return Err(ENOMEM);
+                }
+            }
+
+            // Create new block and queue CowBreak decision.
+            let new_block_id;
+            let cow_dec_id;
+            {
+                let inner = guard.as_mut().ok_or(ENODEV)?;
+                new_block_id = inner.next_block_id;
+                inner.next_block_id += 1;
+                cow_dec_id = inner.next_decision_id;
+                inner.next_decision_id += 1;
+
+                let new_block = PolarisBlock {
+                    block_id: new_block_id,
+                    session_id: arg.session_id,
+                    token_start: cb_old_token_start,
+                    token_count: cb_old_token_count,
+                    home_gpu: gpu_id,
+                    gpu_vaddr: 0,
+                    gpu_phys_handle: 0,
+                    cpu_buf_addr: 0,
+                    size_bytes: cb_old_size,
+                    refcount: 1,
+                    state: PolarisBlockState::CowPending,
+                    flags: PolarisBlockFlags::empty(),
+                    phase: cb_old_phase,
+                    last_touch_ns: 0,
+                    map_time_ns: 0,
+                    retry_count: 0,
+                    pending_decision_id: cow_dec_id,
+                    completion_ptr: core::ptr::null_mut(),
+                };
+
+                inner.pending_decisions.push(
+                    PolarisDecision {
+                        decision_id: cow_dec_id,
+                        op: PolarisDecisionOp::CowBreak as u32,
+                        gpu_id,
+                        block_id: new_block_id,
+                        session_id: arg.session_id,
+                        src_handle: cb_old_phys,
+                        dst_vaddr: 0,
+                        size_bytes: cb_old_size,
+                        cpu_addr: 0,
+                        _reserved: [0u64; 4],
+                    },
+                    GFP_KERNEL,
+                )?;
+                inner.blocks.push(new_block, GFP_KERNEL)?;
+
+                // Replace old block_id with new one in session's block_ids.
+                if let Some(sess) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+                    if let Some(pos) = sess.block_ids.iter().position(|&bid| bid == cb_old_block_id) {
+                        sess.block_ids[pos] = new_block_id;
+                    }
+                }
+            }
+
+            arg.block_id = new_block_id;
+
+            // Wait for COW_BREAK completion.
+            let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
+            unsafe { bindings::init_completion(&raw mut comp); }
+
+            {
+                let inner = guard.as_mut().ok_or(ENODEV)?;
+                if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == new_block_id) {
+                    b.completion_ptr = &raw mut comp;
+                }
+            }
+            drop(guard);
+
+            let wait_ret = unsafe {
+                bindings::wait_for_completion_interruptible_timeout(
+                    &raw mut comp,
+                    bindings::__msecs_to_jiffies(5000),
+                )
+            };
+
+            let mut g = POLARIS_STATE.lock();
+            let outcome;
+            {
+                let inner = g.as_mut().ok_or(ENODEV)?;
+                outcome = if let Some(b) = inner.blocks.iter_mut().find(|b| b.block_id == new_block_id) {
+                    b.completion_ptr = core::ptr::null_mut();
+                    match b.state {
+                        PolarisBlockState::Resident => 0i32,
+                        PolarisBlockState::Evicted => -(bindings::ENOMEM as i32),
+                        _ => {
+                            if wait_ret == 0 {
+                                dev_err!(self.dev, "POLARIS: COW_BREAK block {} timed out\n", new_block_id);
+                                b.state = PolarisBlockState::Evicted;
+                                b.pending_decision_id = 0;
+                                -(bindings::ETIMEDOUT as i32)
+                            } else if wait_ret < 0 {
+                                -(bindings::EINTR as i32)
+                            } else {
+                                dev_err!(self.dev, "POLARIS: COW_BREAK block {} unexpected state {:?}\n", new_block_id, b.state);
+                                -(bindings::EIO as i32)
+                            }
+                        }
+                    }
+                } else {
+                    -(bindings::EIO as i32)
+                };
+            }
+            drop(g);
+
+            arg.ret_code = outcome;
+            let mut writer = UserSlice::new(user_ptr, size).writer();
+            writer.write(&arg)?;
+            if outcome == 0 {
+                dev_info!(self.dev, "POLARIS: COW_BREAK complete ─ block {} private for session {}\n", new_block_id, arg.session_id);
+            }
+            return Ok(0);
+        }
+
+        // ── Budget check + offload loop (normal ALLOC path) ────────────
+
         loop {
             let has_budget;
             {
@@ -1583,6 +1935,10 @@ impl PolarisDevice {
                     PolarisBlockState::ReloadPending => {
                         inner.reload_count = inner.reload_count.saturating_add(1);
                     }
+                    PolarisBlockState::CowPending => {
+                        inner.cow_break_count = inner.cow_break_count.saturating_add(1);
+                        inner.cow_copy_bytes = inner.cow_copy_bytes.saturating_add(sz);
+                    }
                     _ => {}
                 }
                 // Capture the completion pointer before the mutable borrow ends.
@@ -1835,6 +2191,8 @@ impl PolarisDevice {
         let offload_cnt = inner.offload_count;
         let reload_cnt = inner.reload_count;
         let evictions = inner.total_evictions;
+        let cow_cnt = inner.cow_break_count;
+        let cow_bytes = inner.cow_copy_bytes;
         drop(guard);
 
         arg.blocks_resident = resident;
@@ -1842,6 +2200,8 @@ impl PolarisDevice {
         arg.blocks_evicted = evicted;
         arg.shared_gpu_bytes = shared;
         arg.private_gpu_bytes = private;
+        arg.cow_break_count = cow_cnt;
+        arg.cow_copy_bytes = cow_bytes;
         arg.total_gpu_bytes = total_gpu;
         arg.used_gpu_bytes = used_gpu;
         arg.cpu_pool_total = cpu_total;

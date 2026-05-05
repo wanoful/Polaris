@@ -217,3 +217,21 @@ pub fn copy_host_to_device(dst_device: u64, src_host: u64, byte_count: usize) ->
     }
     Ok(())
 }
+
+/// Copy data from one GPU device memory location to another.
+/// Used for COW break: copy old physical block contents to a new physical block.
+pub fn copy_device_to_device(dst_device: u64, src_device: u64, byte_count: usize) -> Result<(), String> {
+    let res = unsafe {
+        sys::cuMemcpyDtoD_v2(
+            dst_device as sys::CUdeviceptr,
+            src_device as sys::CUdeviceptr,
+            byte_count,
+        )
+    };
+    if res != CUresult::CUDA_SUCCESS {
+        return Err(format!(
+            "cuMemcpyDtoD(dst={dst_device:#x}, src={src_device:#x}, {byte_count}) failed: error code {res:?}"
+        ));
+    }
+    Ok(())
+}

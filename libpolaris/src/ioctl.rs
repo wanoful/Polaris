@@ -98,20 +98,25 @@ pub unsafe fn ioctl_ptr(fd: i32, cmd: u32, arg: *mut ()) -> i32 {
 }
 
 /// Issue an ioctl that reads data from the kernel.
+/// On syscall failure, returns the errno value as the error.
 pub fn ioctl_read<T>(fd: i32, cmd: u32, arg: &mut T) -> Result<(), i32> {
     let ret = unsafe { libc::ioctl(fd, cmd as _, arg as *mut T as *mut ()) };
     if ret < 0 {
-        Err(-ret)
+        let eno = unsafe { *libc::__errno_location() };
+        // Guard: if errno wasn't set, fall back to a default.
+        Err(if eno != 0 { eno } else { libc::EIO })
     } else {
         Ok(())
     }
 }
 
 /// Issue an ioctl that writes data to the kernel.
+/// On syscall failure, returns the errno value as the error.
 pub fn ioctl_write<T>(fd: i32, cmd: u32, arg: &T) -> Result<(), i32> {
     let ret = unsafe { libc::ioctl(fd, cmd as _, arg as *const T as *mut ()) };
     if ret < 0 {
-        Err(-ret)
+        let eno = unsafe { *libc::__errno_location() };
+        Err(if eno != 0 { eno } else { libc::EIO })
     } else {
         Ok(())
     }

@@ -243,12 +243,51 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
             };
         }
 
-        // ─── COW_BREAK (Phase 3 stub): alloc new + map ─────────────
+        // ─── COW_BREAK: alloc new + copy old→new (GPU DtoD) ────────
         x if x == PolarisDecisionOp::CowBreak as u32 => {
             let size = snap_up(dec.size_bytes, gpu.granule);
-            let vaddr = match gpu.vas.allocate(size, gpu.granule) {
+            let sz_usize = size as usize;
+
+            // Locate source block via phys handle carried in src_handle.
+            let src_phys = dec.src_handle;
+            let src_block_id = match gpu.find_block_by_phys(src_phys) {
+                Some(bid) => bid,
+                None => {
+                    eprintln!(
+                        "polarisd: COW_BREAK block {} — source phys handle {src_phys:#x} not found",
+                        dec.block_id
+                    );
+                    return ExecutionResult {
+                        result: -(libc::EINVAL as i32),
+                        output_handle: 0,
+                        output_cpu_addr: 0,
+                    };
+                }
+            };
+
+            let src_vaddr = match gpu.get_va_alloc(src_block_id) {
+                Some(va) => va.vaddr,
+                None => {
+                    eprintln!(
+                        "polarisd: COW_BREAK block {} — source block {src_block_id} has no VA mapping",
+                        dec.block_id
+                    );
+                    return ExecutionResult {
+                        result: -(libc::EINVAL as i32),
+                        output_handle: 0,
+                        output_cpu_addr: 0,
+                    };
+                }
+            };
+
+            // Allocate fresh GPU VA for the new (private) block.
+            let dst_vaddr = match gpu.vas.allocate(size, gpu.granule) {
                 Some(va) => va,
                 None => {
+                    eprintln!(
+                        "polarisd: COW_BREAK block {} VA pool exhausted",
+                        dec.block_id
+                    );
                     return ExecutionResult {
                         result: -(libc::ENOMEM as i32),
                         output_handle: 0,
@@ -256,24 +295,75 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
                     };
                 }
             };
-            match cuda_vmm::create_physical(size, gpu.device_ordinal) {
-                Ok(h) => {
-                    let _ = cuda_vmm::map_memory(vaddr, h, size);
-                    let _ = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal);
-                    gpu.track_handle(dec.block_id, h);
-                    gpu.track_va(dec.block_id, vaddr, size);
-                    gpu.used_bytes += size;
-                    output_handle = h;
-                    eprintln!(
-                        "polarisd: COW_BREAK block {} (stub: alloc+map, no copy)",
-                        dec.block_id
-                    );
-                }
+
+            // Create new physical memory handle.
+            let new_phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
+                Ok(h) => h,
                 Err(e) => {
-                    eprintln!("polarisd: COW_BREAK failed: {e}");
-                    result = -(libc::ENOMEM as i32);
+                    eprintln!("polarisd: COW_BREAK cuMemCreate failed for block {}: {e}", dec.block_id);
+                    gpu.vas.free(dst_vaddr, size);
+                    return ExecutionResult {
+                        result: -(libc::ENOMEM as i32),
+                        output_handle: 0,
+                        output_cpu_addr: 0,
+                    };
                 }
+            };
+
+            // Map new physical into the destination VA.
+            if let Err(e) = cuda_vmm::map_memory(dst_vaddr, new_phys, size) {
+                eprintln!("polarisd: COW_BREAK cuMemMap failed for block {}: {e}", dec.block_id);
+                if let Err(re) = cuda_vmm::release_physical(new_phys) {
+                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
+                }
+                gpu.vas.free(dst_vaddr, size);
+                return ExecutionResult {
+                    result: -(libc::EINVAL as i32),
+                    output_handle: 0,
+                    output_cpu_addr: 0,
+                };
             }
+
+            // Set access for the destination mapping.
+            if let Err(e) = cuda_vmm::set_access(dst_vaddr, size, gpu.device_ordinal) {
+                eprintln!("polarisd: COW_BREAK cuMemSetAccess failed for block {}: {e}", dec.block_id);
+                let _ = cuda_vmm::unmap_memory(dst_vaddr, size);
+                if let Err(re) = cuda_vmm::release_physical(new_phys) {
+                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
+                }
+                gpu.vas.free(dst_vaddr, size);
+                return ExecutionResult {
+                    result: -(libc::EINVAL as i32),
+                    output_handle: 0,
+                    output_cpu_addr: 0,
+                };
+            }
+
+            // GPU-to-GPU copy: old (source) VA → new (destination) VA.
+            if let Err(e) = cuda_vmm::copy_device_to_device(dst_vaddr, src_vaddr, sz_usize) {
+                eprintln!("polarisd: COW_BREAK cuMemcpyDtoD failed for block {}: {e}", dec.block_id);
+                let _ = cuda_vmm::unmap_memory(dst_vaddr, size);
+                if let Err(re) = cuda_vmm::release_physical(new_phys) {
+                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
+                }
+                gpu.vas.free(dst_vaddr, size);
+                return ExecutionResult {
+                    result: -(libc::EFAULT as i32),
+                    output_handle: 0,
+                    output_cpu_addr: 0,
+                };
+            }
+
+            // Success: track the new block.
+            gpu.track_handle(dec.block_id, new_phys);
+            gpu.track_va(dec.block_id, dst_vaddr, size);
+            gpu.used_bytes += size;
+            output_handle = new_phys;
+
+            eprintln!(
+                "polarisd: COW_BREAK block {} complete: src={src_block_id} phys={src_phys:#x} va={src_vaddr:#x} → new phys={new_phys:#x} va={dst_vaddr:#x} size={size}",
+                dec.block_id
+            );
         }
 
         _ => {
