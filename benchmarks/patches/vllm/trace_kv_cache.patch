@@ -1,0 +1,160 @@
+From: POLARIS Phase 4b benchmark trace patch
+Subject: Add KV cache allocation tracing for vLLM
+
+This patch adds POLARIS trace collection to vLLM's KVCacheManager.
+Set environment variable POLARIS_TRACE=<output_path> before launching
+vLLM, and every KV cache block allocation/free event will be written
+to the specified CSV file.
+
+The trace format (compatible with polaris-workload trace-replay):
+    timestamp_ns,op,session_id,token_start,token_count
+
+Ops emitted:
+  - SESSION_CREATE: first allocation for a request
+  - BLOCK_ALLOC: each block allocated (with token range)
+  - BLOCK_FREE: each block freed
+  - SESSION_DESTROY: request freed from KV cache
+
+Intended vLLM version: commit 132765e3560659ff63ebd236203672e991b70e08
+Applies to: vllm/v1/core/kv_cache_manager.py
+
+Usage:
+  POLARIS_TRACE=/tmp/vllm_trace.csv vllm serve <model>
+  # After benchmark completes, copy /tmp/vllm_trace.csv to your
+  # POLARIS benchmarks/traces/ directory for replay.
+
+How to apply:
+  patch -p1 < benchmarks/patches/vllm/trace_kv_cache.patch
+  # (run this command from the vLLM repository root)
+
+How to revert:
+  patch -R -p1 < benchmarks/patches/vllm/trace_kv_cache.patch
+
+Note: This is purely additive. Zero changes to vLLM's behavior.
+
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 83aa26bd9..bbdad8d96 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import itertools
++import os
++import time
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+@@ -17,6 +19,33 @@ from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+ 
++# ── POLARIS trace collection (Phase 4b benchmark) ──────────────────────────
++# Activated by environment variable POLARIS_TRACE=<output_path>.
++# Produces a CSV trace file in the format:
++#   timestamp_ns,op,session_id,token_start,token_count
++# Ops: SESSION_CREATE, BLOCK_ALLOC, BLOCK_FREE, SESSION_DESTROY
++_POLARIS_TRACE_PATH = os.environ.get("POLARIS_TRACE", "")
++_POLARIS_TRACE_FD = None  # opened lazily on first write
++
++
++def _polaris_trace_fd():
++    global _POLARIS_TRACE_FD
++    if _POLARIS_TRACE_FD is None and _POLARIS_TRACE_PATH:
++        _POLARIS_TRACE_FD = open(_POLARIS_TRACE_PATH, "w")
++        _POLARIS_TRACE_FD.write(
++            "timestamp_ns,op,session_id,token_start,token_count\n"
++        )
++    return _POLARIS_TRACE_FD
++
++
++def _polaris_emit(op: str, session_id: int | str,
++                  token_start: int, token_count: int) -> None:
++    fd = _polaris_trace_fd()
++    if fd is None:
++        return
++    ts = time.time_ns()
++    fd.write(f"{ts},{op},{session_id},{token_start},{token_count}\n")
++    fd.flush()
+ 
+ @dataclass
+ class KVCacheBlocks:
+@@ -159,6 +188,10 @@ class KVCacheManager:
+             tuple(() for _ in range(self.num_kv_cache_groups))
+         )
+ 
++        # POLARIS trace state — per-session block count tracking
++        self._polaris_session_blocks: dict[str, int] = {}  # request_id -> total_blocks
++        self._polaris_seen_sessions: set[str] = set()       # emitted SESSION_CREATE
++
+     @property
+     def usage(self) -> float:
+         """Get the KV cache usage.
+@@ -418,7 +451,9 @@ class KVCacheManager:
+         # P/D: delay caching blocks if we have to recv from
+         # remote. Update state for locally cached blocks.
+         if not self.enable_caching or delay_cache_blocks:
+-            return self.create_kv_cache_blocks(new_blocks)
++            result = self.create_kv_cache_blocks(new_blocks)
++            self._polaris_trace_allocate(request, result)
++            return result
+ 
+         # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+         # + num_external_computed_tokens + num_new_tokens, but must exclude
+@@ -431,7 +466,9 @@ class KVCacheManager:
+         )
+         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+ 
+-        return self.create_kv_cache_blocks(new_blocks)
++        result = self.create_kv_cache_blocks(new_blocks)
++        self._polaris_trace_allocate(request, result)
++        return result
+ 
+     def free(self, request: Request) -> None:
+         """Free the blocks allocated for the request.
+@@ -441,8 +478,45 @@ class KVCacheManager:
+         Args:
+             request: The request to free the blocks.
+         """
++        self._polaris_trace_free(request)
+         self.coordinator.free(request.request_id)
+ 
++    # ── POLARIS trace helpers ────────────────────────────────────────────
++
++    def _polaris_trace_allocate(
++        self, request: Request, result: "KVCacheBlocks"
++    ) -> None:
++        """Emit SESSION_CREATE and BLOCK_ALLOC events for this allocation."""
++        rid = request.request_id
++        total_blocks = sum(len(g) for g in result.blocks)
++        old_total = self._polaris_session_blocks.get(rid, 0)
++
++        if rid not in self._polaris_seen_sessions:
++            _polaris_emit("SESSION_CREATE", rid, 0, 0)
++            self._polaris_seen_sessions.add(rid)
++
++        block_size = self.kv_cache_config.kv_cache_groups[0].block_size
++        if total_blocks > old_total:
++            for i in range(old_total, total_blocks):
++                token_start = i * block_size
++                _polaris_emit("BLOCK_ALLOC", rid, token_start, block_size)
++        elif total_blocks < old_total:
++            for _ in range(total_blocks, old_total):
++                _polaris_emit("BLOCK_FREE", rid, 0, 0)
++
++        self._polaris_session_blocks[rid] = total_blocks
++
++    def _polaris_trace_free(self, request: Request) -> None:
++        """Emit BLOCK_FREE and SESSION_DESTROY events."""
++        rid = request.request_id
++        total = self._polaris_session_blocks.pop(rid, 0)
++        if total == 0 and rid not in self._polaris_seen_sessions:
++            return
++        for _ in range(total):
++            _polaris_emit("BLOCK_FREE", rid, 0, 0)
++        _polaris_emit("SESSION_DESTROY", rid, 0, 0)
++        self._polaris_seen_sessions.discard(rid)
++
+     def remove_skipped_blocks(
+         self, request_id: str, total_computed_tokens: int
+     ) -> None:

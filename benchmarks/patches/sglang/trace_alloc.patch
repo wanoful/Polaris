@@ -1,0 +1,127 @@
+diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
+index 56fccdd..dbf5e3d 100644
+--- a/python/sglang/srt/mem_cache/common.py
++++ b/python/sglang/srt/mem_cache/common.py
+@@ -1,6 +1,8 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
++import time
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -24,6 +26,86 @@ if TYPE_CHECKING:
+ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+ MAMBA_STATE_PER_REQ_NO_CACHE = 1
+ 
++# ── POLARIS trace collection (Phase 4b benchmark) ──────────────────────────
++# Activated by environment variable POLARIS_TRACE=<output_path>.
++# Produces a CSV trace file in the format:
++#   timestamp_ns,op,session_id,token_start,token_count
++# Ops: SESSION_CREATE, BLOCK_ALLOC, BLOCK_FREE, SESSION_DESTROY
++_POLARIS_TRACE_PATH = os.environ.get("POLARIS_TRACE", "")
++_POLARIS_TRACE_FD = None  # opened lazily on first write
++_POLARIS_SESSION_TOKENS: dict[str, int] = {}  # req.rid -> total allocated tokens
++_POLARIS_SEEN: set[str] = set()  # req.rid that had SESSION_CREATE emitted
++POLARIS_BLOCK_SIZE = 16  # tokens per POLARIS KV block
++
++
++def _polaris_trace_fd():
++    global _POLARIS_TRACE_FD
++    if _POLARIS_TRACE_FD is None and _POLARIS_TRACE_PATH:
++        _POLARIS_TRACE_FD = open(_POLARIS_TRACE_PATH, "w")
++        _POLARIS_TRACE_FD.write(
++            "timestamp_ns,op,session_id,token_start,token_count\n"
++        )
++    return _POLARIS_TRACE_FD
++
++
++def _polaris_emit(op: str, session_id: str,
++                  token_start: int, token_count: int) -> None:
++    fd = _polaris_trace_fd()
++    if fd is None:
++        return
++    ts = time.time_ns()
++    fd.write(f"{ts},{op},{session_id},{token_start},{token_count}\n")
++    fd.flush()
++
++
++def _polaris_trace_extend(reqs: list["Req"], extend_lens: list[int]) -> None:
++    """Emit SESSION_CREATE and BLOCK_ALLOC for prefill allocations."""
++    for req, ext_len in zip(reqs, extend_lens):
++        if ext_len <= 0:
++            continue
++        rid = req.rid
++        old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
++
++        if rid not in _POLARIS_SEEN:
++            _polaris_emit("SESSION_CREATE", rid, 0, 0)
++            _POLARIS_SEEN.add(rid)
++
++        # Emit BLOCK_ALLOC in POLARIS block-sized chunks
++        for start in range(0, ext_len, POLARIS_BLOCK_SIZE):
++            tok_start = old_total + start
++            tok_count = min(POLARIS_BLOCK_SIZE, ext_len - start)
++            _polaris_emit("BLOCK_ALLOC", rid, tok_start, tok_count)
++
++        _POLARIS_SESSION_TOKENS[rid] = old_total + ext_len
++
++
++def _polaris_trace_decode(reqs: list["Req"], token_per_req: int) -> None:
++    """Emit BLOCK_ALLOC for decode allocations."""
++    for req in reqs:
++        rid = req.rid
++        old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
++
++        for start in range(0, token_per_req, POLARIS_BLOCK_SIZE):
++            tok_start = old_total + start
++            tok_count = min(POLARIS_BLOCK_SIZE, token_per_req - start)
++            _polaris_emit("BLOCK_ALLOC", rid, tok_start, tok_count)
++
++        _POLARIS_SESSION_TOKENS[rid] = old_total + token_per_req
++
++
++def _polaris_trace_release(req: "Req") -> None:
++    """Emit BLOCK_FREE and SESSION_DESTROY."""
++    rid = req.rid
++    total = _POLARIS_SESSION_TOKENS.pop(rid, 0)
++    if total == 0 and rid not in _POLARIS_SEEN:
++        return
++    # Emit one BLOCK_FREE per allocated block
++    num_blocks = (total + POLARIS_BLOCK_SIZE - 1) // POLARIS_BLOCK_SIZE
++    for _ in range(num_blocks):
++        _polaris_emit("BLOCK_FREE", rid, 0, 0)
++    _polaris_emit("SESSION_DESTROY", rid, 0, 0)
++    _POLARIS_SEEN.discard(rid)
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -489,6 +571,9 @@ def alloc_for_extend(
+         batch.req_to_token_pool,
+     )
+ 
++    # ── POLARIS trace ──
++    _polaris_trace_extend(batch.reqs, batch.extend_lens)
++
+     return out_cache_loc, req_pool_indices_device, req_pool_indices
+ 
+ 
+@@ -560,10 +645,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+     )
+ 
++    # ── POLARIS trace ──
++    _polaris_trace_decode(batch.reqs, token_per_req)
++
+     return out_cache_loc
+ 
+ 
+ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
++    # ── POLARIS trace ──
++    _polaris_trace_release(req)
++
+     # MambaRadixCache may alloc mamba state before alloc KV cache
+     if req.req_pool_idx is None:
+         assert (
