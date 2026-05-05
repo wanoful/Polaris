@@ -221,6 +221,7 @@ pub struct PolarisGetGlobalStatsArg {
     pub private_gpu_bytes: u64,
     pub cow_break_count: u64,
     pub cow_copy_bytes: u64,
+    pub memory_saved_vs_naive: u64,
     pub total_gpu_bytes: u64,
     pub used_gpu_bytes: u64,
     pub cpu_pool_total: u64,

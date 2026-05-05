@@ -133,6 +133,7 @@ unsafe extern "C" fn polaris_stats_show(
     // Count block states.
     let (mut resident, mut offloaded, mut evicted, mut pending) = (0u32, 0u32, 0u32, 0u32);
     let (mut shared, mut private) = (0u64, 0u64);
+    let mut memory_saved: u64 = 0;
     for b in &inner.blocks {
         match b.state {
             PolarisBlockState::Resident => resident += 1,
@@ -142,6 +143,9 @@ unsafe extern "C" fn polaris_stats_show(
         }
         if b.flags.contains(PolarisBlockFlag::Shared) {
             shared += b.size_bytes;
+            memory_saved = memory_saved.saturating_add(
+                b.refcount.saturating_sub(1).saturating_mul(b.size_bytes),
+            );
         } else {
             private += b.size_bytes;
         }
@@ -170,6 +174,7 @@ unsafe extern "C" fn polaris_stats_show(
     let evictions = inner.total_evictions;
     let cow_cnt = inner.cow_break_count;
     let cow_bytes = inner.cow_copy_bytes;
+    let memory_saved_naive = memory_saved.saturating_sub(cow_bytes);
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -196,6 +201,7 @@ reloads:        {reload_cnt}
 evictions:      {evictions}
 cow_breaks:     {cow_cnt}
 cow_copy_mib:   {cow_copy_mib}
+cow_saved_mib:  {saved_mib}
 gpu_total_mib:  {gpu_total_mib}
 gpu_used_mib:   {gpu_used_mib}
 cpu_pool_mib:   {cpu_pool_mib}
@@ -219,6 +225,7 @@ pending_decs:   {decisions}
                 evictions = evictions,
                 cow_cnt = cow_cnt,
                 cow_copy_mib = cow_bytes / (1024 * 1024),
+                saved_mib = memory_saved_naive / (1024 * 1024),
                 gpu_total_mib = total_gpu / (1024 * 1024),
                 gpu_used_mib = used_gpu / (1024 * 1024),
                 cpu_pool_mib = cpu_total / (1024 * 1024),
@@ -664,6 +671,9 @@ impl PolarisDevice {
 
             if tf.refcount > 1 {
                 block.refcount -= 1;
+                if block.refcount == 1 {
+                    block.flags = block.flags & !PolarisBlockFlag::Shared;
+                }
                 dev_info!(
                     self.dev,
                     "POLARIS: session {} destroy: block {} refcount decremented to {}\n",
@@ -723,7 +733,10 @@ impl PolarisDevice {
         // the daemon to complete; non-FreePending blocks for this session
         // are removed.
         inner.sessions.retain(|s| s.session_id != sid);
-        inner.blocks.retain(|b| !(b.session_id == sid && b.state != PolarisBlockState::FreePending));
+        // Only remove blocks whose refcount has dropped to 0.  COW-shared
+        // blocks (refcount > 0 after decrement) must stay in the table for
+        // child sessions that still reference them.
+        inner.blocks.retain(|b| !(b.session_id == sid && b.state != PolarisBlockState::FreePending && b.refcount == 0));
 
         dev_info!(self.dev, "POLARIS: session {} destroyed\n", sid);
         Ok(0)
@@ -1152,7 +1165,7 @@ impl PolarisDevice {
                     // Decrement old refcount; clear Shared if it drops to 1.
                     inner.blocks[oi].refcount -= 1;
                     if inner.blocks[oi].refcount == 1 {
-                        inner.blocks[oi].flags ^= PolarisBlockFlag::Shared;
+                        inner.blocks[oi].flags = inner.blocks[oi].flags & !PolarisBlockFlag::Shared;
                     }
 
                     cb_old_block_id = old_block_id;
@@ -1202,6 +1215,7 @@ impl PolarisDevice {
                     Some((_, id, sz, gpu)) => (id, sz, gpu),
                     None => {
                         dev_err!(self.dev, "POLARIS: COW_BREAK budget exceeded, no victim available\n");
+                        arg.ret_code = -(bindings::ENOMEM as i32);
                         return Err(ENOMEM);
                     }
                 };
@@ -1210,7 +1224,10 @@ impl PolarisDevice {
                     let inner = guard.as_mut().ok_or(ENODEV)?;
                     let block = match inner.blocks.iter_mut().find(|b| b.block_id == victim_id) {
                         Some(b) => b,
-                        None => return Err(ENOENT),
+                        None => {
+                            arg.ret_code = -(bindings::ENOENT as i32);
+                            return Err(ENOENT);
+                        }
                     };
                     let src_phys = block.gpu_phys_handle;
                     block.state = PolarisBlockState::OffloadPending;
@@ -1260,6 +1277,7 @@ impl PolarisDevice {
                         b.completion_ptr = core::ptr::null_mut();
                         if b.state != PolarisBlockState::CpuOffloaded {
                             dev_err!(self.dev, "POLARIS: OFFLOAD for COW_BREAK victim {} failed, aborting\n", victim_id);
+                            arg.ret_code = -(bindings::ENOMEM as i32);
                             return Err(ENOMEM);
                         }
                     }
@@ -1271,6 +1289,7 @@ impl PolarisDevice {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
                 if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
                     dev_err!(self.dev, "POLARIS: pending decision queue full, rejecting COW_BREAK\n");
+                    arg.ret_code = -(bindings::ENOMEM as i32);
                     return Err(ENOMEM);
                 }
             }
@@ -1301,6 +1320,7 @@ impl PolarisDevice {
                     phase: cb_old_phase,
                     last_touch_ns: 0,
                     map_time_ns: 0,
+                    cow_src_handle: cb_old_phys,
                     retry_count: 0,
                     pending_decision_id: cow_dec_id,
                     completion_ptr: core::ptr::null_mut(),
@@ -1547,6 +1567,7 @@ impl PolarisDevice {
                 phase,
                 last_touch_ns: 0,
                 map_time_ns: 0,
+                cow_src_handle: 0,
                 retry_count: 0,
                 pending_decision_id: dec_id,
                 completion_ptr: core::ptr::null_mut(),
@@ -1722,6 +1743,10 @@ impl PolarisDevice {
                 dev_info!(self.dev, "POLARIS: block {} freed directly\n", block_id);
             }
         } else {
+            // Still referenced by other sessions — clear Shared flag if now private.
+            if inner.blocks[block_idx].refcount == 1 {
+                inner.blocks[block_idx].flags = inner.blocks[block_idx].flags & !PolarisBlockFlag::Shared;
+            }
             dev_info!(
                 self.dev, "POLARIS: block {} refcount decremented to {}\n",
                 block_id, inner.blocks[block_idx].refcount
@@ -2116,7 +2141,8 @@ impl PolarisDevice {
     }
 
     /// Re-queue a decision for a block (G4 retry path).
-    /// Preserves the original operation type based on block state.
+    /// Preserves the original operation type and relevant fields
+    /// (phys handle for OFFLOAD/COW_BREAK, CPU addr for RELOAD).
     fn requeue_decision(&self, inner: &mut PolarisInner, block_idx: usize) {
         let block = &mut inner.blocks[block_idx];
         let dec_id = inner.next_decision_id;
@@ -2131,6 +2157,17 @@ impl PolarisDevice {
             _ => PolarisDecisionOp::Alloc as u32,
         };
 
+        let src_handle = match block.state {
+            PolarisBlockState::OffloadPending => block.gpu_phys_handle,
+            PolarisBlockState::CowPending => block.cow_src_handle,
+            _ => 0,
+        };
+
+        let cpu_addr = match block.state {
+            PolarisBlockState::ReloadPending => block.cpu_buf_addr,
+            _ => 0,
+        };
+
         let _ = inner.pending_decisions.push(
             PolarisDecision {
                 decision_id: dec_id,
@@ -2138,10 +2175,10 @@ impl PolarisDevice {
                 gpu_id: block.home_gpu,
                 block_id: block.block_id,
                 session_id: block.session_id,
-                src_handle: 0,
+                src_handle,
                 dst_vaddr: 0,
                 size_bytes: block.size_bytes,
-                cpu_addr: 0,
+                cpu_addr,
                 _reserved: [0u64; 4],
             },
             GFP_KERNEL,
@@ -2163,6 +2200,7 @@ impl PolarisDevice {
         let mut evicted: u32 = 0;
         let mut shared: u64 = 0;
         let mut private: u64 = 0;
+        let mut memory_saved: u64 = 0;
         let mut total_gpu: u64 = 0;
         let mut used_gpu: u64 = 0;
         let mut cpu_total: u64 = 0;
@@ -2177,6 +2215,12 @@ impl PolarisDevice {
             }
             if block.flags.contains(PolarisBlockFlag::Shared) {
                 shared += block.size_bytes;
+                // Naive allocation without COW: each session that references
+                // this block would need its own private copy.  The block
+                // already exists as one copy, so we saved (refcount-1) copies.
+                memory_saved = memory_saved.saturating_add(
+                    block.refcount.saturating_sub(1).saturating_mul(block.size_bytes),
+                );
             } else {
                 private += block.size_bytes;
             }
@@ -2193,6 +2237,7 @@ impl PolarisDevice {
         let evictions = inner.total_evictions;
         let cow_cnt = inner.cow_break_count;
         let cow_bytes = inner.cow_copy_bytes;
+        let memory_saved_naive = memory_saved.saturating_sub(cow_bytes);
         drop(guard);
 
         arg.blocks_resident = resident;
@@ -2202,6 +2247,7 @@ impl PolarisDevice {
         arg.private_gpu_bytes = private;
         arg.cow_break_count = cow_cnt;
         arg.cow_copy_bytes = cow_bytes;
+        arg.memory_saved_vs_naive = memory_saved_naive;
         arg.total_gpu_bytes = total_gpu;
         arg.used_gpu_bytes = used_gpu;
         arg.cpu_pool_total = cpu_total;

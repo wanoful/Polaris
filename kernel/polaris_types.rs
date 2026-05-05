@@ -109,6 +109,9 @@ pub struct PolarisBlock {
     pub phase: PolarisPhase,
     pub last_touch_ns: u64,
     pub map_time_ns: u64,
+    /// Opaque phys handle of the source block for in-flight COW_BREAK.
+    /// Set when the decision is queued; used by requeue_decision on retry.
+    pub cow_src_handle: u64,
     /// Number of consecutive COMPLETE_OPERATION failures for this block.
     /// Reset to 0 on success. After MAX_RETRIES (=3) → EVICTED.
     pub retry_count: u32,
