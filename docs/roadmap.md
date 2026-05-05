@@ -27,7 +27,7 @@ Inference layer (PyTorch / vLLM / synthetic workload)
 ┌──────────────┐
 │   polarisd   │  ← userspace daemon: executes CUDA VMM operations —
 │  (userspace) │    cuMemCreate, cuMemMap, cuMemUnmap, cuMemSetAccess,
-│              │    cudaMemcpyAsync (GPU↔CPU), cuMemRelease
+│              │    cudaMemcpy (GPU↔CPU), cuMemRelease
 └──────────────┘
        │
        ▼
@@ -267,7 +267,6 @@ struct polaris_session {
     u32 home_gpu;
     u64 gpu_vas_base;        // reserved GPU virtual address space start
     u64 gpu_vas_size;        // total reserved VA space for this session
-    u64 gpu_vas_cursor;      // next unallocated VA offset
     u32 beam_width;
     u64 parent_session_id;   // for COW: 0 if root
     struct list_head blocks; // linked list in token order
@@ -315,9 +314,9 @@ POLARIS_DEC_MAP         // cuMemMap an existing phys handle into a VA range
                         //   (used for COW sharing: map parent's handle into child's VA)
 POLARIS_DEC_UNMAP       // cuMemUnmap but keep phys handle
                         //   (used before offload: detach from VA before cudaMemcpy)
-POLARIS_DEC_OFFLOAD     // cudaMemcpyAsync GPU→CPU + cuMemUnmap
-POLARIS_DEC_RELOAD      // cuMemCreate + cuMemMap + cudaMemcpyAsync CPU→GPU
-POLARIS_DEC_COW_BREAK   // cuMemCreate + cuMemMap + cudaMemcpyAsync old→new
+POLARIS_DEC_OFFLOAD     // cudaMemcpy GPU→CPU + cuMemUnmap
+POLARIS_DEC_RELOAD      // cuMemCreate + cuMemMap + cudaMemcpy CPU→GPU
+POLARIS_DEC_COW_BREAK   // cuMemCreate + cuMemMap + cudaMemcpy old→new
 ```
 
 **Wire format:**
@@ -565,7 +564,7 @@ then resumes the decision loop. The kernel begins queuing new decisions.
   `polaris_gpu.cpu_pool_total_bytes`
 - Kernel tracks utilization in `polaris_gpu.cpu_pool_used_bytes`
 - Kernel selects victim blocks → queues `POLARIS_DEC_OFFLOAD` decision →
-  daemon copies GPU→CPU (`cudaMemcpyAsync`) → `cuMemUnmap` → reports
+  daemon copies GPU→CPU (`cudaMemcpy`) → `cuMemUnmap` → reports
   `output_cpu_addr` → kernel updates block state to `CPU_OFFLOADED` and
   stores `cpu_buf_addr`
 
@@ -586,7 +585,7 @@ Inference layer calls BLOCK_GROW(tokens=512, count=16) for session 7
 ```
 
 **Reload execution:** `POLARIS_DEC_RELOAD` → daemon `cuMemCreate` →
-`cuMemMap` → `cudaMemcpyAsync` CPU→GPU → reports `output_handle` →
+`cuMemMap` → `cudaMemcpy` CPU→GPU → reports `output_handle` →
 kernel updates state to `RESIDENT`.
 
 **BLOCK_TOUCH semantics:** `BLOCK_TOUCH` updates `last_touch_ns` for LRU
@@ -634,7 +633,7 @@ victim_score =
 ```
 
 **Deliverables:**
-- Real `cudaMemcpyAsync` GPU↔CPU path
+- Real `cudaMemcpy` GPU↔CPU path
 - Real reload path: offloaded block accessed → transparently remapped
 - Runtime-switchable policy: `fifo`, `lru`, `phase_aware`
 - Per-policy statistics (offload count, reload count, offload latency)
@@ -712,7 +711,7 @@ Session 7 calls BLOCK_GROW(tokens=0..15, flags=OVERWRITE)
   → daemon:
        cuMemCreate (new physical handle)
        cuMemMap (into session 7's VA space for tokens 0..15)
-       cudaMemcpyAsync (old_phys → new_phys, copies content)
+       cudaMemcpy (old_phys → new_phys, copies content)
        cuMemSetAccess (new mapping, read/write)
   → daemon reports completion: result=0, output_handle=<new_phys>
   → kernel: old block refcount--, new block refcount=1
@@ -734,7 +733,7 @@ need to be preserved. In that case the kernel can allocate a private block,
 decrement the old block's refcount, and let the caller fill the new block
 from scratch.
 
-Important safety rule: `gpu_vas_cursor > token_start + token_count` is not
+Important safety rule: tracking the session's token cursor is not
 sufficient to prove that a block is stale. In normal LLM decode, historical
 KV blocks remain semantically live because every decode attention step reads
 the prefix. Therefore, skip-copy is a narrow full-overwrite/no-preserve

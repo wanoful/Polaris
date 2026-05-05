@@ -99,6 +99,7 @@ fn run_synthetic_kv(fd: c_int, num_blocks: u32, tokens_per_block: u32) -> Result
         home_gpu: 0,
         beam_width: 1,
         gpu_vas_bytes: (num_blocks as u64) * (tokens_per_block as u64) * 512 * 1024, // rough estimate
+        priority: 5,
         ..Default::default()
     };
     ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session_arg)
@@ -114,6 +115,7 @@ fn run_synthetic_kv(fd: c_int, num_blocks: u32, tokens_per_block: u32) -> Result
             session_id: sid,
             token_start: i * tokens_per_block,
             token_count: tokens_per_block,
+            phase: PolarisPhase::Prefill as u32,
             ..Default::default()
         };
         ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow_arg)
@@ -161,6 +163,7 @@ fn run_beam_search(fd: c_int, beam_width: u32, decode_steps: u32) -> Result<(), 
         home_gpu: 0,
         beam_width: 1,
         gpu_vas_bytes: 1024 * 1024 * 1024,
+        priority: 5,
         ..Default::default()
     };
     ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut parent_arg)
@@ -174,6 +177,7 @@ fn run_beam_search(fd: c_int, beam_width: u32, decode_steps: u32) -> Result<(), 
             session_id: parent_id,
             token_start: i * 16,
             token_count: 16,
+            phase: PolarisPhase::Prefill as u32,
             ..Default::default()
         };
         ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow)
@@ -237,6 +241,7 @@ fn run_concurrent(fd: c_int, num_sessions: u32, blocks_per_session: u32) -> Resu
             home_gpu: 0,
             beam_width: 1,
             gpu_vas_bytes: 512 * 1024 * 1024,
+            priority: 5,
             ..Default::default()
         };
         ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session_arg)
@@ -248,6 +253,7 @@ fn run_concurrent(fd: c_int, num_sessions: u32, blocks_per_session: u32) -> Resu
                 session_id: session_arg.session_id,
                 token_start: i * 16,
                 token_count: 16,
+                phase: PolarisPhase::Prefill as u32,
                 ..Default::default()
             };
             ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut grow).ok();
