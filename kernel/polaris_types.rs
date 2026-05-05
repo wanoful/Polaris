@@ -144,10 +144,10 @@ pub struct PolarisSession {
     pub home_gpu: u32,
     pub gpu_vas_base: u64,
     pub gpu_vas_size: u64,
-    pub gpu_vas_cursor: u64,
     pub beam_width: u32,
     pub bytes_per_token: u64,
     pub parent_session_id: u64,
+    pub priority: u32,
     pub block_ids: KVec<u64>, // ordered list of block IDs in token order
 }
 

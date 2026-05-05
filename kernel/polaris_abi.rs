@@ -97,7 +97,9 @@ pub struct PolarisSessionCreateArg {
     pub beam_width: u32,
     pub gpu_vas_bytes: u64,
     pub bytes_per_token: u64,
-    pub _reserved: [u64; 3],
+    pub priority: u32,
+    pub _reserved: u32,
+    pub _reserved2: [u64; 2],
 }
 
 #[repr(C)]
@@ -134,11 +136,11 @@ pub struct PolarisBlockGrowArg {
     pub token_start: u32,
     pub token_count: u32,
     pub flags: u32,
-    pub _reserved: u32,
+    pub phase: u32,
     pub block_id: u64,
     pub ret_code: i32,
-    pub _reserved2: u32,
-    pub _reserved3: [u64; 2],
+    pub _reserved: u32,
+    pub _reserved2: [u64; 2],
 }
 
 #[repr(C)]

@@ -529,16 +529,17 @@ impl PolarisDevice {
             POLARIS_DEFAULT_BYTES_PER_TOKEN
         };
 
+        let priority = if arg.priority > 0 { arg.priority } else { 5 };
         inner.sessions.push(
             PolarisSession {
                 session_id,
                 home_gpu: arg.home_gpu,
                 gpu_vas_base: 0,
                 gpu_vas_size: arg.gpu_vas_bytes,
-                gpu_vas_cursor: 0,
                 beam_width: arg.beam_width,
                 bytes_per_token: bpt,
                 parent_session_id: 0,
+                priority,
                 block_ids: KVec::new(),
             },
             GFP_KERNEL,
@@ -723,9 +724,9 @@ impl PolarisDevice {
             .ok_or(ENOENT)?;
         let parent_gpu = parent.home_gpu;
         let parent_vas_size = parent.gpu_vas_size;
-        let parent_vas_cursor = parent.gpu_vas_cursor;
         let parent_beam = parent.beam_width;
         let parent_bpt = parent.bytes_per_token;
+        let parent_priority = parent.priority;
         let parent_block_ids: KVec<u64> = {
             let mut ids = KVec::new();
             for &bid in &parent.block_ids {
@@ -761,10 +762,10 @@ impl PolarisDevice {
                 home_gpu: parent_gpu,
                 gpu_vas_base: 0,
                 gpu_vas_size: parent_vas_size,
-                gpu_vas_cursor: parent_vas_cursor,
                 beam_width: parent_beam,
                 bytes_per_token: parent_bpt,
                 parent_session_id: parent_id,
+                priority: parent_priority,
                 block_ids: parent_block_ids,
             },
             GFP_KERNEL,
@@ -816,12 +817,16 @@ impl PolarisDevice {
             size_bytes = (arg.token_count as u64) * bpt;
 
             // ── Phase 2a: Collect CPU_OFFLOADED blocks for pre-decode residency ──
+            // Iterate the session's block_ids to cover both directly-owned
+            // and COW-shared blocks (whose session_id is the parent's).
             offloaded_bids = KVec::new();
-            for block in inner.blocks.iter() {
-                if block.session_id == arg.session_id
-                    && block.state == PolarisBlockState::CpuOffloaded
-                {
-                    offloaded_bids.push(block.block_id, GFP_KERNEL)?;
+            if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
+                for &bid in &sess.block_ids {
+                    if let Some(block) = inner.blocks.iter().find(|b| b.block_id == bid) {
+                        if block.state == PolarisBlockState::CpuOffloaded {
+                            offloaded_bids.push(block.block_id, GFP_KERNEL)?;
+                        }
+                    }
                 }
             }
         } // inner dropped here, freeing the borrow on guard
@@ -871,7 +876,7 @@ impl PolarisDevice {
                 // Find a victim to offload to make room for this reload.
                 let vid = {
                     let inner = guard.as_mut().ok_or(ENODEV)?;
-                    polaris_policy::select_victim(inner, arg.session_id)
+                    polaris_policy::select_victim(inner, arg.session_id, gpu_id)
                 };
 
                 let (victim_id, victim_sz, victim_gpu) = match vid {
@@ -879,7 +884,7 @@ impl PolarisDevice {
                     None => {
                         dev_err!(
                             self.dev,
-                            "POLARIS: cannot reload block {} — budget exceeded, no offload victim fits in CPU pool\n",
+                            "POLARIS: cannot reload block {} — budget exceeded, no eligible resident block found\n",
                             bid,
                         );
                         return Err(ENOMEM);
@@ -1061,13 +1066,13 @@ impl PolarisDevice {
             // Select a victim to offload using the current eviction policy.
             let victim = {
                 let inner = guard.as_mut().ok_or(ENODEV)?;
-                polaris_policy::select_victim(inner, arg.session_id)
+                polaris_policy::select_victim(inner, arg.session_id, gpu_id)
             };
 
             let (victim_id, victim_sz, victim_gpu) = match victim {
                 Some((_, id, sz, gpu)) => (id, sz, gpu),
                 None => {
-                    dev_err!(self.dev, "POLARIS: GPU {} budget exceeded, no offload victim fits in CPU pool\n", gpu_id);
+                    dev_err!(self.dev, "POLARIS: GPU {} budget exceeded, no eligible resident block found (recheck budget or CPU pool)\n", gpu_id);
                     return Err(ENOMEM);
                 }
             };
@@ -1169,6 +1174,11 @@ impl PolarisDevice {
             dec_id = inner.next_decision_id;
             inner.next_decision_id += 1;
 
+            let phase = if arg.phase == PolarisPhase::Decode as u32 {
+                PolarisPhase::Decode
+            } else {
+                PolarisPhase::Prefill
+            };
             let block = PolarisBlock {
                 block_id,
                 session_id: arg.session_id,
@@ -1182,7 +1192,7 @@ impl PolarisDevice {
                 refcount: 1,
                 state: PolarisBlockState::AllocPending,
                 flags: PolarisBlockFlags::empty(),
-                phase: PolarisPhase::Prefill,
+                phase,
                 last_touch_ns: 0,
                 map_time_ns: 0,
                 retry_count: 0,
@@ -1281,11 +1291,27 @@ impl PolarisDevice {
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
         // Find the block by session_id and token_start.
-        let block_idx = inner
-            .blocks
-            .iter()
-            .position(|b| b.session_id == arg.session_id && b.token_start == arg.token_start)
-            .ok_or(ENOENT)?;
+        // Check both directly-owned blocks (session_id match) and COW-shared
+        // blocks (looked up via the session's block_ids list).
+        let block_idx = {
+            // First: direct match on session_id.
+            let direct = inner
+                .blocks
+                .iter()
+                .position(|b| b.session_id == arg.session_id && b.token_start == arg.token_start);
+            if direct.is_some() {
+                direct
+            } else {
+                // COW child: search the session's block_ids for a matching token_start.
+                let session = inner.sessions.iter().find(|s| s.session_id == arg.session_id);
+                session.and_then(|sess| {
+                    sess.block_ids.iter().find_map(|&bid| {
+                        inner.blocks.iter()
+                            .position(|b| b.block_id == bid && b.token_start == arg.token_start)
+                    })
+                })
+            }
+        }.ok_or(ENOENT)?;
 
         // Collect info before mutation.
         let block_id = inner.blocks[block_idx].block_id;
@@ -1365,8 +1391,29 @@ impl PolarisDevice {
         let inner = guard.as_mut().ok_or(ENODEV)?;
         let now = unsafe { bindings::ktime_get_mono_fast_ns() };
         let touch_end = arg.token_start + arg.token_count;
-        for block in inner.blocks.iter_mut() {
+
+        // Collect block IDs to touch (covers both directly-owned and COW-shared blocks).
+        let mut bids_to_touch: KVec<u64> = KVec::new();
+        if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
+            for &bid in &sess.block_ids {
+                bids_to_touch.push(bid, GFP_KERNEL)?;
+            }
+        }
+        // Also scan by session_id for directly-owned blocks not yet in block_ids list.
+        for block in inner.blocks.iter() {
             if block.session_id == arg.session_id {
+                let start = block.token_start as u64;
+                let end = start + block.token_count as u64;
+                if start < touch_end && end > arg.token_start {
+                    if !bids_to_touch.iter().any(|&bid| bid == block.block_id) {
+                        bids_to_touch.push(block.block_id, GFP_KERNEL)?;
+                    }
+                }
+            }
+        }
+
+        for bid in &bids_to_touch {
+            if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == *bid) {
                 let start = block.token_start as u64;
                 let end = start + block.token_count as u64;
                 if start < touch_end && end > arg.token_start {
@@ -1383,11 +1430,28 @@ impl PolarisDevice {
         let guard = POLARIS_STATE.lock();
         let inner = guard.as_ref().ok_or(ENODEV)?;
 
-        match inner
-            .blocks
-            .iter()
-            .find(|b| b.session_id == arg.session_id && b.token_start == arg.token_start)
-        {
+        // Look up by session_id and token_start.  For COW child sessions the
+        // block's session_id is the parent's, so fall back to the session's
+        // block_ids list.
+        let maybe_block = {
+            let direct = inner
+                .blocks
+                .iter()
+                .find(|b| b.session_id == arg.session_id && b.token_start == arg.token_start);
+            if direct.is_some() {
+                direct
+            } else {
+                let session = inner.sessions.iter().find(|s| s.session_id == arg.session_id);
+                session.and_then(|sess| {
+                    sess.block_ids.iter().find_map(|&bid| {
+                        inner.blocks.iter()
+                            .find(|b| b.block_id == bid && b.token_start == arg.token_start)
+                    })
+                })
+            }
+        };
+
+        match maybe_block {
             Some(block) => {
                 arg.block_id = block.block_id;
                 arg.state = block.state as u32;
@@ -1501,7 +1565,9 @@ impl PolarisDevice {
                     PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
-                        block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
+                        let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+                        block.map_time_ns = now;
+                        block.last_touch_ns = now;
                         block.cpu_buf_addr = 0;
                     }
                     PolarisBlockState::FreePending => {
