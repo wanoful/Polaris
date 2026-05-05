@@ -1,39 +1,5 @@
-From: POLARIS Phase 4b benchmark trace patch
-Subject: Add KV cache allocation tracing for vLLM
-
-This patch adds POLARIS trace collection to vLLM's KVCacheManager.
-Set environment variable POLARIS_TRACE=<output_path> before launching
-vLLM, and every KV cache block allocation/free event will be written
-to the specified CSV file.
-
-The trace format (compatible with polaris-workload trace-replay):
-    timestamp_ns,op,session_id,token_start,token_count
-
-Ops emitted:
-  - SESSION_CREATE: first allocation for a request
-  - BLOCK_ALLOC: each block allocated (with token range)
-  - BLOCK_FREE: each block freed
-  - SESSION_DESTROY: request freed from KV cache
-
-Intended vLLM version: commit 132765e3560659ff63ebd236203672e991b70e08
-Applies to: vllm/v1/core/kv_cache_manager.py
-
-Usage:
-  POLARIS_TRACE=/tmp/vllm_trace.csv vllm serve <model>
-  # After benchmark completes, copy /tmp/vllm_trace.csv to your
-  # POLARIS benchmarks/traces/ directory for replay.
-
-How to apply:
-  patch -p1 < benchmarks/patches/vllm/trace_kv_cache.patch
-  # (run this command from the vLLM repository root)
-
-How to revert:
-  patch -R -p1 < benchmarks/patches/vllm/trace_kv_cache.patch
-
-Note: This is purely additive. Zero changes to vLLM's behavior.
-
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 83aa26bd9..bbdad8d96 100644
+index 83aa26bd9..eabfea192 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,6 +2,8 @@
@@ -133,7 +99,7 @@ index 83aa26bd9..bbdad8d96 100644
 +            _polaris_emit("SESSION_CREATE", rid, 0, 0)
 +            self._polaris_seen_sessions.add(rid)
 +
-+        block_size = self.kv_cache_config.kv_cache_groups[0].block_size
++        block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
 +        if total_blocks > old_total:
 +            for i in range(old_total, total_blocks):
 +                token_start = i * block_size
