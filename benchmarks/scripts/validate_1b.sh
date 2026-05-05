@@ -64,7 +64,7 @@ echo ""
 echo "2. Starting polarisd daemon..."
 sudo "$RELEASE/polarisd" &
 DAEMON_PID=$!
-sleep 3
+sleep 10
 
 if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
     fail "polarisd exited immediately — check dmesg for errors"
