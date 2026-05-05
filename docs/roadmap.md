@@ -673,17 +673,35 @@ parent_session_id=3       →   child_session_id=7
    handles and GPU virtual addresses** as the parent
 4. No new GPU memory allocated — only metadata in the kernel
 
-**COW Break trigger:** COW break fires when any ioctl attempts to modify
-the content of a block whose `refcount > 1`. In practice:
+**COW Break trigger:** COW is triggered at the KV block API boundary, not by
+GPU hardware write faults. The workload or framework adapter expresses a
+semantic operation through ioctl — append, branch, or overwrite — and the
+kernel decides whether COW is required from the authoritative block table.
+The caller must not decide COW itself and must not inspect refcounts.
+
+In practice:
 
 - **Standard beam search:** child calls `BLOCK_GROW(tokens=512, count=16)`.
   This token range is **beyond** the shared prefix → it's a new block, not
   a modification → no COW break. The child allocates fresh.
-- **COW break test path:** the workload passes `POLARIS_GROW_FLAG_OVERWRITE`
-  to `BLOCK_GROW`, requesting tokens that overlap an existing shared block.
-  Kernel detects `refcount > 1` → queues `COW_BREAK` decision → daemon
-  allocates a **new** physical block with copied contents for the writing
-  session.
+- **Range conflict without overwrite:** if `BLOCK_GROW` targets a token range
+  that already overlaps an existing block and `POLARIS_GROW_FLAG_OVERWRITE`
+  is not set, the kernel must reject the ioctl. This prevents accidental
+  silent corruption of existing KV contents. The preferred error is
+  `-EEXIST` when available in the kernel binding; otherwise return
+  `-EINVAL` and log the overlapping `(session_id, token_start, token_count)`.
+- **Overwrite path:** the workload or vLLM/SGLang adapter passes
+  `POLARIS_GROW_FLAG_OVERWRITE` to `BLOCK_GROW`, requesting a write to an
+  existing token range. This flag means "this operation overwrites an
+  existing logical block"; it does **not** mean "force COW." The kernel then
+  checks the overlapping block:
+  - `refcount == 1`: the block is private, so overwrite may proceed in place.
+  - `refcount > 1`: the block is shared, so the kernel queues `COW_BREAK`.
+
+This mirrors vLLM's design at a different layer: vLLM performs refcount/COW
+checks inside its user-space block manager, while POLARIS performs the same
+decision inside the kernel module and delegates the copy/map operation to
+`polarisd`.
 
 **COW Break execution (POLARIS_DEC_COW_BREAK):**
 
@@ -703,13 +721,24 @@ Session 7 calls BLOCK_GROW(tokens=0..15, flags=OVERWRITE)
 
 The old block remains mapped for all other sessions that still share it.
 
-### Optimisation: Skip copy when block is stale
+### Optimisation: Skip Copy On Full-Block Overwrite
 
-If the writing session has already advanced past the shared block (i.e.,
-its `gpu_vas_cursor > token_start + token_count` of the shared block),
-the kernel can skip the COW copy and simply decrement refcount. This is
-common in beam search: the parent finished writing block 0..15 long before
-the child branches.
+The default COW break must copy old contents into the new physical block.
+This is required for partial overwrites: if only token 10 inside a 16-token
+block is modified, tokens 0..9 and 11..15 must still preserve their old KV
+values for the writing session.
+
+The kernel may skip the old→new copy only when the caller explicitly declares
+that the operation overwrites the **entire** block and old contents do not
+need to be preserved. In that case the kernel can allocate a private block,
+decrement the old block's refcount, and let the caller fill the new block
+from scratch.
+
+Important safety rule: `gpu_vas_cursor > token_start + token_count` is not
+sufficient to prove that a block is stale. In normal LLM decode, historical
+KV blocks remain semantically live because every decode attention step reads
+the prefix. Therefore, skip-copy is a narrow full-overwrite/no-preserve
+optimization, not the default beam-search path.
 
 ### Tracking
 
