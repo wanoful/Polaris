@@ -38,7 +38,7 @@ Inference layer (PyTorch / vLLM / synthetic workload)
 - **polarisctl**: CLI tool for stats, session inspection, and debugging.
 - **workloads/**: Synthetic KV stress, beam search, concurrent, and trace replay workloads.
 - **benchmarks/**: vLLM/SGLang trace collection, replay, plotting, and automated suite.
-- **adapter/** (deferred): Drop-in vLLM BlockSpaceManager replacement using POLARIS ioctls.
+- **adapter/**: Drop-in vLLM v1 integration adapter (`polaris_vllm`) — replaces `KVCacheManager` via `--scheduler-cls` extension point.
 - **ebpf/** (deferred): XDP eBPF program for zero-copy request ingestion.
 
 ## Core Abstractions
@@ -78,6 +78,22 @@ cargo run --bin beam_search -- --help
 - Replay traces: `workloads/src/trace_replay.rs`
 - Run full suite: `benchmarks/scripts/run_all.sh`
 - Generate plots: `benchmarks/scripts/plot.py`
+
+## vLLM Integration (Phase 4e)
+
+A drop-in adapter is provided under `adapter/polaris_vllm/`.  It uses vLLM v1's
+official `--scheduler-cls` extension point so **no source patches are required**.
+
+```bash
+# 1. Install the adapter
+cd adapter/polaris_vllm && pip install -e .
+
+# 2. Run vLLM with POLARIS backend
+vllm serve meta-llama/Llama-2-7b-hf \
+  --scheduler-cls polaris_vllm.scheduler.PolarisScheduler
+```
+
+See `adapter/polaris_vllm/README.md` for architecture details and troubleshooting.
 
 ## Repository Structure
 
