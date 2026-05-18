@@ -10,19 +10,29 @@ to an optional final phase.
 
 ---
 
-## Architecture: Kernel Module + CUDA VMM Daemon
+## Architecture: Patched NVIDIA UVM Fault Hook + POLARIS Kernel Service + CUDA VMM Daemon
 
 ```
 Inference layer (PyTorch / vLLM / synthetic workload)
       │
-      │  ioctl  ("I need a new KV block")
+      │  CUDA kernel touches an unmapped KV GPU VA
+      ▼
+NVIDIA GPU MMU
+      │
+      │  replayable page fault interrupt
+      ▼
+┌──────────────────────────────┐
+│ patched nvidia-uvm.ko        │  ← owns replayable page-fault interrupt,
+│ (UVM fault bottom half)      │    parses fault buffer, filters POLARIS VA
+└──────────────┬───────────────┘
+               │  internal kernel call / exported symbol
       ▼
 ┌──────────────┐
-│  polaris.ko  │  ← kernel module: authoritative block table (page table),
+│  polaris.ko  │  ← kernel service: authoritative block table (page table),
 │  (kernel)    │    page-fault decisions, COW refcount, LRU state,
-│              │    victim selection, eviction policy
+│              │    victim selection, eviction policy, fault wait queues
 └──────┬───────┘
-       │  ioctl  ("Execute: cuMemMap block 42 on GPU 0 at VA 0x7f...")
+       │  ioctl wakeup ("Execute: cuMemMap block 42 on GPU 0 at VA 0x7f...")
        ▼
 ┌──────────────┐
 │   polarisd   │  ← userspace daemon: executes CUDA VMM operations —
@@ -37,24 +47,91 @@ Inference layer (PyTorch / vLLM / synthetic workload)
 ```
 
 **Core justification:** GPU hardware page tables are proprietary and
-controlled by NVIDIA firmware. POLARIS cannot directly edit them. Instead,
-CUDA Virtual Memory Management (VMM) provides the OS-equivalent primitives:
-`cuMemMap` maps physical GPU memory into a reserved virtual address range;
-`cuMemUnmap` removes the mapping. The kernel module is the **sole decision
-authority** — it maintains the global block table, tracks per-block state,
-and issues all map/unmap/reclaim commands. The daemon is a blind executor.
-This split is structurally identical to how a CPU OS handles page faults:
-the kernel decides, the MMU executes. The difference is only that GPU MMU
-manipulation flows through the NVIDIA driver rather than kernel code
-directly.
+controlled by NVIDIA firmware. POLARIS still cannot edit them directly, but
+the open NVIDIA kernel driver exposes the page-fault interrupt path used by
+UVM. RM owns the physical interrupt, UVM calls
+`nvUvmInterfaceOwnPageFaultIntr(..., NV_TRUE)` to take replayable page-fault
+ownership, RM calls UVM's registered `isrTopHalf`, and UVM's bottom half
+parses the replayable fault buffer before issuing a GPU replay. POLARIS will
+take over this path by patching `nvidia-uvm.ko`, not by polling from the
+workload.
+
+CUDA Virtual Memory Management (VMM) remains the OS-equivalent mapping
+primitive: `cuMemMap` maps physical GPU memory into a reserved virtual
+address range; `cuMemUnmap` removes the mapping. The kernel service is the
+**sole decision authority** - it maintains the global block table, tracks
+per-block state, and issues all map/unmap/reclaim decisions. The daemon is a
+blind executor. The critical change is that the event source is a real GPU
+page-fault interrupt in the NVIDIA driver rather than a manual
+`POLARIS_BLOCK_GROW` ioctl from the workload.
+
+**Driver takeover finding:** A standalone third-party module cannot cleanly
+preempt UVM after it has claimed replayable page faults. The practical path
+is to build a patched `nvidia-uvm.ko` from
+`/home/wano/workspace/os/open-gpu-kernel-modules` and add a narrow POLARIS
+hook in the UVM replayable fault service path. Non-POLARIS faults must fall
+through to NVIDIA's existing UVM handler unchanged.
+
+### NVIDIA UVM Fault Path To Hook
+
+The open driver shows the control points POLARIS needs:
+
+- UVM registers its interrupt callbacks in
+  `kernel-open/nvidia-uvm/uvm_global.c` by assigning
+  `g_exported_uvm_events.isrTopHalf = uvm_isr_top_half_entry` and passing the
+  callback table to `nvUvmInterfaceRegisterUvmEvents`.
+- UVM takes replayable page-fault interrupt ownership in
+  `kernel-open/nvidia-uvm/uvm_gpu_replayable_faults.c` by calling
+  `nvUvmInterfaceOwnPageFaultIntr(parent_gpu->rm_device, NV_TRUE)`.
+- The RM-facing wrapper is in `kernel-open/nvidia/nv_uvm_interface.c`;
+  it exports `nvUvmInterfaceOwnPageFaultIntr`,
+  `nvUvmInterfaceInitFaultInfo`, `nvUvmInterfaceFlushReplayableFaultBuffer`,
+  `nvUvmInterfaceHasPendingNonReplayableFaults`, and
+  `nvUvmInterfaceGetNonReplayableFaults`.
+- The RM implementation in
+  `src/nvidia/arch/nvalloc/unix/src/rm-gpu-ops.c` calls
+  `nvGpuOpsOwnPageFaultIntr(device, bOwnInterrupts)`. Its comments state
+  that when UVM owns replayable faults, RM will not service, enable, or
+  disable that interrupt.
+- The interrupt top half is `uvm_isr_top_half_entry` in
+  `kernel-open/nvidia-uvm/uvm_gpu_isr.c`. It schedules
+  `replayable_faults_isr_bottom_half_entry` when replayable faults are
+  pending.
+- The replayable bottom half calls
+  `uvm_parent_gpu_service_replayable_faults(parent_gpu)`, which fetches fault
+  buffer entries, services a batch, and issues replay through UVM's existing
+  replay machinery.
+- Fault packets are parsed into `uvm_fault_buffer_entry_t`; the parsed entry
+  exposes `fault_address`, `fault_access_type`, `is_virtual`, `instance_ptr`,
+  and `fault_source`. POLARIS should filter on a registered GPU VA range and
+  let all other entries follow the stock UVM path.
+
+**Hook strategy:** add a small POLARIS dispatcher immediately after
+replayable fault entries are parsed and before UVM attempts normal managed
+memory servicing. If `fault_address` is outside a POLARIS registered VA
+range, return `NOT_MINE` and preserve stock behavior. If it is inside a
+POLARIS range, the dispatcher:
+
+1. Coalesces faults to the KV block granularity.
+2. Calls into `polaris.ko` with `(gpu_uuid, fault_address, access_type,
+   instance_ptr, fault_source)`.
+3. Queues the required decision (`ALLOC`, `RELOAD`, `COW_BREAK`, or
+   `MAP_EXISTING`) and wakes `polarisd`.
+4. Waits for the daemon to complete the VMM operation or time out.
+5. Returns success to the UVM fault loop so UVM can update the fault buffer
+   GET pointer, clear/rearm the interrupt, and replay the faulting work.
+
+The hook must never perform CUDA VMM operations in interrupt context. All
+CUDA calls stay in `polarisd`; the UVM bottom half only blocks on a bounded
+kernel wait queue while the GPU channel is already fault-stalled.
 
 ### Why a kernel module is necessary
 
 | Concern | vLLM / SGLang | POLARIS |
 |---------|---------------|---------|
-| Global visibility across processes | None — each process sees only itself | Kernel module sees all sessions, all GPUs, all blocks |
+| Global visibility across processes | None — each process sees only itself | Kernel service sees all sessions, all GPUs, all blocks |
 | State persistence | Lost on process crash | Kernel structures survive, allowing graceful reclaim |
-| OS integration | Isolated Python process | Standard interfaces: `/dev/polaris`, `/sys/kernel/polaris/stats`, ioctls |
+| OS integration | Isolated Python process | Standard interfaces: patched `nvidia-uvm.ko`, `/dev/polaris`, `/sys/kernel/polaris/stats`, ioctls |
 | COW refcount authority | None (Python dict) | Atomic kernel-side refcount, crash-safe |
 | Policy pluggability | Hard-coded in Python | Kernel module exposes tunable policies, switchable at runtime |
 
@@ -125,8 +202,9 @@ block manager.
                                                 GPU memory
 ```
 
-The ioctl protocol defined in Phase 1a is POLARIS's proposal for this
-universal interface. No such standard exists today.
+The ioctl protocol defined in Phase 1b plus the UVM fault hook in Phase 1a
+are POLARIS's proposal for this universal interface. No such standard exists
+today.
 
 ---
 
@@ -174,7 +252,11 @@ This is POLARIS's equivalent of a page table.
 ### Questions to be answered
 
 - Can CUDA VMM's `cuMemMap`/`cuMemUnmap` be composed into a kernel-directed
-  page-fault mechanism that behaves like OS paging for KV Cache?
+  page-fault mechanism driven by NVIDIA UVM replayable-fault interrupts?
+- Can a patched `nvidia-uvm.ko` safely intercept only POLARIS KV-cache fault
+  addresses while preserving stock UVM handling for all other faults?
+- What is the latency from GPU page-fault interrupt to daemon VMM mapping to
+  UVM replay?
 - How much GPU memory is saved when the kernel module applies phase-aware
   victim selection with CPU offload?
 - What is the COW sharing efficiency for beam search compared to full
@@ -201,6 +283,7 @@ This is POLARIS's equivalent of a page table.
 - Internal fragmentation: unused token slots within allocated blocks
 - COW sharing: shared GPU bytes vs. private GPU bytes
 - Page-fault count, offload count, reload count
+- Driver-fault count, interrupt-to-map latency, map-to-replay latency
 - Offload latency, reload latency
 - End-to-end throughput: tokens per second
 
@@ -211,7 +294,45 @@ This is POLARIS's equivalent of a page table.
 This is the **core contribution** of the project. Everything else depends
 on this working correctly.
 
-### Phase 1a: Kernel Module Skeleton
+### Phase 1a: NVIDIA UVM Fault Hook Spike
+
+**Goal:** Replace manual workload notifications with real GPU page-fault
+interrupts from the NVIDIA driver.
+
+- Build a patched `nvidia-uvm.ko` from the open driver tree and load it with
+  the matching open NVIDIA kernel modules.
+- Add a small POLARIS hook in the replayable fault service path after fault
+  entries are parsed into `uvm_fault_buffer_entry_t`.
+- Register POLARIS GPU VA ranges in a lookup table keyed by GPU UUID and VA
+  range.
+- For each replayable fault:
+  - If `fault_address` is not in a POLARIS range, return immediately to the
+    stock UVM handler.
+  - If it is in a POLARIS range, coalesce to the KV block, call
+    `polaris_resolve_gpu_fault()`, and wait for completion.
+  - On success, let UVM replay the faulting work.
+  - On timeout or daemon failure, cancel or fail the fault using the existing
+    UVM fatal-fault path rather than spinning forever.
+- Preserve non-replayable fault handling. UVM/RM split ownership of
+  non-replayable faults through a shadow buffer; POLARIS should not use that
+  path for the primary KV-cache demand-paging mechanism.
+
+**Validation experiments:**
+
+- Trigger a deliberate unmapped access inside a registered POLARIS VA range
+  and verify the patched UVM hook sees the `fault_address`.
+- Verify a normal Unified Memory workload still follows the stock UVM handler
+  and passes before/after checks.
+- Measure interrupt-to-hook latency and hook-to-replay latency with a no-op
+  handler before enabling daemon VMM operations.
+
+**Success criterion:**
+
+- A CUDA kernel touching an unmapped POLARIS KV-cache VA stalls, enters the
+  patched UVM replayable-fault path, is mapped by `polarisd`, and then resumes
+  after UVM replay without a manual `POLARIS_BLOCK_GROW` ioctl.
+
+### Phase 1b: Kernel Module Skeleton
 
 **Goal:** Loadable kernel module with session and block metadata management,
 plus the complete decision protocol interface between kernel and daemon.
@@ -219,6 +340,8 @@ plus the complete decision protocol interface between kernel and daemon.
 **Implement:**
 
 - Character device `/dev/polaris` with `open`, `release`, `unlocked_ioctl`
+- Kernel-facing API used by patched `nvidia-uvm.ko`:
+  `polaris_register_fault_range()` and `polaris_resolve_gpu_fault()`
 - `sysfs` stats exposure (`/sys/kernel/polaris/stats`)
 - GPU registration structure
 - Session table (create, lookup, destroy)
@@ -229,10 +352,11 @@ plus the complete decision protocol interface between kernel and daemon.
 
 ```c
 enum polaris_block_state {
-    POLARIS_BLOCK_FREE_PENDING,     // daemon is releasing the phys handle
+    POLARIS_BLOCK_PHYS_FREE_PENDING, // daemon is releasing the phys handle
     POLARIS_BLOCK_RESIDENT,         // mapped to GPU, accessible
     POLARIS_BLOCK_ALLOC_PENDING,    // daemon is creating + mapping
     POLARIS_BLOCK_UNMAPPED,         // unmapped from GPU VA, phys handle exists
+    POLARIS_BLOCK_RECLAIMABLE,      // logical release done, waiting for safe physical reclaim
     POLARIS_BLOCK_CPU_OFFLOADED,    // unmapped, data on CPU pinned memory
     POLARIS_BLOCK_OFFLOAD_PENDING,  // daemon is copying GPU→CPU
     POLARIS_BLOCK_RELOAD_PENDING,   // daemon is allocating + copying CPU→GPU
@@ -250,7 +374,7 @@ struct polaris_block {
     u64 session_id;
     u32 token_start, token_count;
     u32 home_gpu;
-    u64 gpu_vaddr;           // GPU virtual address (reserved via cuMemAddressReserve)
+    u64 gpu_vaddr;           // session-local GPU VA from registered POLARIS pool
     u64 gpu_phys_handle;     // opaque CUDA VMM allocation handle
     u64 cpu_buf_addr;        // CPU pinned buffer address (valid if CPU_OFFLOADED)
     u64 size_bytes;
@@ -260,13 +384,14 @@ struct polaris_block {
     u32 phase;               // POLARIS_PHASE_PREFILL or POLARIS_PHASE_DECODE
     u64 last_touch_ns;       // for LRU
     u64 map_time_ns;         // when this block was last mapped
+    u64 fault_count;         // number of driver interrupts resolved for this block
 };
 
 struct polaris_session {
     u64 session_id;
     u32 home_gpu;
-    u64 gpu_vas_base;        // reserved GPU virtual address space start
-    u64 gpu_vas_size;        // total reserved VA space for this session
+    u64 gpu_vas_base;        // session-local subrange inside daemon-reserved VA pool
+    u64 gpu_vas_size;        // total VA metadata budget for this session
     u32 beam_width;
     u64 parent_session_id;   // for COW: 0 if root
     struct list_head blocks; // linked list in token order
@@ -274,6 +399,7 @@ struct polaris_session {
 
 struct polaris_gpu {
     u32 gpu_id;
+    u8 gpu_uuid[16];           // NVIDIA UUID used by UVM/RM fault callbacks
     u64 total_bytes;
     u64 used_bytes;
     u64 budget_bytes;
@@ -281,23 +407,46 @@ struct polaris_gpu {
     u64 cpu_pool_total_bytes;  // total CPU pinned memory for offload
     u64 cpu_pool_used_bytes;   // currently in-use CPU offload buffer space
 };
+
+struct polaris_fault {
+    u64 fault_id;
+    u64 generation;          // prevents stale daemon completions after timeout/reuse
+    u32 gpu_id;
+    u64 fault_address;       // parsed from uvm_fault_buffer_entry_t
+    u64 block_id;            // resolved by POLARIS VA range lookup
+    u32 access_type;         // read/write/atomic/prefetch
+    u32 state;               // QUEUED, WAITING_DAEMON, RESOLVED, FAILED
+    u64 enqueue_ns;
+    u64 deadline_ns;         // bounded wait in UVM bottom half
+    u64 resolved_ns;
+};
 ```
 
-**Required ioctls:**
+**Required ioctls, grouped by owner:**
 
 ```
-POLARIS_REGISTER_GPU            // daemon reports GPU capacity, CPU pool size
-POLARIS_SESSION_CREATE           // allocate session, reserve GPU VA space
-POLARIS_SESSION_DESTROY          // release all blocks, free VA space
-POLARIS_SESSION_GET_STATS
-POLARIS_SESSION_BRANCH           // COW: fork session, share all existing blocks
-POLARIS_BLOCK_GROW               // page-fault entry: request new block(s)
-POLARIS_BLOCK_FREE               // release a specific token range (decrements refcount)
-POLARIS_BLOCK_TOUCH              // update access timestamp for LRU
-POLARIS_BLOCK_GET_STATE          // query a block's location and mapping
-POLARIS_GET_DECISION             // daemon polls: "what should I do next?"
+/* daemon/admin-facing */
+POLARIS_DAEMON_ATTACH            // daemon announces executor availability
+POLARIS_DAEMON_HEARTBEAT         // daemon liveness and generation tracking
+POLARIS_REGISTER_GPU             // daemon reports GPU capacity, CPU pool size
+POLARIS_REGISTER_VA_RANGE        // daemon-only: register CUDA-reserved KV VA range
+POLARIS_GET_DECISION             // blocking wait: "what should I do next?"
 POLARIS_COMPLETE_OPERATION       // daemon reports: "I did the thing" (with result code)
+POLARIS_SET_POLICY               // admin/debug: switch eviction policy
 POLARIS_GET_GLOBAL_STATS
+
+/* workload/framework-facing */
+POLARIS_SESSION_CREATE           // metadata-only session creation
+POLARIS_SESSION_DESTROY          // release all logical blocks and VA bindings
+POLARIS_SESSION_GET_STATS
+POLARIS_SESSION_BRANCH           // COW: fork session, share physical handles
+POLARIS_BLOCK_RESERVE            // logical token range + session-local GPU VA
+POLARIS_BLOCK_RELEASE            // logical release; physical reclaim is async/safe
+POLARIS_BLOCK_TOUCH              // advisory access timestamp for LRU
+POLARIS_BLOCK_GET_STATE          // query a block's location and mapping
+
+/* debug/test only */
+POLARIS_BLOCK_GROW               // fallback without patched UVM; not production path
 ```
 
 ### Kernel ↔ Daemon Decision Protocol
@@ -309,37 +458,87 @@ is the critical interface between policy (kernel) and execution (daemon).
 
 ```
 POLARIS_DEC_ALLOC       // cuMemCreate + cuMemMap → return phys handle
+                        //   (used when a real UVM replayable fault lands on an unmapped block)
 POLARIS_DEC_FREE        // cuMemUnmap + cuMemRelease
 POLARIS_DEC_MAP         // cuMemMap an existing phys handle into a VA range
                         //   (used for COW sharing: map parent's handle into child's VA)
 POLARIS_DEC_UNMAP       // cuMemUnmap but keep phys handle
-                        //   (used before offload: detach from VA before cudaMemcpy)
-POLARIS_DEC_OFFLOAD     // cudaMemcpy GPU→CPU + cuMemUnmap
-POLARIS_DEC_RELOAD      // cuMemCreate + cuMemMap + cudaMemcpy CPU→GPU
-POLARIS_DEC_COW_BREAK   // cuMemCreate + cuMemMap + cudaMemcpy old→new
+                        //   (metadata-only detach or post-copy cleanup; never before copy)
+POLARIS_DEC_OFFLOAD     // cudaMemcpy GPU VA→CPU + cuMemUnmap after copy
+POLARIS_DEC_RELOAD      // cuMemCreate + cuMemMap + cudaMemcpy CPU→GPU VA
+POLARIS_DEC_COW_BREAK   // cuMemCreate + cuMemMap + cudaMemcpy old VA→new VA
 ```
 
 **Wire format:**
 
 ```c
-#define POLARIS_MAX_DECISIONS_PER_POLL  16
+#define POLARIS_MAX_DECISIONS_PER_GET  16
 
 struct polaris_decision {
     __u64 decision_id;          // unique, assigned by kernel
+    __u64 fault_id;             // 0 for non-fault decisions
+    __u64 generation;           // fault/session generation for stale completion rejection
     __u32 op;                   // POLARIS_DEC_*
     __u32 gpu_id;
     __u64 block_id;             // kernel block ID (for traceability)
     __u64 session_id;
 
     // Inputs (kernel → daemon)
-    __u64 src_handle;           // phys handle to operate on
-    __u64 dst_vaddr;            // target GPU VA (for map)
+    __u64 src_handle;           // physical backing identity for map/release/debug
+    __u64 dst_handle;           // optional existing destination handle
+    __u64 src_vaddr;            // CUDA-readable GPU VA for copy/unmap
+    __u64 dst_vaddr;            // CUDA-map/write GPU VA for map/reload/COW
     __u64 size_bytes;
     __u64 cpu_addr;             // CPU pinned buffer address (offload/reload)
+    __u32 access_flags;         // CUDA VMM access mode for cuMemSetAccess
+    __u32 timeout_ms;           // bounded daemon execution budget
 
     __u64 __reserved[4];
 };
 ```
+
+**Opcode semantics:**
+
+```
+ALLOC:
+  input:  dst_vaddr, size_bytes, access_flags
+  action: cuMemCreate → cuMemMap(dst_vaddr) → cuMemSetAccess
+  output: output_handle
+
+MAP:
+  input:  src_handle, dst_vaddr, size_bytes, access_flags
+  action: cuMemMap(dst_vaddr, src_handle) → cuMemSetAccess
+
+UNMAP:
+  input:  src_vaddr, size_bytes
+  action: cuMemUnmap(src_vaddr)
+
+FREE:
+  input:  src_vaddr if mapped, src_handle, size_bytes
+  action: cuMemUnmap(src_vaddr) if still mapped → cuMemRelease(src_handle)
+
+OFFLOAD:
+  input:  src_vaddr, cpu_addr, size_bytes
+  action: cudaMemcpy(cpu_addr ← src_vaddr), then cuMemUnmap(src_vaddr)
+  output: output_cpu_addr
+
+RELOAD:
+  input:  dst_vaddr, cpu_addr, size_bytes, access_flags
+  action: cuMemCreate → cuMemMap(dst_vaddr) → cuMemSetAccess
+          → cudaMemcpy(dst_vaddr ← cpu_addr)
+  output: output_handle
+
+COW_BREAK:
+  input:  src_vaddr, dst_vaddr, size_bytes, access_flags
+  action: cuMemCreate → cuMemMap(dst_vaddr) → cuMemSetAccess
+          → cudaMemcpy(dst_vaddr ← src_vaddr)
+  output: output_handle
+```
+
+CUDA VMM handles identify physical backing allocations. CUDA kernels and
+`cudaMemcpy` operate on mapped GPU virtual addresses, so copy-related
+decisions must carry explicit source and destination VAs in addition to
+handles.
 
 **GET_DECISION argument:**
 
@@ -347,7 +546,7 @@ struct polaris_decision {
 struct polaris_get_decision_arg {
     __u32 count;                // out: decisions returned
     __u32 __reserved;
-    struct polaris_decision decisions[POLARIS_MAX_DECISIONS_PER_POLL];
+    struct polaris_decision decisions[POLARIS_MAX_DECISIONS_PER_GET];
 };
 ```
 
@@ -356,6 +555,7 @@ struct polaris_get_decision_arg {
 ```c
 struct polaris_complete_operation_arg {
     __u64 decision_id;
+    __u64 generation;           // must match current decision/fault generation
     __s32 result;               // 0 = success; negative = errno on failure
     __u32 __reserved;
 
@@ -372,7 +572,7 @@ struct polaris_complete_operation_arg {
 
 | Error code | Daemon meaning | Kernel response |
 |------------|---------------|-----------------|
-| `-ENOMEM` | `cuMemCreate` returned OUT_OF_MEMORY | Retry with smaller block, or fail the original BLOCK_GROW ioctl |
+| `-ENOMEM` | `cuMemCreate` returned OUT_OF_MEMORY | Retry with smaller block, queue eviction/offload, or fail the pending fault/fallback ioctl |
 | `-ENODEV` | GPU lost / driver error | Mark GPU as unhealthy, reject all sessions on that GPU |
 | `-EINVAL` | Invalid parameter (driver rejected) | Kernel log + mark block FAILED + return error to caller |
 | `-EFAULT` | Copy failed (page fault on CPU buffer) | Retry once, then evict the block |
@@ -380,19 +580,30 @@ struct polaris_complete_operation_arg {
 
 The kernel maintains a per-decision retry counter to prevent infinite retry
 loops. After 3 consecutive failures for the same block, the block is
-marked as `POLARIS_BLOCK_EVICTED` and the original caller receives an
-error.
+marked as `POLARIS_BLOCK_EVICTED` and the pending fault or fallback caller
+receives an error. Late `COMPLETE_OPERATION` calls whose generation no
+longer matches the active decision are ignored.
 
-**Implementation note:** The daemon must process every pending decision
-before polling `GET_DECISION` again, to prevent starvation. The
-`decision_id` ties each `COMPLETE_OPERATION` to exactly one queued decision.
+**Implementation note:** `POLARIS_GET_DECISION` is a blocking ioctl with a
+timeout, and `/dev/polaris` should also support `poll`/`epoll`. The daemon
+must process every returned decision before waiting for more work, to prevent
+starvation. The `(decision_id, generation)` pair ties each
+`COMPLETE_OPERATION` to exactly one queued decision.
 
-### Workload-Facing ioctl Argument Structs
+### ioctl Argument Structs
 
 ```c
 /* --- GPU registration (daemon → kernel) --- */
+struct polaris_daemon_attach_arg {
+    __u32 daemon_version;
+    __u32 flags;
+    __u64 heartbeat_interval_ms;
+    __u64 __reserved[4];
+};
+
 struct polaris_register_gpu_arg {
     __u32 gpu_id;
+    __u8  gpu_uuid[16];          // NVIDIA UUID used by UVM fault hook
     __u64 total_bytes;
     __u64 budget_bytes;          // kernel enforces this limit
     __u64 cpu_pool_bytes;        // daemon's pre-allocated CPU pinned memory size
@@ -401,23 +612,49 @@ struct polaris_register_gpu_arg {
     __u64 __reserved2[2];
 };
 
-/* --- Session create (workload → kernel) --- */
+/* --- POLARIS GPU VA range registration (daemon-only → kernel/driver hook) --- */
+struct polaris_register_va_range_arg {
+    __u64 range_id;               // out/in: kernel-assigned or daemon-supplied pool ID
+    __u32 gpu_id;
+    __u32 flags;                  // global KV pool, read-only capable, etc.
+    __u64 base;                  // base returned by cuMemAddressReserve
+    __u64 length;                // reserved KV cache VA span
+    __u64 block_size;            // KV block granularity
+    __u64 __reserved2[4];
+};
+
+/* --- Session create (workload → kernel metadata only) --- */
 struct polaris_session_create_arg {
     __u64 session_id;             // out: kernel-assigned
     __u32 home_gpu;               // in: preferred GPU (kernel may override)
     __u32 beam_width;             // in
-    __u64 gpu_vas_bytes;          // in: how much GPU VA to reserve
     __u64 __reserved[4];
 };
 
-/* --- Block grow / page-fault (workload → kernel) --- */
-#define POLARIS_GROW_FLAG_OVERWRITE  (1 << 0)   // allow overlap with shared blocks
+#define POLARIS_RESERVE_FLAG_OVERWRITE (1 << 0) // allow overlap with shared blocks
+#define POLARIS_RESERVE_FLAG_READ_MOSTLY (1 << 1)
+#define POLARIS_RESERVE_FLAG_WRITE_NEW   (1 << 2)
+#define POLARIS_RESERVE_FLAG_FULL_OVERWRITE_NO_PRESERVE (1 << 3)
+#define POLARIS_RELEASE_FLAG_STREAM_QUIESCED (1 << 0)
 
+/* --- Block reserve (workload → kernel metadata, no GPU allocation) --- */
+struct polaris_block_reserve_arg {
+    __u64 session_id;             // in
+    __u32 token_start;            // in
+    __u32 token_count;            // in
+    __u32 phase;                  // in: PREFILL or DECODE
+    __u32 flags;                  // in: POLARIS_RESERVE_FLAG_* and overwrite mode
+    __u64 block_id;               // out: kernel-assigned logical block ID
+    __u64 gpu_vaddr;              // out: session-local VA to be touched by CUDA kernel
+    __u64 __reserved[3];
+};
+
+/* --- Block grow test path (workload → kernel) --- */
 struct polaris_block_grow_arg {
     __u64 session_id;             // in
     __u32 token_start;            // in
     __u32 token_count;            // in
-    __u32 flags;                  // in: POLARIS_GROW_FLAG_*
+    __u32 flags;                  // in: debug compatibility with POLARIS_RESERVE_FLAG_*
     __u32 __reserved;
     __u64 block_id;               // out: kernel-assigned block ID
     __s32 ret_code;               // out: 0 = queued, -ENOMEM, -ENODEV
@@ -425,12 +662,14 @@ struct polaris_block_grow_arg {
     __u64 __reserved3[2];
 };
 
-/* --- Block free (workload → kernel) --- */
-struct polaris_block_free_arg {
+/* --- Block release (workload → kernel) --- */
+struct polaris_block_release_arg {
     __u64 session_id;             // in
     __u32 token_start;            // in
     __u32 token_count;            // in
-    __u64 __reserved[4];
+    __u32 flags;                  // caller guarantees stream quiescence if set
+    __u32 __reserved2;
+    __u64 __reserved3[4];
 };
 
 /* --- Block touch (workload → kernel, updates LRU) --- */
@@ -449,7 +688,27 @@ struct polaris_session_branch_arg {
 };
 ```
 
-### Phase 1b: CUDA VMM Backend (Daemon)
+Production page faults do not enter through `polaris_block_grow_arg`. They
+enter through the patched UVM fault hook, which calls an internal
+`polaris_resolve_gpu_fault()` helper with the parsed `uvm_fault_buffer_entry_t`
+fields. `POLARIS_BLOCK_GROW` remains only for synthetic tests and trace
+replay when the patched NVIDIA driver is not loaded.
+
+`POLARIS_BLOCK_RESERVE` is the normal allocation-facing API after the
+interrupt change. It creates only logical metadata and returns a session-local
+GPU VA. It does not allocate physical GPU memory. The first GPU access to
+that VA triggers the UVM replayable fault path, and POLARIS then decides
+whether to allocate, reload, map an existing shared handle, or COW break.
+Overlapping reservations return `-EEXIST` unless `POLARIS_RESERVE_FLAG_OVERWRITE`
+is set.
+
+`POLARIS_BLOCK_RELEASE` is a logical release, not an immediate unsafe
+`cuMemRelease`. The caller must either guarantee stream quiescence with
+`POLARIS_RELEASE_FLAG_STREAM_QUIESCED`, or POLARIS marks the block
+reclaimable and delays physical unmap/release until a safe point such as
+session teardown or a daemon-observed CUDA event in later integrations.
+
+### Phase 1c: CUDA VMM Backend (Daemon)
 
 **Goal:** Real GPU memory allocation driven by kernel page-fault decisions.
 
@@ -462,57 +721,58 @@ equivalent to OS page fault handling.
 - Discover GPU via CUDA and NVML
 - Report GPU memory capacity, free memory to the kernel module
 - Reserve a single global GPU VA pool at startup (`cuMemAddressReserve`)
-  — all blocks across all sessions are mapped into this pool. Per-session
-  reservation adds unnecessary daemon round-trips and fragments VA space.
-  GPU VA is vast (40+ bits), so a single 64 GiB reservation is safe.
+  — all session-local KV VAs are carved from this pool. Sessions receive
+  distinct, non-overlapping VA slices for isolation and COW correctness, but
+  the daemon avoids per-session CUDA reservation round-trips. GPU VA is vast
+  (40+ bits), so a single 64 GiB reservation is safe.
+- Register the global KV VA pool with POLARIS through privileged
+  `POLARIS_REGISTER_VA_RANGE`; workloads do not register fault ranges
 - Execute kernel decisions:
   - `cuMemCreate`: allocate physical GPU memory handle
   - `cuMemMap`: map a physical handle into a sub-range of the global VA pool
   - `cuMemUnmap`: unmap the sub-range — equivalent of page-out
   - `cuMemSetAccess`: set read/write access for a GPU on a VA range
   - `cuMemRelease`: free physical memory handle
-- Poll `POLARIS_GET_DECISION` and execute the returned operation list
+- Block in `POLARIS_GET_DECISION` and execute the returned operation list
 - Report completion via `POLARIS_COMPLETE_OPERATION`
 
-**Page-fault flow (BLOCK_GROW):**
+**Page-fault flow (real driver interrupt):**
 
 ```
- Inference layer
-      │  ioctl(POLARIS_BLOCK_GROW, session=7, tokens=1..16, flags=0)
+ CUDA kernel
+      │  read/write GPU VA 0x7f... inside session 7 KV range
       ▼
- Kernel module                                Daemon
- ┌──────────────────────┐                  ┌─────────────────┐
- │ 1. Look up session 7 │                  │                 │
- │ 2. Find gap in block │                  │                 │
- │    table at tokens   │                  │                 │
- │    1..16 → page fault│                  │                 │
- │ 3. Check GPU budget  │                  │                 │
- │    → has free space   │                  │                 │
- │ 4. Create block entry │                  │                 │
- │    state=ALLOC_PENDING│                  │                 │
- │ 5. Queue decision:   │───GET_DECISION──▶│ 6. Read decision│
- │    {op=ALLOC,         │                  │ 7. cuMemCreate  │
- │     session=7,        │                  │ 8. cuMemMap     │
- │     gpu=0,            │                  │ 9. Report done  │
- │     size=8MB}         │◀─COMPLETE_OP────│    {result=0,    │
- │                       │                  │     handle=X}   │
- │ 10. Update block:    │                  │                 │
- │     phys_handle=X,   │                  │                 │
- │     state=RESIDENT   │                  │                 │
- │ 11. Return to user   │                  │                 │
- │     ret_code=0        │                  │                 │
- └──────────────────────┘                  └─────────────────┘
+ NVIDIA UVM fault BH          POLARIS kernel service             Daemon
+ ┌──────────────────────┐     ┌──────────────────────┐        ┌─────────────────┐
+ │ 1. Parse fault entry │     │                      │        │                 │
+ │ 2. Match POLARIS VA  │────▶│ 3. Resolve session   │        │                 │
+ │    range             │     │    and block         │        │                 │
+ │                      │     │ 4. Check GPU budget  │        │                 │
+ │                      │     │ 5. Create/mark block │        │                 │
+ │                      │     │    ALLOC_PENDING     │        │                 │
+ │                      │     │ 6. Queue decision:   │─WAKE──▶│ 7. Read decision│
+ │                      │     │    {op=ALLOC,        │        │ 8. cuMemCreate  │
+ │                      │     │     fault_id=F,      │        │ 9. cuMemMap     │
+ │                      │     │     dst_vaddr=0x7f}  │◀DONE──│10. COMPLETE_OP  │
+ │                      │     │11. Update block:     │        │                 │
+ │                      │◀────│    state=RESIDENT    │        │                 │
+ │12. Advance fault GET │     │                      │        │                 │
+ │13. UVM replay        │     │                      │        │                 │
+ └──────────────────────┘     └──────────────────────┘        └─────────────────┘
 ```
 
-When GPU memory budget is exceeded at step 3, the kernel returns `-ENOMEM`
-to the caller.  Full victim selection, offload, and eviction under memory
-pressure is implemented in Phase 2.
+When GPU memory budget is exceeded at step 4, the kernel fault resolver does
+not return `-ENOMEM` to the workload directly because the workload is stalled
+inside a GPU fault. Instead it either queues eviction/offload work (Phase 2)
+or fails the fault through the UVM cancel/fatal path so the CUDA work receives
+an ordinary CUDA failure.
 
-**Error path (step 7 fails):** If `cuMemCreate` returns OUT_OF_MEMORY,
+**Error path (step 8 fails):** If `cuMemCreate` returns OUT_OF_MEMORY,
 daemon reports `result=-ENOMEM` via `COMPLETE_OPERATION`. Kernel retries
 once (recomputes the decision, possibly selecting a different victim). If
-the retry also fails, the block entry is removed and the `BLOCK_GROW`
-ioctl returns `-ENOMEM` to the calling process.
+the retry also fails, the block entry is removed and the fault is completed
+as failed; the UVM hook cancels/fails the replayable fault rather than
+spinning in the bottom half.
 
 **Deliverables:**
 
@@ -520,32 +780,45 @@ ioctl returns `-ENOMEM` to the calling process.
 - `polarisd` daemon compiles and runs
 - Real `cuMemCreate`/`cuMemMap`/`cuMemUnmap` path functional
 - Per-GPU used/free bytes reported to the kernel and match `nvidia-smi`
-- Synthetic KV workload: allocate blocks → touch them → free them
+- Synthetic KV workload: reserve VA → launch kernel touching unmapped KV
+  blocks → driver fault hook maps them → touch/free them
 
 **Success criterion:**
 
-- A workload allocates KV blocks through `BLOCK_GROW`, `nvidia-smi` visibly
-  shows memory consumption rising, and POLARIS stats match the real GPU
-  memory usage within a 5% margin.
+- A workload allocates KV blocks by touching unmapped GPU VAs, `nvidia-smi`
+  visibly shows memory consumption rising, and POLARIS stats match the real
+  GPU memory usage within a 5% margin.
 
-### Phase 1c: Daemon Lifecycle & Resilience
+### Phase 1d: Daemon Lifecycle & Resilience
 
 **Daemon startup:** `polarisd` runs as a systemd service, started before any
 workload. On init:
 
 1. Opens `/dev/polaris`
-2. Discovers GPUs via CUDA/NVML
-3. Calls `POLARIS_REGISTER_GPU` for each GPU (including CPU pool capacity)
-4. Pre-allocates the CPU pinned memory pool (`cudaMallocHost`)
-5. Enters the decision loop: `POLARIS_GET_DECISION` → execute → `COMPLETE_OPERATION`
+2. Calls `POLARIS_DAEMON_ATTACH`
+3. Discovers GPUs via CUDA/NVML
+4. Calls `POLARIS_REGISTER_GPU` for each GPU (including CPU pool capacity)
+5. Reserves and registers the global KV GPU VA pool with
+   `POLARIS_REGISTER_VA_RANGE`
+6. Pre-allocates the CPU pinned memory pool (`cudaMallocHost`)
+7. Enters the blocking decision loop:
+   `POLARIS_GET_DECISION` → execute → `COMPLETE_OPERATION`
+8. Sends `POLARIS_DAEMON_HEARTBEAT` periodically so pending faults can fail
+   quickly if the executor dies
 
 **Daemon crash recovery:** If the daemon process dies:
 
 - Kernel marks all blocks in `*_PENDING` states as `EVICTED` (the pending
   operations cannot complete)
 - All new `POLARIS_GET_DECISION` calls return an empty list (no daemon attached)
-- All new `BLOCK_GROW` calls from workloads immediately return `-ENODEV`
-- Workloads receive an error and may retry after the daemon restarts
+- All pending fault waiters fail when their deadline expires or the daemon
+  generation changes
+- All new fallback `BLOCK_GROW` calls from workloads immediately return
+  `-ENODEV`
+- All new driver faults in POLARIS VA ranges fail through the UVM cancel/fatal
+  path after a bounded timeout
+- Workloads receive an ordinary CUDA error and may retry after the daemon
+  restarts
 
 **Daemon restart:** On restart, the daemon queries `/sys/kernel/polaris/stats`
 to reconcile its internal state with the kernel's block table. The daemon
@@ -568,20 +841,21 @@ then resumes the decision loop. The kernel begins queuing new decisions.
   `output_cpu_addr` → kernel updates block state to `CPU_OFFLOADED` and
   stores `cpu_buf_addr`
 
-**Pre-decode residency check (reload trigger):** When the inference layer
-calls `BLOCK_GROW` during the decode phase, the kernel must ensure all
-existing blocks of that session are GPU-resident before returning. The
-attention computation reads **every** historical KV block — a single
-offloaded block causes a GPU fault.
+**Decode fault handling (reload trigger):** During decode, the attention
+kernel reads **every** historical KV block. If any historical block is
+offloaded, the first access to its unmapped GPU VA triggers the patched UVM
+fault hook. The POLARIS fault resolver must map or reload the block before
+allowing UVM to replay the faulting work.
 
 ```
-Inference layer calls BLOCK_GROW(tokens=512, count=16) for session 7
-  → kernel queues ALLOC for the new block
-  → kernel scans session 7's block table: finds block 5 is CPU_OFFLOADED
+CUDA decode kernel accesses block 5 for session 7
+  → GPU MMU faults because block 5 is unmapped
+  → patched UVM fault hook identifies block 5 in POLARIS VA range
+  → POLARIS sees block 5 is CPU_OFFLOADED
   → kernel queues RELOAD for block 5
-  → kernel waits for both ALLOC and RELOAD to complete (via daemon)
-  → kernel returns from BLOCK_GROW
-  → inference layer can now safely compute attention over all blocks
+  → daemon maps/copies CPU→GPU and completes the decision
+  → POLARIS marks block 5 RESIDENT
+  → UVM replays the faulting work
 ```
 
 **Reload execution:** `POLARIS_DEC_RELOAD` → daemon `cuMemCreate` →
@@ -589,8 +863,9 @@ Inference layer calls BLOCK_GROW(tokens=512, count=16) for session 7
 kernel updates state to `RESIDENT`.
 
 **BLOCK_TOUCH semantics:** `BLOCK_TOUCH` updates `last_touch_ns` for LRU
-**only**. It does NOT trigger reload. The kernel relies on the `BLOCK_GROW`
-handler to reload offloaded blocks proactively before computation.
+**only**. It does NOT trigger reload. Reloads are triggered by real GPU page
+faults, plus optional proactive prefetch decisions if the adapter knows the
+next decode step will read a range.
 
 **CPU pool exhaustion:** When `cpu_pool_used_bytes + victim_block_size >
 cpu_pool_total_bytes`, offload is not possible. The kernel must either:
@@ -668,30 +943,42 @@ parent_session_id=3       →   child_session_id=7
 1. Child session is created, linked to parent via `parent_session_id`
 2. All parent blocks get `refcount` atomically incremented and `flags`
    set to `POLARIS_BLOCK_FLAG_SHARED`
-3. Child session's block table entries **point to the same physical
-   handles and GPU virtual addresses** as the parent
-4. No new GPU memory allocated — only metadata in the kernel
+3. Child session's block table entries point to the same physical handles
+   as the parent, but use child-owned GPU virtual addresses carved from the
+   POLARIS VA pool
+4. The daemon maps the shared physical handles into the child's VA slots with
+   restrictive access permissions where supported
+5. No new GPU memory allocated — only metadata and additional VA mappings
 
-**COW Break trigger:** COW is triggered at the KV block API boundary, not by
-GPU hardware write faults. The workload or framework adapter expresses a
-semantic operation through ioctl — append, branch, or overwrite — and the
-kernel decides whether COW is required from the authoritative block table.
-The caller must not decide COW itself and must not inspect refcounts.
+**COW Break trigger:** COW is preferably triggered by the same driver fault
+path used for demand paging. Shared prefix blocks are mapped with the most
+restrictive access mode available for the target CUDA VMM mapping. If a
+branch writes or atomically updates a shared block, the replayable fault entry
+arrives with a write/atomic `fault_access_type`; the POLARIS fault resolver
+checks the authoritative refcount and queues `COW_BREAK` before replay.
+
+If the CUDA VMM path cannot create a read-only GPU mapping for the tested
+driver/GPU combination, COW falls back to the KV block API boundary. In that
+fallback, the workload or framework adapter expresses a semantic operation
+through ioctl - append, branch, or overwrite - and the kernel decides whether
+COW is required from the authoritative block table. The caller must not decide
+COW itself and must not inspect refcounts.
 
 In practice:
 
-- **Standard beam search:** child calls `BLOCK_GROW(tokens=512, count=16)`.
-  This token range is **beyond** the shared prefix → it's a new block, not
-  a modification → no COW break. The child allocates fresh.
-- **Range conflict without overwrite:** if `BLOCK_GROW` targets a token range
-  that already overlaps an existing block and `POLARIS_GROW_FLAG_OVERWRITE`
-  is not set, the kernel must reject the ioctl. This prevents accidental
-  silent corruption of existing KV contents. The preferred error is
-  `-EEXIST` when available in the kernel binding; otherwise return
-  `-EINVAL` and log the overlapping `(session_id, token_start, token_count)`.
-- **Overwrite path:** the workload or vLLM/SGLang adapter passes
-  `POLARIS_GROW_FLAG_OVERWRITE` to `BLOCK_GROW`, requesting a write to an
-  existing token range. This flag means "this operation overwrites an
+- **Standard beam search:** child reserves a new decode token range beyond
+  the shared prefix. The first GPU write to that new block faults, POLARIS
+  allocates a fresh block, and no COW break is needed.
+- **Range conflict without overwrite:** if the adapter asks POLARIS to reserve
+  a token range that already overlaps an existing block and
+  `POLARIS_RESERVE_FLAG_OVERWRITE` is not set, the kernel must reject the ioctl.
+  This prevents accidental silent corruption of existing KV contents. The
+  preferred error is `-EEXIST` when available in the kernel binding;
+  otherwise return `-EINVAL` and log the overlapping
+  `(session_id, token_start, token_count)`.
+- **Overwrite path:** a real GPU write/atomic fault on a shared protected
+  block, or the fallback `POLARIS_RESERVE_FLAG_OVERWRITE` path, requests a write
+  to an existing logical block. The flag means "this operation overwrites an
   existing logical block"; it does **not** mean "force COW." The kernel then
   checks the overlapping block:
   - `refcount == 1`: the block is private, so overwrite may proceed in place.
@@ -705,17 +992,19 @@ decision inside the kernel module and delegates the copy/map operation to
 **COW Break execution (POLARIS_DEC_COW_BREAK):**
 
 ```
-Session 7 calls BLOCK_GROW(tokens=0..15, flags=OVERWRITE)
-  → kernel finds block[0..15] has refcount > 1 (shared with parent)
+Session 7 writes token range 0..15 in a shared mapped block
+  → GPU write fault enters patched UVM replayable-fault path
+  → POLARIS finds block[0..15] has refcount > 1 (shared with parent)
   → kernel queues COW_BREAK decision
   → daemon:
        cuMemCreate (new physical handle)
-       cuMemMap (into session 7's VA space for tokens 0..15)
-       cudaMemcpy (old_phys → new_phys, copies content)
+       cuMemMap (new handle into session 7's private VA slot for tokens 0..15)
+       cudaMemcpy (old shared VA → new private VA, copies content)
        cuMemSetAccess (new mapping, read/write)
   → daemon reports completion: result=0, output_handle=<new_phys>
   → kernel: old block refcount--, new block refcount=1
   → kernel: session 7's block[0..15] now points to the new physical handle
+  → UVM replays the faulting write
 ```
 
 The old block remains mapped for all other sessions that still share it.
@@ -752,13 +1041,15 @@ optimization, not the default beam-search path.
 - Phase 1: standard beam search — beam_width=8, verify that child sessions
   allocate zero new blocks for the prompt (all shared), then allocate fresh
   for decode. Measure `shared_gpu_bytes`.
-- Phase 2: COW break test — use `POLARIS_GROW_FLAG_OVERWRITE` on a shared
-  block in one branch, verify the copy occurs and the other branches are
-  unaffected.
+- Phase 2: COW break test - write to a shared protected block and verify the
+  driver fault queues `COW_BREAK`. Also test the fallback
+  `POLARIS_RESERVE_FLAG_OVERWRITE` path when read-only VMM mappings are not
+  available.
 
 **Deliverables:**
 - `POLARIS_SESSION_BRANCH` ioctl
-- `POLARIS_GROW_FLAG_OVERWRITE` flag for `BLOCK_GROW`
+- Write/atomic fault handling for shared blocks; fallback
+  `POLARIS_RESERVE_FLAG_OVERWRITE` flag for `BLOCK_RESERVE`
 - COW break detection, `POLARIS_DEC_COW_BREAK` execution path
 - Real GPU copy for COW break
 - Sharing and COW statistics
@@ -780,9 +1071,12 @@ systems.
 Build a Rust-based workload generator that:
 
 - Creates sessions with configurable prompt/output lengths
-- Allocates real GPU-backed KV blocks via POLARIS ioctls
-- Simulates decode loop: calls `BLOCK_GROW` for each new token,
-  `BLOCK_TOUCH` for existing blocks
+- Reserves POLARIS GPU VA ranges and allocates real GPU-backed KV blocks by
+  launching kernels that touch unmapped KV addresses
+- Simulates decode loop by launching a tiny CUDA kernel that reads the
+  historical KV addresses and writes the newly appended block; in fallback
+  mode only, it calls `BLOCK_GROW`/`BLOCK_TOUCH` to exercise the old ioctl
+  path without the patched NVIDIA driver
 - Supports beam search workload: `SESSION_BRANCH` → COW testing
 - Emits CSV traces: timestamp, operation, session_id, block_id, GPU,
   latency
@@ -792,8 +1086,9 @@ Build a Rust-based workload generator that:
   schema (`timestamp_ns,op,session_id,token_start,token_count`) for
   replayability across vLLM, SGLang, and POLARIS.
 
-This is **not a real model** — it only exercises the KV cache management
-path with real CUDA memory. This is sufficient for the OS-level evaluation.
+This is **not a real model** - it only exercises the KV cache management
+path with real CUDA memory and real NVIDIA replayable page faults. This is
+sufficient for the OS-level evaluation.
 
 ### Phase 4b: vLLM Trace Replay
 
@@ -957,27 +1252,28 @@ class PolarisBlockManager(BlockSpaceManager):
         self.fd = polaris_fd  # file descriptor for /dev/polaris
 
     def allocate(self, seq_group):
-        # 替换 cudaMalloc → ioctl(POLARIS_BLOCK_GROW)
-        arg = polaris_block_grow_arg(
+        # Reserve logical KV metadata; the CUDA kernel's first touch maps it.
+        arg = polaris_block_reserve_arg(
             session_id=seq_group.request_id,
             token_start=seq_group.get_token_count(),
             token_count=self.block_size,
         )
-        fcntl.ioctl(self.fd, POLARIS_BLOCK_GROW, arg)
+        fcntl.ioctl(self.fd, POLARIS_BLOCK_RESERVE, arg)
 
     def free(self, seq):
-        # 替换 cudaFree → 可以 no-op（POLARIS 内核自行回收）
+        # Replace cudaFree with POLARIS metadata release.
+        fcntl.ioctl(self.fd, POLARIS_BLOCK_RELEASE, ...)
 
     def fork(self, parent, child):
-        # 替换 Python copy → ioctl(POLARIS_SESSION_BRANCH)
+        # Replace Python copy with kernel-side refcount sharing.
         arg = polaris_session_branch_arg(parent_session_id=parent.id)
         fcntl.ioctl(self.fd, POLARIS_SESSION_BRANCH, arg)
 
     def swap_out(self, seq):
-        # 替换 cudaMemcpy → no-op（内核自动决策换出）
+        # No-op: POLARIS decides offload from pressure and access faults.
 
     def swap_in(self, seq):
-        # 替换 cudaMemcpy → no-op（内核自动决策换入）
+        # No-op: a later GPU access triggers reload through the UVM fault hook.
 ```
 
 `swap_out` and `swap_in` become no-ops because POLARIS's kernel module
@@ -1034,16 +1330,17 @@ benchmarking work — it is a self-contained add-on.
 
 ```
 Week 1–2:   Phase 0     — Freeze design document, hardware setup
-Week 3–5:   Phase 1a    — Kernel module skeleton, device, ioctls, decision protocol
-Week 6–8:   Phase 1b    — CUDA VMM daemon, real GPU allocation, page-fault flow
-Week 9:     Phase 1c    — Daemon lifecycle, systemd integration, crash recovery
-Week 10–11: Phase 2a    — GPU↔CPU offload/reload
-Week 12–13: Phase 2b    — FIFO, LRU, phase-aware eviction policies
-Week 14–16: Phase 3     — COW for beam search (padded to 3 weeks for refcount debugging)
-Week 17–20: Phase 4a–d — Benchmark suite, vLLM/SGLang trace replay and comparison
-Week 21:     Phase 4e    — Optional: vLLM integration adapter (if time permits)
-Week 22:     Phase 5     — eBPF network offload (if time permits)
-Week 23–24: Buffer      — Integration testing, final report
+Week 3–4:   Phase 1a    — Patched NVIDIA UVM replayable-fault hook spike
+Week 5–6:   Phase 1b    — Kernel module skeleton, device, ioctls, decision protocol
+Week 7–9:   Phase 1c    — CUDA VMM daemon, real GPU allocation, driver-fault flow
+Week 10:    Phase 1d    — Daemon lifecycle, systemd integration, crash recovery
+Week 11–12: Phase 2a    — GPU↔CPU offload/reload
+Week 13–14: Phase 2b    — FIFO, LRU, phase-aware eviction policies
+Week 15–17: Phase 3     — COW for beam search (padded to 3 weeks for refcount debugging)
+Week 18–21: Phase 4a–d — Benchmark suite, vLLM/SGLang trace replay and comparison
+Week 22:     Phase 4e    — Optional: vLLM integration adapter (if time permits)
+Week 23:     Phase 5     — eBPF network offload (if time permits)
+Week 24:    Buffer      — Integration testing, final report
 ```
 
 ---
@@ -1052,6 +1349,12 @@ Week 23–24: Buffer      — Integration testing, final report
 
 ```
 polaris/
+  nvidia-uvm-patch/
+    README.md               # files and symbols changed in open-gpu-kernel-modules
+    polaris_uvm_hook.c      # UVM replayable fault dispatcher glue
+    polaris_uvm_hook.h      # hook declarations shared with patched UVM files
+    patches/                # git-format patches against NVIDIA open driver
+
   kernel/
     polaris.c              # main module
     polaris.h              # shared types
@@ -1128,16 +1431,19 @@ polaris/
 The minimum viable POLARIS must include:
 
 - [x] Loadable Linux kernel module `polaris.ko`
+- [x] Patched `nvidia-uvm.ko` hook for replayable GPU page faults in POLARIS
+  VA ranges
 - [x] Decision protocol: `GET_DECISION` / `COMPLETE_OPERATION` with error handling
 - [x] Rust userspace daemon `polarisd` with systemd integration and crash recovery
 - [x] CUDA VMM backend: real `cuMemCreate`, `cuMemMap`, `cuMemUnmap`
-- [x] Page-fault flow: `BLOCK_GROW` triggers kernel decision → daemon maps → accessible to inference layer
-- [x] Block-level free: `BLOCK_FREE` for mid-lifecycle block release
+- [x] Page-fault flow: GPU replayable fault enters patched UVM → POLARIS
+  queues daemon decision → daemon maps → UVM replays faulting work
+- [x] Block-level logical release: `BLOCK_RELEASE` for safe async reclaim
 - [x] Per-GPU memory accounting (GPU + CPU pool), validated against `nvidia-smi`
 - [x] Block-based KV Cache abstraction with token-range granularity
 - [x] GPU-to-CPU offload and CPU-to-GPU reload, with CPU pool exhaustion handling
 - [x] Three eviction policies: FIFO, LRU, phase-aware
-- [x] COW for beam search with `POLARIS_SESSION_BRANCH` and `POLARIS_GROW_FLAG_OVERWRITE`
+- [x] COW for beam search with `POLARIS_SESSION_BRANCH` and `POLARIS_RESERVE_FLAG_OVERWRITE`
 - [x] Benchmark results comparing POLARIS to vLLM and SGLang on at least 3 scenarios
   (trace replay is the primary evaluation method; vLLM adapter integration is a
   stretch goal)
@@ -1147,16 +1453,18 @@ The minimum viable POLARIS must include:
 ## Final Report Claims
 
 Avoid:
-- "We replaced the NVIDIA GPU driver"
+- "We replaced the entire NVIDIA GPU driver"
 - "We directly edited GPU hardware page tables"
 - "We implemented full production vLLM/SGLang"
 - "We solved distributed multi-node inference"
 
 Claim instead:
-- "We implemented POLARIS, a Linux kernel module that orchestrates CUDA VMM
-  to provide kernel-level PagedAttention for LLM KV Cache management."
-- "POLARIS treats KV Cache blocks as OS-paged resources: page-fault on
-  missing blocks, evict under memory pressure, reload on access."
+- "We implemented POLARIS, a Linux kernel service plus a narrow patch to
+  NVIDIA's open UVM module that orchestrates CUDA VMM to provide
+  kernel-level PagedAttention for LLM KV Cache management."
+- "POLARIS treats KV Cache blocks as OS-paged resources: a real NVIDIA UVM
+  replayable page fault on a missing block queues daemon mapping work, then
+  the faulting GPU work is replayed."
 - "POLARIS implements in-kernel copy-on-write with atomic reference counting
   to enable memory-efficient beam search."
 - "POLARIS is evaluated against vLLM and SGLang on real KV Cache allocation
@@ -1166,7 +1474,8 @@ Claim instead:
 
 ## One-Sentence Summary
 
-**POLARIS is a Linux kernel module and CUDA VMM daemon that provides
-OS-level paged KV Cache management for LLM inference: kernel-directed page
-faults, CPU offload/reload, and reference-counted COW for beam search,
-validated against vLLM and SGLang on real GPU hardware.**
+**POLARIS is a patched NVIDIA UVM fault hook, Linux kernel service, and CUDA
+VMM daemon that provides OS-level paged KV Cache management for LLM
+inference: real GPU page-fault-triggered allocation, CPU offload/reload, and
+reference-counted COW for beam search, validated against vLLM and SGLang on
+real GPU hardware.**
