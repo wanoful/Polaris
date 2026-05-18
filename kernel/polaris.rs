@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 
-//! POLARIS: Paged Operating Layer for Accelerated Routing and Inference Systems
-//!
-//! This kernel module provides OS-level paged KV Cache management for LLM inference.
-//! It maintains the authoritative block table, manages sessions, and issues GPU memory
-//! management decisions to the userspace daemon (polarisd) via an ioctl-based
-//! decision protocol.
-//!
-//! All state is global: every open("/dev/polaris") shares the same block table,
-//! session table, GPU registry, and decision queue. This is the fundamental
-//! value of the kernel module — cross-process visibility.
+// POLARIS: Paged Operating Layer for Accelerated Routing and Inference Systems
+//
+// This kernel module provides OS-level paged KV Cache management for LLM inference.
+// It maintains the authoritative block table, manages sessions, and issues GPU memory
+// management decisions to the userspace daemon (polarisd) via an ioctl-based
+// decision protocol.
+//
+// All state is global: every open("/dev/polaris") shares the same block table,
+// session table, GPU registry, and decision queue. This is the fundamental
+// value of the kernel module — cross-process visibility.
 
 mod polaris_types;
 mod polaris_policy;
@@ -32,6 +32,17 @@ use kernel::{
 };
 
 use polaris_types::*;
+
+// Return values for the C-callable NVIDIA UVM fault hook.
+const POLARIS_UVM_FAULT_NOT_MINE: i32 = 0;
+const POLARIS_UVM_FAULT_HANDLED: i32 = 1;
+const POLARIS_UVM_FAULT_ERROR: i32 = -1;
+
+enum PolarisUvmFaultResult {
+    NotMine,
+    Handled,
+    Error,
+}
 
 // ─── Global shared state ────────────────────────────────────────────────────
 
@@ -68,6 +79,148 @@ kernel::sync::global_lock! {
 // kernel has already zeroed the refcount, so calling module_put again
 // would trigger BUG().
 static MODULE_EXITING: Atomic<u32> = Atomic::new(0);
+
+/// C-callable hook for patched NVIDIA UVM replayable GPU page faults.
+#[no_mangle]
+pub extern "C" fn polaris_uvm_handle_gpu_fault(
+    gpu_id: u32,
+    fault_address: u64,
+    access_type: u32,
+) -> i32 {
+    match polaris_resolve_gpu_fault(gpu_id, fault_address, access_type) {
+        Ok(PolarisUvmFaultResult::NotMine) => POLARIS_UVM_FAULT_NOT_MINE,
+        Ok(PolarisUvmFaultResult::Handled) => POLARIS_UVM_FAULT_HANDLED,
+        Ok(PolarisUvmFaultResult::Error) | Err(_) => POLARIS_UVM_FAULT_ERROR,
+    }
+}
+
+fn polaris_resolve_gpu_fault(
+    gpu_id: u32,
+    fault_address: u64,
+    access_type: u32,
+) -> Result<PolarisUvmFaultResult> {
+    let mut guard = POLARIS_STATE.lock();
+    let inner = guard.as_mut().ok_or(ENODEV)?;
+
+    let gpu = match inner.gpus.iter().find(|g| g.gpu_id == gpu_id) {
+        Some(gpu) => gpu,
+        None => return Ok(PolarisUvmFaultResult::NotMine),
+    };
+    if !gpu.va_range_registered {
+        return Ok(PolarisUvmFaultResult::NotMine);
+    }
+    let va_range_end = gpu.va_range_base.saturating_add(gpu.va_range_length);
+    if fault_address < gpu.va_range_base || fault_address >= va_range_end {
+        return Ok(PolarisUvmFaultResult::NotMine);
+    }
+
+    let block_idx = match inner.blocks.iter().position(|b| {
+        b.home_gpu == gpu_id
+            && fault_address >= b.gpu_vaddr
+            && fault_address < b.gpu_vaddr.saturating_add(b.size_bytes)
+    }) {
+        Some(idx) => idx,
+        None => return Ok(PolarisUvmFaultResult::Error),
+    };
+    let fault_id = inner.next_fault_id;
+    inner.next_fault_id += 1;
+    let generation = inner.fault_generation;
+    let op = match inner.blocks[block_idx].state {
+        PolarisBlockState::Unmapped => PolarisDecisionOp::Alloc,
+        PolarisBlockState::CpuOffloaded => PolarisDecisionOp::Reload,
+        PolarisBlockState::CowPending => PolarisDecisionOp::CowBreak,
+        PolarisBlockState::Resident => PolarisDecisionOp::MapExisting,
+        _ => PolarisDecisionOp::Alloc,
+    };
+    let decision_id = inner.next_decision_id;
+    inner.next_decision_id += 1;
+    let (
+        block_id,
+        session_id,
+        src_handle,
+        dst_vaddr,
+        size_bytes,
+        cpu_addr,
+        timeout_ms,
+    );
+    {
+        let block = &mut inner.blocks[block_idx];
+        block.pending_fault_id = fault_id;
+        block.pending_generation = generation;
+        block.pending_decision_id = decision_id;
+        block.state = match op {
+            PolarisDecisionOp::Reload => PolarisBlockState::ReloadPending,
+            PolarisDecisionOp::CowBreak => PolarisBlockState::CowPending,
+            PolarisDecisionOp::MapExisting => PolarisBlockState::Resident,
+            _ => PolarisBlockState::AllocPending,
+        };
+        block.fault_timeout_ms = POLARIS_DEFAULT_FAULT_TIMEOUT_MS;
+        block_id = block.block_id;
+        session_id = block.session_id;
+        src_handle = block.gpu_phys_handle;
+        dst_vaddr = block.gpu_vaddr;
+        size_bytes = block.size_bytes;
+        cpu_addr = block.cpu_buf_addr;
+        timeout_ms = block.fault_timeout_ms;
+    }
+    inner.pending_faults.push(
+        PolarisFault {
+            fault_id,
+            generation,
+            gpu_id,
+            fault_address,
+            block_id,
+            access_type,
+            state: 0,
+            enqueue_ns: unsafe { bindings::ktime_get_mono_fast_ns() },
+            deadline_ns: 0,
+            resolved_ns: 0,
+        },
+        GFP_KERNEL,
+    )?;
+    inner.pending_decisions.push(
+        PolarisDecision {
+            decision_id,
+            fault_id,
+            generation,
+            op: op as u32,
+            gpu_id,
+            block_id,
+            session_id,
+            src_handle,
+            dst_handle: 0,
+            src_vaddr: fault_address,
+            dst_vaddr,
+            size_bytes,
+            cpu_addr,
+            access_flags: access_type,
+            timeout_ms,
+            _reserved: [0u64; 4],
+        },
+        GFP_KERNEL,
+    )?;
+    let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
+    unsafe { bindings::init_completion(&raw mut comp); }
+    inner.blocks[block_idx].completion_ptr = &raw mut comp;
+    drop(guard);
+
+    let wait_ret = unsafe {
+        bindings::wait_for_completion_interruptible_timeout(
+            &raw mut comp,
+            bindings::__msecs_to_jiffies(POLARIS_DEFAULT_FAULT_TIMEOUT_MS),
+        )
+    };
+    let mut guard = POLARIS_STATE.lock();
+    let inner = guard.as_mut().ok_or(ENODEV)?;
+    if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
+        block.completion_ptr = core::ptr::null_mut();
+        if wait_ret == 0 && block.state != PolarisBlockState::Resident {
+            block.state = PolarisBlockState::Evicted;
+            return Err(ETIMEDOUT);
+        }
+    }
+    Ok(PolarisUvmFaultResult::Handled)
+}
 
 // ─── sysfs buffer writer ────────────────────────────────────────────────────
 
@@ -977,110 +1130,11 @@ impl PolarisDevice {
         fault_address: u64,
         access_type: u32,
     ) -> Result<isize> {
-        let mut guard = POLARIS_STATE.lock();
-        let inner = guard.as_mut().ok_or(ENODEV)?;
-        let block_idx = inner.blocks.iter().position(|b| {
-            b.home_gpu == gpu_id
-                && fault_address >= b.gpu_vaddr
-                && fault_address < b.gpu_vaddr.saturating_add(b.size_bytes)
-        }).ok_or(ENOENT)?;
-        let fault_id = inner.next_fault_id;
-        inner.next_fault_id += 1;
-        let generation = inner.fault_generation;
-        let op = match inner.blocks[block_idx].state {
-            PolarisBlockState::Unmapped => PolarisDecisionOp::Alloc,
-            PolarisBlockState::CpuOffloaded => PolarisDecisionOp::Reload,
-            PolarisBlockState::CowPending => PolarisDecisionOp::CowBreak,
-            PolarisBlockState::Resident => PolarisDecisionOp::MapExisting,
-            _ => PolarisDecisionOp::Alloc,
-        };
-        let decision_id = inner.next_decision_id;
-        inner.next_decision_id += 1;
-        let (
-            block_id,
-            session_id,
-            src_handle,
-            dst_vaddr,
-            size_bytes,
-            cpu_addr,
-            timeout_ms,
-        );
-        {
-            let block = &mut inner.blocks[block_idx];
-            block.pending_fault_id = fault_id;
-            block.pending_generation = generation;
-            block.pending_decision_id = decision_id;
-            block.state = match op {
-                PolarisDecisionOp::Reload => PolarisBlockState::ReloadPending,
-                PolarisDecisionOp::CowBreak => PolarisBlockState::CowPending,
-                PolarisDecisionOp::MapExisting => PolarisBlockState::Resident,
-                _ => PolarisBlockState::AllocPending,
-            };
-            block.fault_timeout_ms = POLARIS_DEFAULT_FAULT_TIMEOUT_MS;
-            block_id = block.block_id;
-            session_id = block.session_id;
-            src_handle = block.gpu_phys_handle;
-            dst_vaddr = block.gpu_vaddr;
-            size_bytes = block.size_bytes;
-            cpu_addr = block.cpu_buf_addr;
-            timeout_ms = block.fault_timeout_ms;
+        match polaris_resolve_gpu_fault(gpu_id, fault_address, access_type)? {
+            PolarisUvmFaultResult::Handled => Ok(0),
+            PolarisUvmFaultResult::NotMine => Err(ENOENT),
+            PolarisUvmFaultResult::Error => Err(EIO),
         }
-        inner.pending_faults.push(
-            PolarisFault {
-                fault_id,
-                generation,
-                gpu_id,
-                fault_address,
-                block_id,
-                access_type,
-                state: 0,
-                enqueue_ns: unsafe { bindings::ktime_get_mono_fast_ns() },
-                deadline_ns: 0,
-                resolved_ns: 0,
-            },
-            GFP_KERNEL,
-        )?;
-        inner.pending_decisions.push(
-            PolarisDecision {
-                decision_id,
-                fault_id,
-                generation,
-                op: op as u32,
-                gpu_id,
-                block_id,
-                session_id,
-                src_handle,
-                dst_handle: 0,
-                src_vaddr: fault_address,
-                dst_vaddr,
-                size_bytes,
-                cpu_addr,
-                access_flags: access_type,
-                timeout_ms,
-                _reserved: [0u64; 4],
-            },
-            GFP_KERNEL,
-        )?;
-        let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
-        unsafe { bindings::init_completion(&raw mut comp); }
-        inner.blocks[block_idx].completion_ptr = &raw mut comp;
-        drop(guard);
-        let wait_ret = unsafe {
-            bindings::wait_for_completion_interruptible_timeout(
-                &raw mut comp,
-                bindings::__msecs_to_jiffies(POLARIS_DEFAULT_FAULT_TIMEOUT_MS as u64),
-            )
-        };
-        let mut guard = POLARIS_STATE.lock();
-        let inner = guard.as_mut().ok_or(ENODEV)?;
-        if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == block_id) {
-            block.completion_ptr = core::ptr::null_mut();
-            if wait_ret == 0 && block.state != PolarisBlockState::Resident {
-                block.state = PolarisBlockState::Evicted;
-                return Err(ETIMEDOUT);
-            }
-        }
-        Ok(0)
     }
 
     fn handle_block_touch(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {

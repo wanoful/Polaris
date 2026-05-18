@@ -6,3 +6,4 @@
 # The main source is polaris.rs, which includes submodules via `mod` declarations.
 
 obj-m := polaris.o
+polaris-y := polaris_rust.o polaris_export.o
