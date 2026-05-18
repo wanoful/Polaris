@@ -24,8 +24,8 @@ timestamp_ns,op,session_id,token_start,token_count
 | Op | When emitted |
 |----|-------------|
 | `SESSION_CREATE` | First `alloc_for_extend()` for a request (using `req.rid` as session_id) |
-| `BLOCK_ALLOC` | One row per 16-token block allocated during extend or decode |
-| `BLOCK_FREE` | One row per 16-token block freed in `release_kv_cache()` |
+| `BLOCK_RESERVE` | One row per 16-token logical block reserved during extend or decode |
+| `BLOCK_RELEASE` | One row per 16-token block released in `release_kv_cache()` |
 | `SESSION_DESTROY` | `release_kv_cache()` called |
 
 ## Which SGLang version/commit
@@ -67,5 +67,5 @@ polaris-workload trace-replay --input benchmarks/traces/sglang_trace.csv
 - **Token-to-block mapping**: SGLang allocates at token granularity (1 token per slot with `page_size=1`). The trace aggregates into POLARIS's 16-token blocks.
 - **Zero behavioral change**: the patch only adds logging, never alters allocation logic.
 - **Batch allocation**: SGLang allocates KV cache per batch, not per request. The trace helpers iterate over the batch to emit per-request events.
-- **Prefix caching**: SGLang's RadixCache handles prefix sharing internally. Block-level events are emitted for actual allocations only — cached prefix hits don't generate BLOCK_ALLOC events (consistent with vLLM behavior).
-- **Preemption**: SGLang handles preemption through `release_kv_cache()` which also inserts committed tokens into the radix tree. The trace captures this as BLOCK_FREE + SESSION_DESTROY, same as vLLM.
+- **Prefix caching**: SGLang's RadixCache handles prefix sharing internally. Block-level events are emitted for logical reservations only — cached prefix hits don't generate BLOCK_RESERVE events (consistent with vLLM behavior).
+- **Preemption**: SGLang handles preemption through `release_kv_cache()` which also inserts committed tokens into the radix tree. The trace captures this as BLOCK_RELEASE + SESSION_DESTROY, same as vLLM.

@@ -55,7 +55,7 @@ pub enum PolarisEvictionPolicy {
 pub enum PolarisDecisionOp {
     Alloc = 0,
     Free = 1,
-    Map = 2,
+    MapExisting = 2,
     Unmap = 3,
     Offload = 4,
     Reload = 5,
@@ -65,7 +65,13 @@ pub enum PolarisDecisionOp {
 // ─── Flag Constants (raw u32 — the ioctl ABI uses plain integers) ───────────
 
 pub const POLARIS_BLOCK_FLAG_SHARED: u32 = 1 << 0;
-pub const POLARIS_GROW_FLAG_OVERWRITE: u32 = 1 << 0;
+pub const POLARIS_RESERVE_FLAG_OVERWRITE: u32 = 1 << 0;
+pub const POLARIS_RESERVE_FLAG_READ_MOSTLY: u32 = 1 << 1;
+pub const POLARIS_RESERVE_FLAG_WRITE_NEW: u32 = 1 << 2;
+pub const POLARIS_RESERVE_FLAG_FULL_OVERWRITE_NO_PRESERVE: u32 = 1 << 3;
+pub const POLARIS_RELEASE_FLAG_STREAM_QUIESCED: u32 = 1 << 0;
+
+pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -87,6 +93,18 @@ pub struct PolarisRegisterGpuArg {
     pub numa_node: u32,
     pub _reserved: u32,
     pub _reserved2: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisRegisterVaRangeArg {
+    pub range_id: u64,
+    pub gpu_id: u32,
+    pub flags: u32,
+    pub base: u64,
+    pub length: u64,
+    pub block_size: u64,
+    pub _reserved: [u64; 4],
 }
 
 #[repr(C)]
@@ -131,25 +149,26 @@ pub struct PolarisSessionBranchArg {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct PolarisBlockGrowArg {
+pub struct PolarisBlockReserveArg {
     pub session_id: u64,
     pub token_start: u32,
     pub token_count: u32,
-    pub flags: u32,
     pub phase: u32,
+    pub flags: u32,
     pub block_id: u64,
-    pub ret_code: i32,
-    pub _reserved: u32,
-    pub _reserved2: [u64; 2],
+    pub gpu_vaddr: u64,
+    pub _reserved: [u64; 3],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-pub struct PolarisBlockFreeArg {
+pub struct PolarisBlockReleaseArg {
     pub session_id: u64,
     pub token_start: u32,
     pub token_count: u32,
-    pub _reserved: [u64; 4],
+    pub flags: u32,
+    pub _reserved: u32,
+    pub _reserved2: [u64; 4],
 }
 
 #[repr(C)]
@@ -178,14 +197,20 @@ pub struct PolarisBlockGetStateArg {
 #[derive(Clone, Copy, Default)]
 pub struct PolarisDecision {
     pub decision_id: u64,
+    pub fault_id: u64,
+    pub generation: u64,
     pub op: u32,
     pub gpu_id: u32,
     pub block_id: u64,
     pub session_id: u64,
     pub src_handle: u64,
+    pub dst_handle: u64,
+    pub src_vaddr: u64,
     pub dst_vaddr: u64,
     pub size_bytes: u64,
     pub cpu_addr: u64,
+    pub access_flags: u32,
+    pub timeout_ms: u32,
     pub _reserved: [u64; 4],
 }
 
@@ -201,6 +226,7 @@ pub struct PolarisGetDecisionArg {
 #[derive(Clone, Copy, Default)]
 pub struct PolarisCompleteOperationArg {
     pub decision_id: u64,
+    pub generation: u64,
     pub result: i32,
     pub _reserved: u32,
     pub output_handle: u64,

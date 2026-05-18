@@ -1,6 +1,6 @@
 #!/bin/bash
 # Phase 1b success criterion validation:
-#   "A workload allocates KV blocks through BLOCK_GROW, nvidia-smi visibly
+#   "A workload reserves KV blocks through BLOCK_RESERVE, nvidia-smi visibly
 #    shows memory consumption rising, and POLARIS stats match the real GPU
 #    memory usage within a 5% margin."
 #
@@ -97,12 +97,12 @@ echo "   logging to $SMI_LOG"
 # ─── Run workload ───────────────────────────────────────────────────────────
 echo ""
 echo "4. Running synthetic-kv workload (32 blocks × 16 tokens ≈ 256 MiB)..."
-echo "   (BLOCK_GROW is synchronous — each call blocks until daemon completes)"
+echo "   (BLOCK_RESERVE is blocking — each call waits for the fault decision path)"
 sudo "$RELEASE/polaris-workload" synthetic-kv --num-blocks 32 --tokens-per-block 16
 
 # ─── Wait for daemon to drain decisions ─────────────────────────────────────
 echo ""
-echo "5. Waiting for daemon to process pending FREE decisions..."
+echo "5. Waiting for daemon to drain any pending decisions..."
 sleep 3
 
 # ─── Stop nvidia-smi polling ────────────────────────────────────────────────

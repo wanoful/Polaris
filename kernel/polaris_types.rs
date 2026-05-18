@@ -22,44 +22,47 @@ pub const POLARIS_IOCTL_MAGIC: u32 = 0x50;
 pub const POLARIS_REGISTER_GPU: u32 =
     kernel::ioctl::_IOW::<PolarisRegisterGpuArg>(POLARIS_IOCTL_MAGIC, 0x01);
 
+pub const POLARIS_REGISTER_VA_RANGE: u32 =
+    kernel::ioctl::_IOWR::<PolarisRegisterVaRangeArg>(POLARIS_IOCTL_MAGIC, 0x02);
+
 pub const POLARIS_SESSION_CREATE: u32 =
-    kernel::ioctl::_IOWR::<PolarisSessionCreateArg>(POLARIS_IOCTL_MAGIC, 0x02);
+    kernel::ioctl::_IOWR::<PolarisSessionCreateArg>(POLARIS_IOCTL_MAGIC, 0x03);
 
 pub const POLARIS_SESSION_DESTROY: u32 =
-    kernel::ioctl::_IOW::<PolarisSessionDestroyArg>(POLARIS_IOCTL_MAGIC, 0x03);
+    kernel::ioctl::_IOW::<PolarisSessionDestroyArg>(POLARIS_IOCTL_MAGIC, 0x04);
 
 pub const POLARIS_SESSION_GET_STATS: u32 =
-    kernel::ioctl::_IOWR::<PolarisSessionGetStatsArg>(POLARIS_IOCTL_MAGIC, 0x04);
+    kernel::ioctl::_IOWR::<PolarisSessionGetStatsArg>(POLARIS_IOCTL_MAGIC, 0x05);
 
 pub const POLARIS_SESSION_BRANCH: u32 =
-    kernel::ioctl::_IOWR::<PolarisSessionBranchArg>(POLARIS_IOCTL_MAGIC, 0x05);
+    kernel::ioctl::_IOWR::<PolarisSessionBranchArg>(POLARIS_IOCTL_MAGIC, 0x06);
 
-pub const POLARIS_BLOCK_GROW: u32 =
-    kernel::ioctl::_IOWR::<PolarisBlockGrowArg>(POLARIS_IOCTL_MAGIC, 0x06);
+pub const POLARIS_BLOCK_RESERVE: u32 =
+    kernel::ioctl::_IOWR::<PolarisBlockReserveArg>(POLARIS_IOCTL_MAGIC, 0x07);
 
-pub const POLARIS_BLOCK_FREE: u32 =
-    kernel::ioctl::_IOW::<PolarisBlockFreeArg>(POLARIS_IOCTL_MAGIC, 0x07);
+pub const POLARIS_BLOCK_RELEASE: u32 =
+    kernel::ioctl::_IOW::<PolarisBlockReleaseArg>(POLARIS_IOCTL_MAGIC, 0x08);
 
 pub const POLARIS_BLOCK_TOUCH: u32 =
-    kernel::ioctl::_IOW::<PolarisBlockTouchArg>(POLARIS_IOCTL_MAGIC, 0x08);
+    kernel::ioctl::_IOW::<PolarisBlockTouchArg>(POLARIS_IOCTL_MAGIC, 0x09);
 
 pub const POLARIS_BLOCK_GET_STATE: u32 =
-    kernel::ioctl::_IOWR::<PolarisBlockGetStateArg>(POLARIS_IOCTL_MAGIC, 0x09);
+    kernel::ioctl::_IOWR::<PolarisBlockGetStateArg>(POLARIS_IOCTL_MAGIC, 0x0A);
 
 pub const POLARIS_GET_DECISION: u32 =
-    kernel::ioctl::_IOWR::<PolarisGetDecisionArg>(POLARIS_IOCTL_MAGIC, 0x0A);
+    kernel::ioctl::_IOWR::<PolarisGetDecisionArg>(POLARIS_IOCTL_MAGIC, 0x0B);
 
 pub const POLARIS_COMPLETE_OPERATION: u32 =
-    kernel::ioctl::_IOWR::<PolarisCompleteOperationArg>(POLARIS_IOCTL_MAGIC, 0x0B);
+    kernel::ioctl::_IOWR::<PolarisCompleteOperationArg>(POLARIS_IOCTL_MAGIC, 0x0C);
 
 pub const POLARIS_GET_GLOBAL_STATS: u32 =
-    kernel::ioctl::_IOWR::<PolarisGetGlobalStatsArg>(POLARIS_IOCTL_MAGIC, 0x0C);
+    kernel::ioctl::_IOWR::<PolarisGetGlobalStatsArg>(POLARIS_IOCTL_MAGIC, 0x0D);
 
 pub const POLARIS_LIST_SESSIONS: u32 =
-    kernel::ioctl::_IOWR::<PolarisListSessionsArg>(POLARIS_IOCTL_MAGIC, 0x0D);
+    kernel::ioctl::_IOWR::<PolarisListSessionsArg>(POLARIS_IOCTL_MAGIC, 0x0E);
 
 pub const POLARIS_SET_POLICY: u32 =
-    kernel::ioctl::_IOW::<PolarisSetPolicyArg>(POLARIS_IOCTL_MAGIC, 0x0E);
+    kernel::ioctl::_IOW::<PolarisSetPolicyArg>(POLARIS_IOCTL_MAGIC, 0x0F);
 
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
@@ -77,11 +80,11 @@ impl_flags!(
 );
 
 impl_flags!(
-    /// Bitmask of flags passed to BLOCK_GROW.
+    /// Bitmask of flags passed to BLOCK_RESERVE.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct PolarisGrowFlags(u32);
 
-    /// Individual BLOCK_GROW flag.
+    /// Individual BLOCK_RESERVE flag.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PolarisGrowFlag {
         /// Allow overlapping an existing shared block (triggers COW break).
@@ -119,7 +122,11 @@ pub struct PolarisBlock {
     /// decision is queued; cleared (set to 0) when the daemon reports
     /// completion. Used to match COMPLETE_OPERATION results to blocks.
     pub pending_decision_id: u64,
-    /// Stack-allocated completion pointer used by synchronous BLOCK_GROW.
+    /// Fault metadata for the in-flight driver notification path.
+    pub pending_fault_id: u64,
+    pub pending_generation: u64,
+    pub fault_timeout_ms: u32,
+    /// Stack-allocated completion pointer used by synchronous fault waits.
     /// Set before dropping the lock, consumed by COMPLETE_OPERATION.
     /// NULL when no waiter is pending.
     pub completion_ptr: *mut kernel::bindings::completion,
@@ -129,10 +136,8 @@ pub struct PolarisBlock {
 pub const POLARIS_MAX_RETRIES: u32 = 3;
 
 /// Maximum number of decisions that can be queued in pending_decisions.
-/// When the queue reaches this limit, BLOCK_GROW and SESSION_DESTROY return
-/// ENOMEM to the caller. At 10 ms daemon poll interval, 1024 decisions is
-/// over 60 seconds of work — hitting this cap means the daemon is stuck or
-/// crashed.
+/// When the queue reaches this limit, logical reserve and session teardown
+/// return ENOMEM to the caller.
 pub const POLARIS_MAX_PENDING_DECISIONS: usize = 1024;
 
 // SAFETY: All PolarisBlock fields are accessed exclusively under the
@@ -158,13 +163,34 @@ pub struct PolarisSession {
 #[derive(Clone, Debug)]
 pub struct PolarisGpu {
     pub gpu_id: u32,
+    pub gpu_uuid: [u8; 16],
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub budget_bytes: u64,
     pub pressure_score: u64,
     pub cpu_pool_total_bytes: u64,
     pub cpu_pool_used_bytes: u64,
+    pub va_range_id: u64,
+    pub va_range_base: u64,
+    pub va_range_length: u64,
+    pub va_block_size: u64,
+    pub va_range_flags: u32,
+    pub va_range_registered: bool,
     pub healthy: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PolarisFault {
+    pub fault_id: u64,
+    pub generation: u64,
+    pub gpu_id: u32,
+    pub fault_address: u64,
+    pub block_id: u64,
+    pub access_type: u32,
+    pub state: u32,
+    pub enqueue_ns: u64,
+    pub deadline_ns: u64,
+    pub resolved_ns: u64,
 }
 
 // ─── Trait impls for user/kernel boundary crossing ───────────────────────────
@@ -181,6 +207,9 @@ pub struct PolarisGpu {
 unsafe impl kernel::transmute::FromBytes for PolarisRegisterGpuArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisRegisterGpuArg {}
 
+unsafe impl kernel::transmute::FromBytes for PolarisRegisterVaRangeArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRegisterVaRangeArg {}
+
 unsafe impl kernel::transmute::FromBytes for PolarisSessionCreateArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisSessionCreateArg {}
 
@@ -193,11 +222,11 @@ unsafe impl kernel::transmute::AsBytes for PolarisSessionGetStatsArg {}
 unsafe impl kernel::transmute::FromBytes for PolarisSessionBranchArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisSessionBranchArg {}
 
-unsafe impl kernel::transmute::FromBytes for PolarisBlockGrowArg {}
-unsafe impl kernel::transmute::AsBytes for PolarisBlockGrowArg {}
+unsafe impl kernel::transmute::FromBytes for PolarisBlockReserveArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisBlockReserveArg {}
 
-unsafe impl kernel::transmute::FromBytes for PolarisBlockFreeArg {}
-unsafe impl kernel::transmute::AsBytes for PolarisBlockFreeArg {}
+unsafe impl kernel::transmute::FromBytes for PolarisBlockReleaseArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisBlockReleaseArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisBlockTouchArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisBlockTouchArg {}

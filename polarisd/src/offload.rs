@@ -130,29 +130,40 @@ impl CpuPool {
 }
 
 /// Execute the full OFFLOAD operation:
-///   1. Copy data GPU→CPU via cudaMemcpyDtoH
+///   1. Copy data GPU VA → CPU buffer via cudaMemcpyDtoH
 ///   2. Unmap the GPU VA (cuMemUnmap)
-///   3. Release the physical handle (cuMemRelease) — genuinely frees GPU memory
-///   4. Return VA to pool
-///   5. Report CPU buffer address
+///   3. Release the physical handle (cuMemRelease)
+///   4. Keep the VA reservation for the eventual reload
+///   5. Report the CPU buffer address
 pub fn execute_offload(
     dec: &PolarisDecision,
     gpu: &mut gpu::GpuState,
     cpu_pool: &mut CpuPool,
 ) -> (i32, u64, u64) {
-    let va_info = gpu
-        .get_va_alloc(dec.block_id)
-        .map(|v| (v.vaddr, v.size));
-    let (vaddr, size) = match va_info {
-        Some(v) => v,
-        None => {
+    let va_info = gpu.get_va_alloc(dec.block_id).map(|v| (v.vaddr, v.size));
+    let src_vaddr = if dec.src_vaddr != 0 {
+        dec.src_vaddr
+    } else {
+        va_info.map(|v| v.0).unwrap_or(0)
+    };
+    let size = snap_up(dec.size_bytes, gpu.granule).max(va_info.map(|v| v.1).unwrap_or(0));
+    if src_vaddr == 0 || size == 0 {
+        eprintln!(
+            "polarisd: OFFLOAD block {} has no source GPU VA",
+            dec.block_id
+        );
+        return (-(libc::EINVAL as i32), 0, 0);
+    }
+    if va_info.is_none() && dec.src_vaddr != 0 {
+        if !gpu.contains_va(dec.src_vaddr, size) {
             eprintln!(
-                "polarisd: OFFLOAD block {} has no VA allocation",
-                dec.block_id
+                "polarisd: OFFLOAD block {} source VA {:#x} is outside the reserved range",
+                dec.block_id,
+                dec.src_vaddr
             );
             return (-(libc::EINVAL as i32), 0, 0);
         }
-    };
+    }
 
     let sz_usize = size as usize;
 
@@ -177,14 +188,14 @@ pub fn execute_offload(
     };
 
     // Copy GPU → CPU (the VA is still mapped and accessible).
-    if let Err(e) = cuda_vmm::copy_device_to_host(cpu_addr, vaddr, sz_usize) {
+    if let Err(e) = cuda_vmm::copy_device_to_host(cpu_addr, src_vaddr, sz_usize) {
         eprintln!("polarisd: OFFLOAD cudaMemcpyDtoH failed for block {}: {e}", dec.block_id);
         cpu_pool.free(cpu_addr, size);
         return (-(libc::EFAULT as i32), 0, 0);
     }
 
     // Unmap the GPU VA — data now lives only in the CPU buffer.
-    if let Err(e) = cuda_vmm::unmap_memory(vaddr, size) {
+    if let Err(e) = cuda_vmm::unmap_memory(src_vaddr, size) {
         eprintln!("polarisd: OFFLOAD unmap failed for block {}: {e}", dec.block_id);
         cpu_pool.free(cpu_addr, size);
         return (-(libc::EINVAL as i32), 0, 0);
@@ -202,14 +213,13 @@ pub fn execute_offload(
     // Track the CPU buffer allocation.
     cpu_pool.track(dec.block_id, cpu_addr);
 
-    // Update GPU-side tracking: phys handle released, VA freed.
-    gpu.phys_handles.remove(&dec.block_id);
+    // Update GPU-side tracking: phys handle released, VA remains reserved.
+    gpu.clear_handle(dec.block_id);
     gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
-    gpu.va_allocs.remove(&dec.block_id);
-    gpu.vas.free(vaddr, size);
+    gpu.track_va(dec.block_id, src_vaddr, size);
 
     eprintln!(
-        "polarisd: OFFLOAD block {} complete: GPU→CPU copied, phys released, VA unmapped, cpu_buf={cpu_addr:#x}",
+        "polarisd: OFFLOAD block {} complete: GPU VA {src_vaddr:#x} → CPU buffer {cpu_addr:#x}",
         dec.block_id
     );
 
@@ -217,11 +227,11 @@ pub fn execute_offload(
 }
 
 /// Execute the full RELOAD operation:
-///   1. cuMemCreate (new physical handle)
-///   2. cuMemMap into a fresh VA
-///   3. cudaMemcpyHtoD CPU→GPU
+///   1. Re-create physical memory
+///   2. Re-map the existing GPU VA
+///   3. Copy CPU → GPU VA
 ///   4. Report the new physical handle
-///   5. Free the CPU buffer
+///   5. Release the CPU buffer
 ///
 /// Note: the old physical handle was already released during OFFLOAD.
 pub fn execute_reload(
@@ -230,6 +240,17 @@ pub fn execute_reload(
     cpu_pool: &mut CpuPool,
 ) -> (i32, u64, u64) {
     let size = snap_up(dec.size_bytes, gpu.granule);
+    let vaddr = match if dec.dst_vaddr != 0 {
+        Some(dec.dst_vaddr)
+    } else {
+        gpu.get_va_alloc(dec.block_id).map(|v| v.vaddr)
+    } {
+        Some(va) => va,
+        None => {
+            eprintln!("polarisd: RELOAD block {} has no destination GPU VA", dec.block_id);
+            return (-(libc::EINVAL as i32), 0, 0);
+        }
+    };
 
     // The kernel passes the CPU buffer address in dec.cpu_addr.
     let cpu_addr = dec.cpu_addr;
@@ -241,21 +262,11 @@ pub fn execute_reload(
         return (-(libc::EINVAL as i32), 0, 0);
     }
 
-    // Allocate fresh GPU VA.
-    let vaddr = match gpu.vas.allocate(size, gpu.granule) {
-        Some(va) => va,
-        None => {
-            eprintln!("polarisd: RELOAD VA pool exhausted for block {}", dec.block_id);
-            return (-(libc::ENOMEM as i32), 0, 0);
-        }
-    };
-
     // Create new physical memory (old was released during offload).
     let new_phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("polarisd: RELOAD cuMemCreate failed for block {}: {e}", dec.block_id);
-            gpu.vas.free(vaddr, size);
             return (-(libc::ENOMEM as i32), 0, 0);
         }
     };
@@ -266,7 +277,6 @@ pub fn execute_reload(
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
             eprintln!("polarisd: RELOAD cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
         }
-        gpu.vas.free(vaddr, size);
         return (-(libc::EINVAL as i32), 0, 0);
     }
 
@@ -277,7 +287,6 @@ pub fn execute_reload(
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
             eprintln!("polarisd: RELOAD cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
         }
-        gpu.vas.free(vaddr, size);
         return (-(libc::EINVAL as i32), 0, 0);
     }
 
@@ -288,7 +297,6 @@ pub fn execute_reload(
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
             eprintln!("polarisd: RELOAD cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
         }
-        gpu.vas.free(vaddr, size);
         return (-(libc::EFAULT as i32), 0, 0);
     }
 

@@ -48,44 +48,47 @@ pub(crate) use iowr;
 pub const POLARIS_REGISTER_GPU: u32 =
     iow!(MAGIC, 0x01, PolarisRegisterGpuArg);
 
+pub const POLARIS_REGISTER_VA_RANGE: u32 =
+    iowr!(MAGIC, 0x02, PolarisRegisterVaRangeArg);
+
 pub const POLARIS_SESSION_CREATE: u32 =
-    iowr!(MAGIC, 0x02, PolarisSessionCreateArg);
+    iowr!(MAGIC, 0x03, PolarisSessionCreateArg);
 
 pub const POLARIS_SESSION_DESTROY: u32 =
-    iow!(MAGIC, 0x03, PolarisSessionDestroyArg);
+    iow!(MAGIC, 0x04, PolarisSessionDestroyArg);
 
 pub const POLARIS_SESSION_GET_STATS: u32 =
-    iowr!(MAGIC, 0x04, PolarisSessionGetStatsArg);
+    iowr!(MAGIC, 0x05, PolarisSessionGetStatsArg);
 
 pub const POLARIS_SESSION_BRANCH: u32 =
-    iowr!(MAGIC, 0x05, PolarisSessionBranchArg);
+    iowr!(MAGIC, 0x06, PolarisSessionBranchArg);
 
-pub const POLARIS_BLOCK_GROW: u32 =
-    iowr!(MAGIC, 0x06, PolarisBlockGrowArg);
+pub const POLARIS_BLOCK_RESERVE: u32 =
+    iowr!(MAGIC, 0x07, PolarisBlockReserveArg);
 
-pub const POLARIS_BLOCK_FREE: u32 =
-    iow!(MAGIC, 0x07, PolarisBlockFreeArg);
+pub const POLARIS_BLOCK_RELEASE: u32 =
+    iow!(MAGIC, 0x08, PolarisBlockReleaseArg);
 
 pub const POLARIS_BLOCK_TOUCH: u32 =
-    iow!(MAGIC, 0x08, PolarisBlockTouchArg);
+    iow!(MAGIC, 0x09, PolarisBlockTouchArg);
 
 pub const POLARIS_BLOCK_GET_STATE: u32 =
-    iowr!(MAGIC, 0x09, PolarisBlockGetStateArg);
+    iowr!(MAGIC, 0x0A, PolarisBlockGetStateArg);
 
 pub const POLARIS_GET_DECISION: u32 =
-    iowr!(MAGIC, 0x0A, PolarisGetDecisionArg);
+    iowr!(MAGIC, 0x0B, PolarisGetDecisionArg);
 
 pub const POLARIS_COMPLETE_OPERATION: u32 =
-    iowr!(MAGIC, 0x0B, PolarisCompleteOperationArg);
+    iowr!(MAGIC, 0x0C, PolarisCompleteOperationArg);
 
 pub const POLARIS_GET_GLOBAL_STATS: u32 =
-    iowr!(MAGIC, 0x0C, PolarisGetGlobalStatsArg);
+    iowr!(MAGIC, 0x0D, PolarisGetGlobalStatsArg);
 
 pub const POLARIS_LIST_SESSIONS: u32 =
-    iowr!(MAGIC, 0x0D, PolarisListSessionsArg);
+    iowr!(MAGIC, 0x0E, PolarisListSessionsArg);
 
 pub const POLARIS_SET_POLICY: u32 =
-    iow!(MAGIC, 0x0E, PolarisSetPolicyArg);
+    iow!(MAGIC, 0x0F, PolarisSetPolicyArg);
 
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 

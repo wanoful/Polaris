@@ -5,7 +5,7 @@
 // KV cache management path with real CUDA memory.
 //
 // Subcommands:
-//   synthetic-kv     — single-session KV allocation with decode loop simulation
+//   synthetic-kv     — single-session KV reserve/touch/release simulation
 //   beam-search      — COW beam search workload with decode simulation
 //   concurrent       — multi-session concurrent workload with decode simulation
 //   trace-replay     — vLLM/SGLang trace file replay (Phase 4b)
@@ -39,9 +39,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Single-session KV allocation stress test with decode loop simulation
+    /// Single-session KV reserve/touch stress test with decode loop simulation
     ///
-    /// Flat mode (backward-compatible): --num-blocks N
+    /// Flat mode: --num-blocks N
     /// Decode loop mode: --prompt-tokens P --output-tokens O [--csv path]
     SyntheticKv {
         /// Number of blocks to allocate (flat mode, no decode sim)
@@ -201,7 +201,7 @@ fn destroy_session(
     eprintln!("  SESSION_DESTROY id={sid} ({lat_us} µs)");
 }
 
-fn block_grow(
+fn block_reserve(
     fd: c_int,
     csv: &mut Option<CsvWriter>,
     sid: u64,
@@ -211,7 +211,7 @@ fn block_grow(
     phase: PolarisPhase,
 ) -> Result<(i32, u64, u64), Box<dyn std::error::Error>> {
     let start = Instant::now();
-    let mut arg = PolarisBlockGrowArg {
+    let mut arg = PolarisBlockReserveArg {
         session_id: sid,
         token_start,
         token_count,
@@ -219,25 +219,26 @@ fn block_grow(
         phase: phase as u32,
         ..Default::default()
     };
-    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut arg)
-        .map_err(|e| format!("BLOCK_GROW: errno {e}"))?;
+    let rc = match ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut arg) {
+        Ok(()) => 0,
+        Err(e) => -(e as i32),
+    };
     let lat_us = start.elapsed().as_micros() as u64;
-    let op = if flags & POLARIS_GROW_FLAG_OVERWRITE != 0 {
+    let op = if flags & POLARIS_RESERVE_FLAG_OVERWRITE != 0 {
         "COW_BREAK"
     } else {
-        "BLOCK_ALLOC"
+        "BLOCK_RESERVE"
     };
     if let Some(ref mut c) = csv {
         c.record(op, sid, token_start, token_count, arg.block_id, 0, lat_us);
     }
-    if arg.ret_code != 0 {
+    if rc != 0 {
         eprintln!(
-            "  {op} sid={sid} tokens={token_start}..{} rc={} ({lat_us} µs)",
+            "  {op} sid={sid} tokens={token_start}..{} rc={rc} ({lat_us} µs)",
             token_start + token_count,
-            arg.ret_code,
         );
     }
-    Ok((arg.ret_code, arg.block_id, lat_us))
+    Ok((rc, arg.block_id, lat_us))
 }
 
 fn block_touch(
@@ -301,9 +302,8 @@ fn get_global_stats(fd: c_int) -> PolarisGetGlobalStatsArg {
 /// Returns (total_prefill_blocks, total_decode_blocks, total_latency_us).
 ///
 /// Behavior:
-///   - Prefill: allocate prompt_blocks in batch with phase=Prefill
-///   - Decode: for each output block, call BLOCK_GROW(phase=Decode) then
-///     BLOCK_TOUCH on all existing blocks (simulates full attention read)
+///   - Prefill: reserve prompt_blocks in batch with phase=Prefill
+///   - Decode: reserve the next output block, then touch the existing range
 fn run_decode_loop(
     fd: c_int,
     csv: &mut Option<CsvWriter>,
@@ -319,12 +319,12 @@ fn run_decode_loop(
     let mut total_tokens: u64 = 0;
 
     // ── Prefill phase ────────────────────────────────────────────────────
-    eprintln!("  Prefill: allocating {prompt_blocks} blocks for {prompt_tokens} tokens...");
+    eprintln!("  Prefill: reserving {prompt_blocks} blocks for {prompt_tokens} tokens...");
     for i in 0..prompt_blocks {
         let start = i * tokens_per_block;
         let count = tokens_per_block.min(prompt_tokens - start);
         total_tokens += count as u64;
-        let (rc, bid, lat_us) = block_grow(
+        let (rc, bid, lat_us) = block_reserve(
             fd, csv, sid, start, count, 0, PolarisPhase::Prefill,
         )?;
         total_lat_us += lat_us;
@@ -352,8 +352,8 @@ fn run_decode_loop(
         let count = tokens_per_block.min(prompt_tokens + output_tokens - token_offset);
         total_tokens += count as u64;
 
-        // Allocate the new decode block
-        let (rc, _bid, lat_us) = block_grow(
+        // Reserve the new decode block.
+        let (rc, _bid, lat_us) = block_reserve(
             fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode,
         )?;
         total_lat_us += lat_us;
@@ -365,15 +365,14 @@ fn run_decode_loop(
             .into());
         }
 
-        // Touch all existing blocks (simulates attention over full context)
-        // The kernel's pre-decode residency check runs inside BLOCK_GROW for
-        // Decode phase — this TOUCH updates LRU for the just-touched blocks.
+        // Touch the active range to model the access pattern seen by the
+        // interrupt-driven fault path.
         let touch_lat = block_touch(fd, csv, sid, 0, total_tokens)?;
         total_lat_us += touch_lat;
 
         if i % 16 == 15 || i == output_blocks - 1 {
             eprintln!(
-                "    decode step {}/{} (total tokens={total_tokens}, grow={lat_us} µs, touch={touch_lat} µs)",
+                "    decode step {}/{} (total tokens={total_tokens}, reserve={lat_us} µs, touch={touch_lat} µs)",
                 i + 1,
                 output_blocks,
             );
@@ -383,9 +382,9 @@ fn run_decode_loop(
     // ── Optional COW-break overlay ───────────────────────────────────────
     if let Some((over_start, over_count)) = overwrite_block {
         eprintln!("  COW_BREAK overwrite: tokens {over_start}..{}", over_start + over_count);
-        let (rc, _bid, lat_us) = block_grow(
+        let (rc, _bid, lat_us) = block_reserve(
             fd, csv, sid, over_start, over_count,
-            POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill,
+            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill,
         )?;
         total_lat_us += lat_us;
         if rc != 0 {
@@ -435,12 +434,12 @@ fn run_synthetic_kv(
             total_elapsed
         );
     } else {
-        // ── Flat allocation mode (backward compat) ───────────────────────
-        eprintln!("Mode: flat allocation  |  {num_blocks} blocks  |  {tokens_per_block} tok/block");
+        // ── Flat reserve mode ────────────────────────────────────────────
+        eprintln!("Mode: flat reserve  |  {num_blocks} blocks  |  {tokens_per_block} tok/block");
         let start = Instant::now();
         let mut total_lat: u64 = 0;
         for i in 0..num_blocks {
-            let (rc, _bid, lat_us) = block_grow(
+            let (rc, _bid, lat_us) = block_reserve(
                 fd, csv, sid,
                 i * tokens_per_block,
                 tokens_per_block,
@@ -449,15 +448,15 @@ fn run_synthetic_kv(
             )?;
             total_lat += lat_us;
             if rc != 0 {
-                eprintln!("  Block {i} allocation failed (ret_code={rc})");
+                eprintln!("  Block {i} reserve failed (ret_code={rc})");
                 destroy_session(fd, csv, sid);
-                return Err(format!("BLOCK_GROW {i} failed with {rc}").into());
+                return Err(format!("BLOCK_RESERVE {i} failed with {rc}").into());
             }
         }
         let elapsed = start.elapsed();
-        eprintln!("Allocated {num_blocks} blocks in {elapsed:?} ({total_lat} µs ioctl)");
+        eprintln!("Reserved {num_blocks} blocks in {elapsed:?} ({total_lat} µs ioctl)");
 
-        // Touch all blocks
+        // Touch the full reserved range once.
         let _ = block_touch(
             fd, csv, sid, 0,
             (num_blocks * tokens_per_block) as u64,
@@ -541,7 +540,7 @@ fn run_beam_search(
                 let count =
                     tokens_per_block.min(prompt_tokens + decode_steps - token_offset);
 
-                let (rc, _, _) = block_grow(
+                let (rc, _, _) = block_reserve(
                     fd, csv, child_id, token_offset, count, 0, PolarisPhase::Decode,
                 )?;
                 if rc != 0 {
@@ -569,9 +568,9 @@ fn run_beam_search(
         eprintln!(
             "COW_BREAK test: child {first_child} overwrites token 0..{tokens_per_block}"
         );
-        let (rc, bid, lat_us) = block_grow(
+        let (rc, bid, lat_us) = block_reserve(
             fd, csv, first_child, 0, tokens_per_block,
-            POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill,
+            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill,
         )?;
         if rc != 0 {
             eprintln!("  COW_BREAK failed (rc={rc})");
@@ -631,7 +630,7 @@ fn run_concurrent(
         for i in 0..prompt_blocks {
             let start = i * tokens_per_block;
             let count = tokens_per_block.min(prompt_tokens - start);
-            let (rc, _, _) = block_grow(
+            let (rc, _, _) = block_reserve(
                 fd, csv, sid, start, count, 0, PolarisPhase::Prefill,
             )?;
             if rc != 0 {
@@ -654,11 +653,11 @@ fn run_concurrent(
                 let count =
                     tokens_per_block.min(prompt_tokens + output_tokens - token_offset);
 
-                let (rc, _, _) = block_grow(
+                let (rc, _, _) = block_reserve(
                     fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode,
                 )?;
                 if rc != 0 {
-                    // Skip this session if allocation fails
+                    // Skip this session if reserve fails.
                     continue;
                 }
 
@@ -716,10 +715,10 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
         )
     }
 
-    fn grow(
+    fn reserve(
         fd: c_int, sid: u64, start: u32, count: u32, flags: u32, phase: u32,
     ) -> (i32, u64) {
-        let mut arg = PolarisBlockGrowArg {
+        let mut arg = PolarisBlockReserveArg {
             session_id: sid,
             token_start: start,
             token_count: count,
@@ -727,8 +726,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
             phase,
             ..Default::default()
         };
-        match ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_GROW, &mut arg) {
-            Ok(()) => (arg.ret_code, arg.block_id),
+        match ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut arg) {
+            Ok(()) => (0, arg.block_id),
             Err(eno) => (-(eno as i32), arg.block_id),
         }
     }
@@ -768,15 +767,15 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut block_ids: Vec<u64> = Vec::new();
     for i in 0..8u32 {
-        let (rc, bid) = grow(fd, parent, i * 16, 16, 0, PolarisPhase::Prefill as u32);
+        let (rc, bid) = reserve(fd, parent, i * 16, 16, 0, PolarisPhase::Prefill as u32);
         if rc != 0 {
-            eprintln!("  FAIL: parent block {i} allocation failed (rc={rc})");
+            eprintln!("  FAIL: parent block {i} reserve failed (rc={rc})");
             destroy_session(fd, parent);
             return Err(format!("setup failed at block {i}").into());
         }
         block_ids.push(bid);
     }
-    eprintln!("Parent prompt: 8 blocks allocated");
+    eprintln!("Parent prompt: 8 blocks reserved");
 
     // ── Branch: 3 children ───────────────────────────────────────────────
     let mut children: Vec<u64> = Vec::new();
@@ -790,8 +789,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     // Test A: first child COW-breaks block 0
     eprintln!("\n--- Test A: first child COW-break block 0 ---");
     let c1 = children[0];
-    let (rc, new_bid_a) = grow(
-        fd, c1, 0, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc, new_bid_a) = reserve(
+        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (_sh_a, _pr_a, cb_a, cc_a) = get_stats(fd);
     if rc == 0 && cb_a == 1 && new_bid_a != block_ids[0] {
@@ -807,8 +806,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     // Test B: second child COW-breaks same block 0
     eprintln!("\n--- Test B: second child COW-break same block 0 ---");
     let c2 = children[1];
-    let (rc, new_bid_b) = grow(
-        fd, c2, 0, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc, new_bid_b) = reserve(
+        fd, c2, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (_sh_b, _pr_b, cb_b, _cc_b) = get_stats(fd);
     if rc == 0 && cb_b == 2 && new_bid_b != block_ids[0] && new_bid_b != new_bid_a {
@@ -821,8 +820,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     // Test C: first child in-place overwrite (block now private)
     eprintln!("\n--- Test C: first child in-place overwrite (refcount=1) ---");
-    let (rc_c, bid_c) = grow(
-        fd, c1, 0, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc_c, bid_c) = reserve(
+        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (_sh_c, _pr_c, cb_c, _) = get_stats(fd);
     if rc_c == 0 && bid_c == new_bid_a && cb_c == 2 {
@@ -835,7 +834,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     // Test D: overlap without OVERWRITE → EINVAL
     eprintln!("\n--- Test D: overlap without OVERWRITE flag ---");
-    let (rc_d, bid_d) = grow(fd, children[2], 0, 16, 0, PolarisPhase::Prefill as u32);
+    let (rc_d, bid_d) = reserve(fd, children[2], 0, 16, 0, PolarisPhase::Prefill as u32);
     if rc_d == -(libc::EINVAL as i32) {
         eprintln!("  PASS: rejected with EINVAL ({rc_d})");
         passed += 1;
@@ -850,8 +849,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     // Test E: third child COW-breaks block 1
     eprintln!("\n--- Test E: third child COW-break block 1 (still shared) ---");
     let c3 = children[2];
-    let (rc_e, new_bid_e) = grow(
-        fd, c3, 16, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc_e, new_bid_e) = reserve(
+        fd, c3, 16, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (_sh_e, _pr_e, cb_e, _) = get_stats(fd);
     if rc_e == 0 && cb_e == 3 && new_bid_e != block_ids[1] {
@@ -866,8 +865,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n--- Test F: nested branch + COW break in grandchild ---");
     let grandchild = branch(fd, c1);
     eprintln!("  Grandchild session: {grandchild}");
-    let (rc_f, new_bid_f) = grow(
-        fd, grandchild, 32, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc_f, new_bid_f) = reserve(
+        fd, grandchild, 32, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (sh_f, pr_f, cb_f, _) = get_stats(fd);
     if rc_f == 0 && cb_f == 4 && new_bid_f != block_ids[2] {
@@ -882,8 +881,8 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     // Test G: grandchild COW-break block 0 (shared with c1)
     eprintln!("\n--- Test G: grandchild COW-break block 0 (shared with c1) ---");
-    let (rc_g, new_bid_g) = grow(
-        fd, grandchild, 0, 16, POLARIS_GROW_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+    let (rc_g, new_bid_g) = reserve(
+        fd, grandchild, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
     );
     let (_sh_g, _pr_g, cb_g, _) = get_stats(fd);
     if rc_g == 0 && cb_g == 5 && new_bid_g != new_bid_a {

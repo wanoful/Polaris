@@ -19,7 +19,7 @@ index 56fccdd..dbf5e3d 100644
 +# Activated by environment variable POLARIS_TRACE=<output_path>.
 +# Produces a CSV trace file in the format:
 +#   timestamp_ns,op,session_id,token_start,token_count
-+# Ops: SESSION_CREATE, BLOCK_ALLOC, BLOCK_FREE, SESSION_DESTROY
++# Ops: SESSION_CREATE, BLOCK_RESERVE, BLOCK_RELEASE, SESSION_DESTROY
 +_POLARIS_TRACE_PATH = os.environ.get("POLARIS_TRACE", "")
 +_POLARIS_TRACE_FD = None  # opened lazily on first write
 +_POLARIS_SESSION_TOKENS: dict[str, int] = {}  # req.rid -> total allocated tokens
@@ -48,7 +48,7 @@ index 56fccdd..dbf5e3d 100644
 +
 +
 +def _polaris_trace_extend(reqs: list["Req"], extend_lens: list[int]) -> None:
-+    """Emit SESSION_CREATE and BLOCK_ALLOC for prefill allocations."""
++    """Emit SESSION_CREATE and BLOCK_RESERVE for prefill reservations."""
 +    for req, ext_len in zip(reqs, extend_lens):
 +        if ext_len <= 0:
 +            continue
@@ -59,17 +59,17 @@ index 56fccdd..dbf5e3d 100644
 +            _polaris_emit("SESSION_CREATE", rid, 0, 0)
 +            _POLARIS_SEEN.add(rid)
 +
-+        # Emit BLOCK_ALLOC in POLARIS block-sized chunks
++        # Emit BLOCK_RESERVE in POLARIS block-sized chunks
 +        for start in range(0, ext_len, POLARIS_BLOCK_SIZE):
 +            tok_start = old_total + start
 +            tok_count = min(POLARIS_BLOCK_SIZE, ext_len - start)
-+            _polaris_emit("BLOCK_ALLOC", rid, tok_start, tok_count)
++            _polaris_emit("BLOCK_RESERVE", rid, tok_start, tok_count)
 +
 +        _POLARIS_SESSION_TOKENS[rid] = old_total + ext_len
 +
 +
 +def _polaris_trace_decode(reqs: list["Req"], token_per_req: int) -> None:
-+    """Emit BLOCK_ALLOC for decode allocations."""
++    """Emit BLOCK_RESERVE for decode reservations."""
 +    for req in reqs:
 +        rid = req.rid
 +        old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
@@ -77,21 +77,21 @@ index 56fccdd..dbf5e3d 100644
 +        for start in range(0, token_per_req, POLARIS_BLOCK_SIZE):
 +            tok_start = old_total + start
 +            tok_count = min(POLARIS_BLOCK_SIZE, token_per_req - start)
-+            _polaris_emit("BLOCK_ALLOC", rid, tok_start, tok_count)
++            _polaris_emit("BLOCK_RESERVE", rid, tok_start, tok_count)
 +
 +        _POLARIS_SESSION_TOKENS[rid] = old_total + token_per_req
 +
 +
 +def _polaris_trace_release(req: "Req") -> None:
-+    """Emit BLOCK_FREE and SESSION_DESTROY."""
++    """Emit BLOCK_RELEASE and SESSION_DESTROY."""
 +    rid = req.rid
 +    total = _POLARIS_SESSION_TOKENS.pop(rid, 0)
 +    if total == 0 and rid not in _POLARIS_SEEN:
 +        return
-+    # Emit one BLOCK_FREE per allocated block
++    # Emit one BLOCK_RELEASE per allocated block
 +    num_blocks = (total + POLARIS_BLOCK_SIZE - 1) // POLARIS_BLOCK_SIZE
 +    for _ in range(num_blocks):
-+        _polaris_emit("BLOCK_FREE", rid, 0, 0)
++        _polaris_emit("BLOCK_RELEASE", rid, 0, 0)
 +    _polaris_emit("SESSION_DESTROY", rid, 0, 0)
 +    _POLARIS_SEEN.discard(rid)
 +

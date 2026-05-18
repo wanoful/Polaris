@@ -11,8 +11,6 @@ use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::thread;
-use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("polarisd: starting POLARIS daemon");
@@ -173,42 +171,45 @@ fn decision_loop(
         match ioctl::ioctl_read(fd, ioctl::POLARIS_GET_DECISION, &mut decision_arg) {
             Ok(()) => {
                 let count = decision_arg.count as usize;
-                if count > 0 {
-                    eprintln!("polarisd: received {count} decision(s)");
-                    for i in 0..count {
-                        let dec = &decision_arg.decisions[i];
-                        let exec = decision::execute(fd, dec, gpu, cpu_pool, test_err);
+                if count == 0 {
+                    continue;
+                }
 
-                        let complete = PolarisCompleteOperationArg {
-                            decision_id: dec.decision_id,
-                            result: exec.result,
-                            output_handle: exec.output_handle,
-                            output_cpu_addr: exec.output_cpu_addr,
-                            ..Default::default()
-                        };
+                eprintln!("polarisd: received {count} decision(s)");
+                for i in 0..count {
+                    let dec = &decision_arg.decisions[i];
+                    let exec = decision::execute(fd, dec, gpu, cpu_pool, test_err);
 
-                        if let Err(e) = ioctl::ioctl_write(
-                            fd,
-                            ioctl::POLARIS_COMPLETE_OPERATION,
-                            &complete,
-                        ) {
-                            eprintln!(
-                                "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
-                                dec.decision_id
-                            );
-                        }
+                    let complete = PolarisCompleteOperationArg {
+                        decision_id: dec.decision_id,
+                        generation: dec.generation,
+                        result: exec.result,
+                        output_handle: exec.output_handle,
+                        output_cpu_addr: exec.output_cpu_addr,
+                        ..Default::default()
+                    };
 
-                        if exec.result == 0 {
-                            eprintln!(
-                                "polarisd: decision {} completed (handle=0x{:x})",
-                                dec.decision_id, exec.output_handle
-                            );
-                        } else {
-                            eprintln!(
-                                "polarisd: decision {} failed with result={}",
-                                dec.decision_id, exec.result
-                            );
-                        }
+                    if let Err(e) = ioctl::ioctl_write(
+                        fd,
+                        ioctl::POLARIS_COMPLETE_OPERATION,
+                        &complete,
+                    ) {
+                        eprintln!(
+                            "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
+                            dec.decision_id
+                        );
+                    }
+
+                    if exec.result == 0 {
+                        eprintln!(
+                            "polarisd: decision {} completed (handle=0x{:x})",
+                            dec.decision_id, exec.output_handle
+                        );
+                    } else {
+                        eprintln!(
+                            "polarisd: decision {} failed with result={}",
+                            dec.decision_id, exec.result
+                        );
                     }
                 }
             }
@@ -220,8 +221,6 @@ fn decision_loop(
                 }
             }
         }
-
-        thread::sleep(Duration::from_millis(10));
     }
 
     Ok(())

@@ -199,13 +199,26 @@ impl GpuState {
         self.va_allocs.get(&block_id)
     }
 
+    /// Find a block_id by its GPU VA.
+    pub fn find_block_by_vaddr(&self, vaddr: u64) -> Option<u64> {
+        self.va_allocs
+            .iter()
+            .find(|(_, va)| va.vaddr == vaddr)
+            .map(|(&bid, _)| bid)
+    }
+
     /// Find a block_id by its physical handle (reverse lookup).
-    /// Used by COW_BREAK to locate the source block's VA and metadata.
+    /// This is only a compatibility fallback when the kernel cannot provide
+    /// the source GPU VA directly.
     pub fn find_block_by_phys(&self, phys_handle: u64) -> Option<u64> {
         self.phys_handles
             .iter()
             .find(|(_, &ph)| ph == phys_handle)
             .map(|(&bid, _)| bid)
+    }
+
+    pub fn contains_va(&self, vaddr: u64, size: u64) -> bool {
+        size > 0 && vaddr >= self.vas.base && vaddr.saturating_add(size) <= self.vas.base + self.vas.size
     }
 
     /// Remove block tracking and return its VA to the pool.
@@ -214,5 +227,9 @@ impl GpuState {
         if let Some(va) = self.va_allocs.remove(&block_id) {
             self.vas.free(va.vaddr, va.size);
         }
+    }
+
+    pub fn clear_handle(&mut self, block_id: u64) {
+        self.phys_handles.remove(&block_id);
     }
 }

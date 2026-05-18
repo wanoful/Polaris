@@ -62,8 +62,8 @@ address range; `cuMemUnmap` removes the mapping. The kernel service is the
 **sole decision authority** - it maintains the global block table, tracks
 per-block state, and issues all map/unmap/reclaim decisions. The daemon is a
 blind executor. The critical change is that the event source is a real GPU
-page-fault interrupt in the NVIDIA driver rather than a manual
-`POLARIS_BLOCK_GROW` ioctl from the workload.
+page-fault interrupt in the NVIDIA driver rather than a manual workload
+growth ioctl.
 
 **Driver takeover finding:** A standalone third-party module cannot cleanly
 preempt UVM after it has claimed replayable page faults. The practical path
@@ -330,7 +330,7 @@ interrupts from the NVIDIA driver.
 
 - A CUDA kernel touching an unmapped POLARIS KV-cache VA stalls, enters the
   patched UVM replayable-fault path, is mapped by `polarisd`, and then resumes
-  after UVM replay without a manual `POLARIS_BLOCK_GROW` ioctl.
+  after UVM replay without a manual workload-triggered ioctl.
 
 ### Phase 1b: Kernel Module Skeleton
 
@@ -446,7 +446,7 @@ POLARIS_BLOCK_TOUCH              // advisory access timestamp for LRU
 POLARIS_BLOCK_GET_STATE          // query a block's location and mapping
 
 /* debug/test only */
-POLARIS_BLOCK_GROW               // fallback without patched UVM; not production path
+// no legacy manual-growth ioctl; tests use BLOCK_RESERVE plus the fault path
 ```
 
 ### Kernel ↔ Daemon Decision Protocol
@@ -688,11 +688,11 @@ struct polaris_session_branch_arg {
 };
 ```
 
-Production page faults do not enter through `polaris_block_grow_arg`. They
+Production page faults do not enter through a workload growth ioctl. They
 enter through the patched UVM fault hook, which calls an internal
 `polaris_resolve_gpu_fault()` helper with the parsed `uvm_fault_buffer_entry_t`
-fields. `POLARIS_BLOCK_GROW` remains only for synthetic tests and trace
-replay when the patched NVIDIA driver is not loaded.
+fields. Synthetic tests and trace replay use `POLARIS_BLOCK_RESERVE` to create
+logical KV ranges; physical mapping is still driven by the fault decision path.
 
 `POLARIS_BLOCK_RESERVE` is the normal allocation-facing API after the
 interrupt change. It creates only logical metadata and returns a session-local
@@ -813,8 +813,7 @@ workload. On init:
 - All new `POLARIS_GET_DECISION` calls return an empty list (no daemon attached)
 - All pending fault waiters fail when their deadline expires or the daemon
   generation changes
-- All new fallback `BLOCK_GROW` calls from workloads immediately return
-  `-ENODEV`
+- Any unsupported legacy workload ioctl path is rejected with `-ENODEV`
 - All new driver faults in POLARIS VA ranges fail through the UVM cancel/fatal
   path after a bounded timeout
 - Workloads receive an ordinary CUDA error and may retry after the daemon
@@ -1075,8 +1074,8 @@ Build a Rust-based workload generator that:
   launching kernels that touch unmapped KV addresses
 - Simulates decode loop by launching a tiny CUDA kernel that reads the
   historical KV addresses and writes the newly appended block; in fallback
-  mode only, it calls `BLOCK_GROW`/`BLOCK_TOUCH` to exercise the old ioctl
-  path without the patched NVIDIA driver
+  mode only, it calls `BLOCK_RESERVE`/`BLOCK_TOUCH` to exercise the logical
+  reservation path without the patched NVIDIA driver
 - Supports beam search workload: `SESSION_BRANCH` → COW testing
 - Emits CSV traces: timestamp, operation, session_id, block_id, GPU,
   latency
@@ -1094,28 +1093,28 @@ sufficient for the OS-level evaluation.
 
 #### Trace Collection Methodology
 
-**What to collect:** A CSV file of every KV Cache block allocation and
-deallocation event during a vLLM inference run.
+**What to collect:** A CSV file of every KV Cache block reservation and
+release event during a vLLM inference run.
 
 **Trace format (`trace.csv`):**
 
 ```csv
 timestamp_ns,op,session_id,token_start,token_count
 123456789,SESSION_CREATE,1,0,0
-124000000,BLOCK_ALLOC,1,0,16
-124010000,BLOCK_ALLOC,1,16,16
-124020000,BLOCK_ALLOC,1,32,16
+124000000,BLOCK_RESERVE,1,0,16
+124010000,BLOCK_RESERVE,1,16,16
+124020000,BLOCK_RESERVE,1,32,16
 ...
-145000000,BLOCK_ALLOC,1,512,16
-145500000,BLOCK_ALLOC,1,528,16
+145000000,BLOCK_RESERVE,1,512,16
+145500000,BLOCK_RESERVE,1,528,16
 146000000,SESSION_BRANCH,1,0,2
-146010000,BLOCK_ALLOC,2,544,16
+146010000,BLOCK_RESERVE,2,544,16
 ...
 220000000,SESSION_DESTROY,1,0,0
 220000001,SESSION_DESTROY,2,0,0
 ```
 
-**Opcodes:** `SESSION_CREATE`, `BLOCK_ALLOC`, `BLOCK_FREE`,
+**Opcodes:** `SESSION_CREATE`, `BLOCK_RESERVE`, `BLOCK_RELEASE`,
 `SESSION_BRANCH` (parent→child), `SESSION_DESTROY`.
 
 **How to collect (monkey-patch vLLM, ~20 lines):**
@@ -1142,13 +1141,13 @@ class BlockSpaceManager:
         seq = seq_group.get_seqs()[0]
         start = seq.get_len()
         count = self.block_size  # tokens per block
-        TRACE_FD.write(f"{ts},BLOCK_ALLOC,{seq_group.request_id},{start},{count}\n")
+        TRACE_FD.write(f"{ts},BLOCK_RESERVE,{seq_group.request_id},{start},{count}\n")
         # ---- END ADD ----
         # ... original logic unchanged ...
 
     def free(self, seq: Sequence) -> None:
         ts = time.time_ns()
-        TRACE_FD.write(f"{ts},BLOCK_FREE,{seq.seq_id},0,0\n")
+        TRACE_FD.write(f"{ts},BLOCK_RELEASE,{seq.seq_id},0,0\n")
         # ... original logic unchanged ...
 
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
@@ -1210,7 +1209,7 @@ For each run (vLLM-native, SGLang-native, POLARIS-replay), collect:
 | Metric | Source | Validation |
 |--------|--------|------------|
 | Peak GPU memory (bytes) | Trace + `nvidia-smi` snapshots | Cross-check POLARIS accounting vs. `nvidia-smi` |
-| Allocated bytes total | Sum of all `BLOCK_ALLOC` sizes | Must match across all three runs for fairness |
+| Reserved bytes total | Sum of all `BLOCK_RESERVE` sizes | Must match across all three runs for fairness |
 | Useful bytes | `∑ token_count × bytes_per_token` | Same for all three (identical trace) |
 | **External fragmentation** | `1 − useful / allocated` | Lower is better |
 | **Internal fragmentation** | `1 − useful / (num_blocks × block_capacity_bytes)` | Lower is better |
