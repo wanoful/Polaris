@@ -352,6 +352,7 @@ name = "workloads"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cudarc",
  "libc",
  "libpolaris",
 ]

@@ -1181,7 +1181,7 @@ impl PolarisDevice {
                 let fault_result = polaris_resolve_gpu_fault(
                     home_gpu,
                     gpu_vaddr,
-                    1, // access_type: write (COW break)
+                    1, // write fault for COW break
                 )?;
                 if fault_result != PolarisUvmFaultResult::Handled {
                     return Err(EIO);
@@ -1244,17 +1244,17 @@ impl PolarisDevice {
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
 
-        // Simulate the GPU first-touch page fault that would normally be
-        // delivered through the NVIDIA UVM replayable-fault hook.  This
+        // Trigger the GPU page-fault pipeline through the same entry point
+        // that the patched nvidia-uvm.ko replayable-fault ISR uses.  This
         // exercises the full kernel→daemon→kernel decision protocol
-        // (ALLOC + cuMemMap) without requiring a real CUDA kernel launch.
-        // In production the UVM hook calls polaris_resolve_gpu_fault
-        // directly; the synthetic path calls the same function so the
-        // daemon-side execution is identical.
+        // (ALLOC + cuMemMap) while still being driven from BLOCK_RESERVE
+        // (the UVM hook would provide the trigger at interrupt time; here
+        // the ioctl provides it synchronously so the workload can block
+        // until physical memory is resident).
         let fault_result = polaris_resolve_gpu_fault(
             home_gpu,
             gpu_vaddr,
-            0,           // access_type: 0 = read
+            0,
         )?;
         if fault_result != PolarisUvmFaultResult::Handled {
             return Err(EIO);

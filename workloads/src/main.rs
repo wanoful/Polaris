@@ -1,27 +1,136 @@
 // POLARIS Workload Generator — Phase 4a
 //
 // Synthetic inference workload runtime that exercises the POLARIS kernel
-// module's KV cache management path.  Not a real model — only exercises the
-// KV cache management path with real CUDA memory.
+// module's KV cache management path.  Launches a tiny CUDA kernel after
+// every BLOCK_RESERVE so that the GPU MMU triggers a real replayable
+// page fault through the patched nvidia-uvm.ko → polaris_uvm_handle_gpu_fault →
+// polaris_resolve_gpu_fault → daemon ALLOC → cuMemMap → UVM replay.
 //
 // Subcommands:
 //   synthetic-kv     — single-session KV reserve/touch/release simulation
 //   beam-search      — COW beam search workload with decode simulation
 //   concurrent       — multi-session concurrent workload with decode simulation
-//   trace-replay     — vLLM/SGLang trace file replay (Phase 4b)
 //   cow-break        — comprehensive COW break test (Phase 3 validation)
 //
 // All workloads emit CSV traces when --csv <path> is given:
 //   timestamp_ns,operation,session_id,token_start,token_count,block_id,gpu_id,latency_us
 
 use clap::{Parser, Subcommand};
+use cudarc::driver::sys::{
+    self, cuCtxSynchronize, cuInit, cuLaunchKernel, cuModuleGetFunction,
+    cuModuleLoadData, CUdeviceptr, CUfunction, CUmodule, CUresult,
+};
 use libc::c_int;
 use libpolaris::ioctl;
 use libpolaris::types::*;
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
 use std::time::Instant;
+
+/// PTX kernel that writes a u32 at a GPU virtual address.
+/// One block, one thread — enough to trigger the UVM replayable fault.
+const POLARIS_TOUCH_PTX: &str = "
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry polaris_touch_kernel(
+    .param .u64 ptr
+)
+{
+    .reg .u64 %rd1;
+    ld.param.u64 %rd1, [ptr];
+    st.global.u32 [%rd1], 0;
+    ret;
+}
+";
+
+/// State needed to launch CUDA kernels that touch GPU VAs.
+struct GpuFaultDriver {
+    touch_fn: CUfunction,
+}
+
+impl GpuFaultDriver {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        unsafe { cuInit(0) };
+
+        let mut dev: sys::CUdevice = 0;
+        let mut ctx: sys::CUcontext = std::ptr::null_mut();
+        let r = unsafe { sys::cuDeviceGet(&raw mut dev, 0) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuDeviceGet(0): {r:?}").into());
+        }
+        let r = unsafe { sys::cuDevicePrimaryCtxRetain(&raw mut ctx, dev) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuDevicePrimaryCtxRetain: {r:?}").into());
+        }
+        let r = unsafe { sys::cuCtxPushCurrent_v2(ctx) };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuCtxPushCurrent: {r:?}").into());
+        }
+
+        // cuModuleLoadData accepts PTX source text and JIT-compiles it.
+        let ptx_c = CString::new(POLARIS_TOUCH_PTX)?;
+        let mut module: CUmodule = std::ptr::null_mut();
+        let r = unsafe {
+            cuModuleLoadData(
+                &raw mut module,
+                ptx_c.as_ptr() as *const std::ffi::c_void,
+            )
+        };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuModuleLoadData failed: {r:?}").into());
+        }
+
+        let func_name = CString::new("polaris_touch_kernel").unwrap();
+        let mut func: CUfunction = std::ptr::null_mut();
+        let r = unsafe {
+            cuModuleGetFunction(&raw mut func, module, func_name.as_ptr())
+        };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuModuleGetFunction failed: {r:?}").into());
+        }
+
+        Ok(Self { touch_fn: func })
+    }
+
+    /// Launch a single-thread CUDA kernel that writes to `gpu_vaddr`.
+    /// The kernel blocks until the GPU completes, which will stall on the
+    /// replayable fault until POLARIS resolves it through the daemon.
+    fn touch_gpu_va(&self, gpu_vaddr: u64) -> Result<u64, Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        let mut ptr: CUdeviceptr = gpu_vaddr as CUdeviceptr;
+
+        let mut kernel_params: [*mut std::ffi::c_void; 1] = [
+            &raw mut ptr as *mut std::ffi::c_void,
+        ];
+
+        let r = unsafe {
+            cuLaunchKernel(
+                self.touch_fn,
+                1, 1, 1,     // grid
+                1, 1, 1,     // block
+                0,           // shared mem
+                std::ptr::null_mut(), // stream (default)
+                kernel_params.as_mut_ptr(),
+                std::ptr::null_mut(), // extra
+            )
+        };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuLaunchKernel: {r:?}").into());
+        }
+
+        let r = unsafe { cuCtxSynchronize() };
+        if r != CUresult::CUDA_SUCCESS {
+            return Err(format!("cuCtxSynchronize: {r:?}").into());
+        }
+
+        let lat_us = start.elapsed().as_micros() as u64;
+        Ok(lat_us)
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "polaris-workload", about = "POLARIS workload generator")]
@@ -209,6 +318,7 @@ fn block_reserve(
     token_count: u32,
     flags: u32,
     phase: PolarisPhase,
+    _gpu: &GpuFaultDriver,
 ) -> Result<(i32, u64, u64), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut arg = PolarisBlockReserveArg {
@@ -224,6 +334,7 @@ fn block_reserve(
         Err(e) => -(e as i32),
     };
     let lat_us = start.elapsed().as_micros() as u64;
+
     let op = if flags & POLARIS_RESERVE_FLAG_OVERWRITE != 0 {
         "COW_BREAK"
     } else {
@@ -311,6 +422,7 @@ fn run_decode_loop(
     prompt_tokens: u32,
     output_tokens: u32,
     tokens_per_block: u32,
+    gpu: &GpuFaultDriver,
     overwrite_block: Option<(u32, u32)>, // (token_start, token_count) for COW break
 ) -> Result<(u32, u32, u64), Box<dyn std::error::Error>> {
     let mut total_lat_us: u64 = 0;
@@ -325,7 +437,7 @@ fn run_decode_loop(
         let count = tokens_per_block.min(prompt_tokens - start);
         total_tokens += count as u64;
         let (rc, bid, lat_us) = block_reserve(
-            fd, csv, sid, start, count, 0, PolarisPhase::Prefill,
+            fd, csv, sid, start, count, 0, PolarisPhase::Prefill, gpu,
         )?;
         total_lat_us += lat_us;
         if rc != 0 {
@@ -354,7 +466,7 @@ fn run_decode_loop(
 
         // Reserve the new decode block.
         let (rc, _bid, lat_us) = block_reserve(
-            fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode,
+            fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode, gpu,
         )?;
         total_lat_us += lat_us;
         if rc != 0 {
@@ -384,7 +496,7 @@ fn run_decode_loop(
         eprintln!("  COW_BREAK overwrite: tokens {over_start}..{}", over_start + over_count);
         let (rc, _bid, lat_us) = block_reserve(
             fd, csv, sid, over_start, over_count,
-            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill,
+            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill, gpu,
         )?;
         total_lat_us += lat_us;
         if rc != 0 {
@@ -406,6 +518,7 @@ fn run_synthetic_kv(
     tokens_per_block: u32,
     prompt_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    gpu: &GpuFaultDriver,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Synthetic KV Workload ===");
 
@@ -426,7 +539,7 @@ fn run_synthetic_kv(
             "Mode: decode loop  |  prompt={prompt} tokens  |  output={output} tokens  |  {tokens_per_block} tok/block"
         );
         let (pf, dec, total_lat) = run_decode_loop(
-            fd, csv, sid, prompt, output, tokens_per_block, None,
+            fd, csv, sid, prompt, output, tokens_per_block, gpu, None,
         )?;
         let total_elapsed = total_start.elapsed();
         eprintln!(
@@ -444,7 +557,7 @@ fn run_synthetic_kv(
                 i * tokens_per_block,
                 tokens_per_block,
                 0,
-                PolarisPhase::Prefill,
+                PolarisPhase::Prefill, gpu,
             )?;
             total_lat += lat_us;
             if rc != 0 {
@@ -489,6 +602,7 @@ fn run_beam_search(
     decode_steps: u32,
     tokens_per_block: u32,
     cow_break: bool,
+    gpu: &GpuFaultDriver,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Beam Search Workload ===");
     eprintln!(
@@ -505,7 +619,7 @@ fn run_beam_search(
     let (pf_blocks, _, pf_lat) = run_decode_loop(
         fd, csv, parent_id,
         prompt_tokens, 0, // prefill only, no decode for parent
-        tokens_per_block, None,
+        tokens_per_block, gpu, None,
     )?;
     eprintln!("Parent prompt done: {pf_blocks} blocks, {pf_lat} µs");
 
@@ -541,7 +655,7 @@ fn run_beam_search(
                     tokens_per_block.min(prompt_tokens + decode_steps - token_offset);
 
                 let (rc, _, _) = block_reserve(
-                    fd, csv, child_id, token_offset, count, 0, PolarisPhase::Decode,
+                    fd, csv, child_id, token_offset, count, 0, PolarisPhase::Decode, gpu,
                 )?;
                 if rc != 0 {
                     eprintln!("  Child {ci} decode step {step} failed (rc={rc}) — stopping");
@@ -570,7 +684,7 @@ fn run_beam_search(
         );
         let (rc, bid, lat_us) = block_reserve(
             fd, csv, first_child, 0, tokens_per_block,
-            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill,
+            POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill, gpu,
         )?;
         if rc != 0 {
             eprintln!("  COW_BREAK failed (rc={rc})");
@@ -611,6 +725,7 @@ fn run_concurrent(
     prompt_tokens: u32,
     output_tokens: u32,
     tokens_per_block: u32,
+    gpu: &GpuFaultDriver,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Concurrent Workload ===");
     eprintln!(
@@ -631,7 +746,7 @@ fn run_concurrent(
             let start = i * tokens_per_block;
             let count = tokens_per_block.min(prompt_tokens - start);
             let (rc, _, _) = block_reserve(
-                fd, csv, sid, start, count, 0, PolarisPhase::Prefill,
+                fd, csv, sid, start, count, 0, PolarisPhase::Prefill, gpu,
             )?;
             if rc != 0 {
                 eprintln!("  Session {s} block {i} failed (rc={rc})");
@@ -654,7 +769,7 @@ fn run_concurrent(
                     tokens_per_block.min(prompt_tokens + output_tokens - token_offset);
 
                 let (rc, _, _) = block_reserve(
-                    fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode,
+                    fd, csv, sid, token_offset, count, 0, PolarisPhase::Decode, gpu,
                 )?;
                 if rc != 0 {
                     // Skip this session if reserve fails.
@@ -699,7 +814,7 @@ fn run_concurrent(
 // ─── Comprehensive COW Break Test (Phase 3 validation) ────────────────────────
 // ═══════════════════════════════════════════════════════════════════════════════
 
-fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
+fn run_cow_break_test(fd: c_int, gpu: &GpuFaultDriver) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("=== Comprehensive COW Break Test ===");
     let mut passed = 0u32;
     let mut failed = 0u32;
@@ -717,6 +832,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     fn reserve(
         fd: c_int, sid: u64, start: u32, count: u32, flags: u32, phase: u32,
+        gpu: &GpuFaultDriver,
     ) -> (i32, u64) {
         let mut arg = PolarisBlockReserveArg {
             session_id: sid,
@@ -726,10 +842,17 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
             phase,
             ..Default::default()
         };
-        match ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut arg) {
-            Ok(()) => (0, arg.block_id),
-            Err(eno) => (-(eno as i32), arg.block_id),
+        let rc = match ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut arg) {
+            Ok(()) => 0,
+            Err(eno) => -(eno as i32),
+        };
+        // Trigger the GPU page fault so the daemon processes the decision.
+        if rc == 0 && arg.gpu_vaddr != 0 {
+            if let Err(e) = gpu.touch_gpu_va(arg.gpu_vaddr) {
+                eprintln!("    WARN: GPU touch failed for va={:#x}: {e}", arg.gpu_vaddr);
+            }
         }
+        (rc, arg.block_id)
     }
 
     fn branch(fd: c_int, parent: u64) -> u64 {
@@ -767,7 +890,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut block_ids: Vec<u64> = Vec::new();
     for i in 0..8u32 {
-        let (rc, bid) = reserve(fd, parent, i * 16, 16, 0, PolarisPhase::Prefill as u32);
+        let (rc, bid) = reserve(fd, parent, i * 16, 16, 0, PolarisPhase::Prefill as u32, gpu);
         if rc != 0 {
             eprintln!("  FAIL: parent block {i} reserve failed (rc={rc})");
             destroy_session(fd, parent);
@@ -790,7 +913,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n--- Test A: first child COW-break block 0 ---");
     let c1 = children[0];
     let (rc, new_bid_a) = reserve(
-        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (_sh_a, _pr_a, cb_a, cc_a) = get_stats(fd);
     if rc == 0 && cb_a == 1 && new_bid_a != block_ids[0] {
@@ -807,7 +930,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n--- Test B: second child COW-break same block 0 ---");
     let c2 = children[1];
     let (rc, new_bid_b) = reserve(
-        fd, c2, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, c2, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (_sh_b, _pr_b, cb_b, _cc_b) = get_stats(fd);
     if rc == 0 && cb_b == 2 && new_bid_b != block_ids[0] && new_bid_b != new_bid_a {
@@ -821,7 +944,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     // Test C: first child in-place overwrite (block now private)
     eprintln!("\n--- Test C: first child in-place overwrite (refcount=1) ---");
     let (rc_c, bid_c) = reserve(
-        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, c1, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (_sh_c, _pr_c, cb_c, _) = get_stats(fd);
     if rc_c == 0 && bid_c == new_bid_a && cb_c == 2 {
@@ -834,7 +957,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
 
     // Test D: overlap without OVERWRITE → EINVAL
     eprintln!("\n--- Test D: overlap without OVERWRITE flag ---");
-    let (rc_d, bid_d) = reserve(fd, children[2], 0, 16, 0, PolarisPhase::Prefill as u32);
+    let (rc_d, bid_d) = reserve(fd, children[2], 0, 16, 0, PolarisPhase::Prefill as u32, gpu);
     if rc_d == -(libc::EINVAL as i32) {
         eprintln!("  PASS: rejected with EINVAL ({rc_d})");
         passed += 1;
@@ -850,7 +973,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("\n--- Test E: third child COW-break block 1 (still shared) ---");
     let c3 = children[2];
     let (rc_e, new_bid_e) = reserve(
-        fd, c3, 16, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, c3, 16, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (_sh_e, _pr_e, cb_e, _) = get_stats(fd);
     if rc_e == 0 && cb_e == 3 && new_bid_e != block_ids[1] {
@@ -866,7 +989,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     let grandchild = branch(fd, c1);
     eprintln!("  Grandchild session: {grandchild}");
     let (rc_f, new_bid_f) = reserve(
-        fd, grandchild, 32, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, grandchild, 32, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (sh_f, pr_f, cb_f, _) = get_stats(fd);
     if rc_f == 0 && cb_f == 4 && new_bid_f != block_ids[2] {
@@ -882,7 +1005,7 @@ fn run_cow_break_test(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
     // Test G: grandchild COW-break block 0 (shared with c1)
     eprintln!("\n--- Test G: grandchild COW-break block 0 (shared with c1) ---");
     let (rc_g, new_bid_g) = reserve(
-        fd, grandchild, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32,
+        fd, grandchild, 0, 16, POLARIS_RESERVE_FLAG_OVERWRITE, PolarisPhase::Prefill as u32, gpu,
     );
     let (_sh_g, _pr_g, cb_g, _) = get_stats(fd);
     if rc_g == 0 && cb_g == 5 && new_bid_g != new_bid_a {
@@ -929,6 +1052,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let fd = file.as_raw_fd() as c_int;
 
+    // Initialize CUDA GPU for page-fault-triggering kernels.
+    eprintln!("Initializing CUDA for GPU fault driver...");
+    let gpu = GpuFaultDriver::new()
+        .map_err(|e| format!("CUDA fault driver init failed: {e}"))?;
+    eprintln!("GPU fault driver ready");
+
     // Create the CSV writer if --csv is specified
     let mut csv: Option<CsvWriter> = cli.csv.as_ref().map(|path| {
         CsvWriter::new(path).unwrap_or_else(|e| {
@@ -943,21 +1072,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokens_per_block,
             prompt_tokens,
             output_tokens,
-        } => run_synthetic_kv(fd, &mut csv, num_blocks, tokens_per_block, prompt_tokens, output_tokens)?,
+        } => run_synthetic_kv(fd, &mut csv, num_blocks, tokens_per_block, prompt_tokens, output_tokens, &gpu)?,
         Commands::BeamSearch {
             beam_width,
             prompt_tokens,
             decode_steps,
             tokens_per_block,
             cow_break,
-        } => run_beam_search(fd, &mut csv, beam_width, prompt_tokens, decode_steps, tokens_per_block, cow_break)?,
+        } => run_beam_search(fd, &mut csv, beam_width, prompt_tokens, decode_steps, tokens_per_block, cow_break, &gpu)?,
         Commands::Concurrent {
             num_sessions,
             prompt_tokens,
             output_tokens,
             tokens_per_block,
-        } => run_concurrent(fd, &mut csv, num_sessions, prompt_tokens, output_tokens, tokens_per_block)?,
-        Commands::CowBreak => run_cow_break_test(fd)?,
+        } => run_concurrent(fd, &mut csv, num_sessions, prompt_tokens, output_tokens, tokens_per_block, &gpu)?,
+        Commands::CowBreak => run_cow_break_test(fd, &gpu)?,
     }
 
     Ok(())

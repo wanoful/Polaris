@@ -12,3 +12,4 @@ path = "src/main.rs"
 libpolaris = { path = "../libpolaris" }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+cudarc = { version = "0.19.4", features = ["cuda-13020"] }
