@@ -832,7 +832,7 @@ fn run_cow_break_test(fd: c_int, gpu: &GpuFaultDriver) -> Result<(), Box<dyn std
 
     fn reserve(
         fd: c_int, sid: u64, start: u32, count: u32, flags: u32, phase: u32,
-        gpu: &GpuFaultDriver,
+        _gpu: &GpuFaultDriver,
     ) -> (i32, u64) {
         let mut arg = PolarisBlockReserveArg {
             session_id: sid,
@@ -846,12 +846,6 @@ fn run_cow_break_test(fd: c_int, gpu: &GpuFaultDriver) -> Result<(), Box<dyn std
             Ok(()) => 0,
             Err(eno) => -(eno as i32),
         };
-        // Trigger the GPU page fault so the daemon processes the decision.
-        if rc == 0 && arg.gpu_vaddr != 0 {
-            if let Err(e) = gpu.touch_gpu_va(arg.gpu_vaddr) {
-                eprintln!("    WARN: GPU touch failed for va={:#x}: {e}", arg.gpu_vaddr);
-            }
-        }
         (rc, arg.block_id)
     }
 
