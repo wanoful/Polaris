@@ -67,8 +67,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Compute budget (use 75% of total GPU memory for KV cache).
     let budget_bytes = info.total_memory * 3 / 4;
-    // CPU pool: 2x GPU memory for offload (Phase 2 feature, but reserve it now).
-    let cpu_pool_bytes = info.total_memory * 2;
+    // CPU pool: 4 GiB for offload testing (Phase 2 feature, reserve a
+    // reasonable amount rather than 2× GPU memory).
+    let cpu_pool_bytes = 4 * 1024 * 1024 * 1024u64;
 
     // Pre-allocate CPU pinned memory pool for block offloads.
     let (cpu_pool_bytes, cpu_pool_base) = match cuda_vmm::allocate_host(cpu_pool_bytes) {
@@ -115,6 +116,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         budget_bytes / (1024 * 1024),
         cpu_pool_bytes / (1024 * 1024),
     );
+
+    // Register the global GPU VA pool with the kernel so that the UVM
+    // fault hook can match fault addresses to POLARIS blocks.
+    {
+        let mut va_arg = PolarisRegisterVaRangeArg {
+            gpu_id: info.index,
+            base: vas_base,
+            length: vas_size,
+            block_size: POLARIS_DEFAULT_BYTES_PER_TOKEN * 16,
+            ..Default::default()
+        };
+        ioctl::ioctl_read(fd, ioctl::POLARIS_REGISTER_VA_RANGE, &mut va_arg)
+            .map_err(|e| format!("REGISTER_VA_RANGE failed: errno {e}"))?;
+        eprintln!(
+            "polarisd: VA range registered (range_id={}, base={:#x}, length={} GiB)",
+            va_arg.range_id,
+            va_arg.base,
+            va_arg.length / (1024 * 1024 * 1024),
+        );
+    }
 
     // Build per-GPU state.
     let mut gpu_state = GpuState::new(

@@ -38,6 +38,7 @@ const POLARIS_UVM_FAULT_NOT_MINE: i32 = 0;
 const POLARIS_UVM_FAULT_HANDLED: i32 = 1;
 const POLARIS_UVM_FAULT_ERROR: i32 = -1;
 
+#[derive(PartialEq)]
 enum PolarisUvmFaultResult {
     NotMine,
     Handled,
@@ -114,12 +115,20 @@ fn polaris_resolve_gpu_fault(
         return Ok(PolarisUvmFaultResult::NotMine);
     }
 
-    let block_idx = match inner.blocks.iter().position(|b| {
-        b.home_gpu == gpu_id
-            && fault_address >= b.gpu_vaddr
-            && fault_address < b.gpu_vaddr.saturating_add(b.size_bytes)
-    }) {
-        Some(idx) => idx,
+    // Search from the end so that newly-created pending blocks are
+    // matched before older resident blocks that share the same VA
+    // (COW break creates a CowPending block at the same VA as the
+    // original shared block).
+    let block_idx = match inner.blocks.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, b)| {
+            b.home_gpu == gpu_id
+                && fault_address >= b.gpu_vaddr
+                && fault_address < b.gpu_vaddr.saturating_add(b.size_bytes)
+        })
+    {
+        Some((idx, _)) => idx,
         None => return Ok(PolarisUvmFaultResult::Error),
     };
     let fault_id = inner.next_fault_id;
@@ -157,7 +166,11 @@ fn polaris_resolve_gpu_fault(
         block.fault_timeout_ms = POLARIS_DEFAULT_FAULT_TIMEOUT_MS;
         block_id = block.block_id;
         session_id = block.session_id;
-        src_handle = block.gpu_phys_handle;
+        src_handle = if block.state == PolarisBlockState::CowPending {
+            block.cow_src_handle
+        } else {
+            block.gpu_phys_handle
+        };
         dst_vaddr = block.gpu_vaddr;
         size_bytes = block.size_bytes;
         cpu_addr = block.cpu_buf_addr;
@@ -190,7 +203,7 @@ fn polaris_resolve_gpu_fault(
             src_handle,
             dst_handle: 0,
             src_vaddr: fault_address,
-            dst_vaddr,
+            dst_vaddr: if op == PolarisDecisionOp::CowBreak { 0 } else { dst_vaddr },
             size_bytes,
             cpu_addr,
             access_flags: access_type,
@@ -986,6 +999,7 @@ impl PolarisDevice {
             .find(|s| s.session_id == arg.parent_session_id)
             .ok_or(ENOENT)?;
         let parent_gpu = parent.home_gpu;
+        let parent_vas_base = parent.gpu_vas_base;
         let parent_vas_size = parent.gpu_vas_size;
         let parent_beam = parent.beam_width;
         let parent_bpt = parent.bytes_per_token;
@@ -1023,7 +1037,7 @@ impl PolarisDevice {
             PolarisSession {
                 session_id: child_id,
                 home_gpu: parent_gpu,
-                gpu_vas_base: 0,
+                gpu_vas_base: parent_vas_base,
                 gpu_vas_size: parent_vas_size,
                 beam_width: parent_beam,
                 bytes_per_token: parent_bpt,
@@ -1053,8 +1067,141 @@ impl PolarisDevice {
         if !inner.sessions.iter().any(|s| s.session_id == arg.session_id) {
             return Err(ENOENT);
         }
+        // Extract all fields from the session reference before any
+        // mutable borrow of inner.sessions below.
         let sess = inner.sessions.iter().find(|s| s.session_id == arg.session_id).ok_or(ENOENT)?;
-        let gpu_vaddr = sess.gpu_vas_base + ((arg.token_start as u64) * sess.bytes_per_token);
+        let gpu_vas_base = sess.gpu_vas_base;
+        let bytes_per_token = sess.bytes_per_token;
+        let home_gpu = sess.home_gpu;
+        let gpu_vaddr = gpu_vas_base + ((arg.token_start as u64) * bytes_per_token);
+        let size_bytes = (arg.token_count as u64).saturating_mul(bytes_per_token);
+        let req_start = arg.token_start as u64;
+        let req_end = req_start + arg.token_count as u64;
+        let overwrite = arg.flags & POLARIS_RESERVE_FLAG_OVERWRITE != 0;
+        let mut existing_block_idx: Option<usize> = None;
+
+        // Collect all block IDs accessible to this session (directly
+        // owned + COW-shared from parent).
+        let mut session_bids: KVec<u64> = KVec::new();
+        for &bid in &sess.block_ids {
+            session_bids.push(bid, GFP_KERNEL)?;
+        }
+
+        // ── Phase-2 COW logic ──────────────────────────────────────────
+        // Two-phase overlap detection:
+        //   Pass 1: directly-owned blocks (session_id matches)
+        //   Pass 2: COW-shared blocks (in session block_ids but
+        //            different session_id)
+        // This ordering ensures that a post-COW-break private block
+        // (refcount==1) is found before the original shared block.
+
+        // Pass 1: directly-owned blocks.
+        for (i, b) in inner.blocks.iter().enumerate() {
+            if b.session_id == arg.session_id {
+                let b_start = b.token_start as u64;
+                let b_end = b_start + b.token_count as u64;
+                if req_start < b_end && req_end > b_start {
+                    if !overwrite {
+                        return Err(EINVAL);
+                    }
+                    existing_block_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        if existing_block_idx.is_none() {
+            // Pass 2: COW-shared blocks (different session_id, but in this
+            // session's block_ids list).
+            for (i, b) in inner.blocks.iter().enumerate() {
+                if session_bids.iter().any(|&bid| bid == b.block_id) {
+                    let b_start = b.token_start as u64;
+                    let b_end = b_start + b.token_count as u64;
+                    if req_start < b_end && req_end > b_start {
+                        if !overwrite {
+                            return Err(EINVAL);
+                        }
+                        existing_block_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(eb_idx) = existing_block_idx {
+            let eb = &mut inner.blocks[eb_idx];
+            if eb.refcount > 1 {
+                // COW break: create a private copy.
+                let block_id = inner.next_block_id;
+                inner.next_block_id += 1;
+                let cow_src = eb.gpu_phys_handle;
+                eb.refcount -= 1;
+                if eb.refcount == 1 {
+                    eb.flags = eb.flags & !PolarisBlockFlag::Shared;
+                }
+                inner.blocks.push(
+                    PolarisBlock {
+                        block_id,
+                        session_id: arg.session_id,
+                        token_start: arg.token_start,
+                        token_count: arg.token_count,
+                        home_gpu,
+                        gpu_vaddr,
+                        gpu_phys_handle: 0,
+                        cpu_buf_addr: 0,
+                        size_bytes,
+                        refcount: 1,
+                        state: PolarisBlockState::CowPending,
+                        flags: PolarisBlockFlags::empty(),
+                        phase: if arg.phase == PolarisPhase::Decode as u32 {
+                            PolarisPhase::Decode
+                        } else {
+                            PolarisPhase::Prefill
+                        },
+                        last_touch_ns: 0,
+                        map_time_ns: 0,
+                        cow_src_handle: cow_src,
+                        retry_count: 0,
+                        pending_decision_id: 0,
+                        pending_fault_id: 0,
+                        pending_generation: 0,
+                        fault_timeout_ms: POLARIS_DEFAULT_FAULT_TIMEOUT_MS,
+                        completion_ptr: core::ptr::null_mut(),
+                    },
+                    GFP_KERNEL,
+                )?;
+                if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+                    session.block_ids.push(block_id, GFP_KERNEL)?;
+                }
+                arg.block_id = block_id;
+                arg.gpu_vaddr = gpu_vaddr;
+                drop(guard);
+                let mut writer = UserSlice::new(user_ptr, size).writer();
+                writer.write(&arg)?;
+
+                let fault_result = polaris_resolve_gpu_fault(
+                    home_gpu,
+                    gpu_vaddr,
+                    1, // access_type: write (COW break)
+                )?;
+                if fault_result != PolarisUvmFaultResult::Handled {
+                    return Err(EIO);
+                }
+                return Ok(0);
+            }
+            // refcount == 1: in-place overwrite — return existing block.
+            eb.token_start = arg.token_start;
+            eb.token_count = arg.token_count;
+            eb.size_bytes = size_bytes;
+            eb.gpu_vaddr = gpu_vaddr;
+            arg.block_id = eb.block_id;
+            arg.gpu_vaddr = gpu_vaddr;
+            drop(guard);
+            let mut writer = UserSlice::new(user_ptr, size).writer();
+            writer.write(&arg)?;
+            return Ok(0);
+        }
+
+        // No overlap: create a fresh block (normal path).
         let block_id = inner.next_block_id;
         inner.next_block_id += 1;
         inner.blocks.push(
@@ -1063,11 +1210,11 @@ impl PolarisDevice {
                 session_id: arg.session_id,
                 token_start: arg.token_start,
                 token_count: arg.token_count,
-                home_gpu: sess.home_gpu,
+                home_gpu,
                 gpu_vaddr,
                 gpu_phys_handle: 0,
                 cpu_buf_addr: 0,
-                size_bytes: (arg.token_count as u64).saturating_mul(sess.bytes_per_token),
+                size_bytes,
                 refcount: 1,
                 state: PolarisBlockState::Unmapped,
                 flags: PolarisBlockFlags::empty(),
@@ -1096,6 +1243,23 @@ impl PolarisDevice {
         drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
+
+        // Simulate the GPU first-touch page fault that would normally be
+        // delivered through the NVIDIA UVM replayable-fault hook.  This
+        // exercises the full kernel→daemon→kernel decision protocol
+        // (ALLOC + cuMemMap) without requiring a real CUDA kernel launch.
+        // In production the UVM hook calls polaris_resolve_gpu_fault
+        // directly; the synthetic path calls the same function so the
+        // daemon-side execution is identical.
+        let fault_result = polaris_resolve_gpu_fault(
+            home_gpu,
+            gpu_vaddr,
+            0,           // access_type: 0 = read
+        )?;
+        if fault_result != PolarisUvmFaultResult::Handled {
+            return Err(EIO);
+        }
+
         Ok(0)
     }
 

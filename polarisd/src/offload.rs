@@ -216,7 +216,7 @@ pub fn execute_offload(
     // Update GPU-side tracking: phys handle released, VA remains reserved.
     gpu.clear_handle(dec.block_id);
     gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
-    gpu.track_va(dec.block_id, src_vaddr, size);
+    gpu.track_va(dec.block_id, src_vaddr, size, false);
 
     eprintln!(
         "polarisd: OFFLOAD block {} complete: GPU VA {src_vaddr:#x} → CPU buffer {cpu_addr:#x}",
@@ -306,7 +306,7 @@ pub fn execute_reload(
 
     // Update daemon tracking.
     gpu.track_handle(dec.block_id, new_phys);
-    gpu.track_va(dec.block_id, vaddr, size);
+    gpu.track_va(dec.block_id, vaddr, size, false);
     gpu.used_bytes += size;
 
     eprintln!(

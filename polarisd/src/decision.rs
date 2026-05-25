@@ -158,7 +158,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
             }
 
             gpu.track_handle(dec.block_id, phys);
-            gpu.track_va(dec.block_id, vaddr, size);
+            gpu.track_va(dec.block_id, vaddr, size, dst.release_to_pool);
             gpu.used_bytes += size;
             output_handle = phys;
 
@@ -223,7 +223,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
                 let _ = cuda_vmm::unmap_memory(dec.dst_vaddr, size);
                 result = -(libc::EINVAL as i32);
             } else {
-                gpu.track_va(dec.block_id, dec.dst_vaddr, size);
+                gpu.track_va(dec.block_id, dec.dst_vaddr, size, false);
                 eprintln!("polarisd: MAP_EXISTING block {} -> phys={:#x} va={:#x}", dec.block_id, dec.src_handle, dec.dst_vaddr);
             }
         }
@@ -404,7 +404,7 @@ fn dispatch(dec: &PolarisDecision, gpu: &mut GpuState, cpu_pool: &mut CpuPool) -
 
             // Success: track the new block.
             gpu.track_handle(dec.block_id, new_phys);
-            gpu.track_va(dec.block_id, dst_vaddr, size);
+            gpu.track_va(dec.block_id, dst_vaddr, size, dst.release_to_pool);
             gpu.used_bytes += size;
             output_handle = new_phys;
 

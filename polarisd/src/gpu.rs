@@ -18,6 +18,9 @@ pub struct GpuVaPool {
 pub struct VaAlloc {
     pub vaddr: u64,
     pub size: u64,
+    /// true when the VA was obtained from GpuVaPool::allocate();
+    /// false when the VA was kernel-assigned (from BLOCK_RESERVE / fault path).
+    pub from_pool: bool,
 }
 
 /// Per-GPU state tracked by the daemon.
@@ -146,6 +149,32 @@ impl GpuVaPool {
         }
     }
 
+    /// Remove a specific VA range from the free list without merging.
+    /// Used to reserve kernel-assigned VAs so the pool doesn't re-issue them.
+    pub fn remove(&mut self, vaddr: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        for idx in 0..self.free_ranges.len() {
+            let (r_start, r_size) = self.free_ranges[idx];
+            if vaddr >= r_start && vaddr + size <= r_start + r_size {
+                let before = vaddr - r_start;
+                let after = (r_start + r_size) - (vaddr + size);
+                if before == 0 && after == 0 {
+                    self.free_ranges.remove(idx);
+                } else if before == 0 {
+                    self.free_ranges[idx] = (vaddr + size, after);
+                } else if after == 0 {
+                    self.free_ranges[idx] = (r_start, before);
+                } else {
+                    self.free_ranges[idx] = (r_start, before);
+                    self.free_ranges.insert(idx + 1, (vaddr + size, after));
+                }
+                return;
+            }
+        }
+    }
+
     /// Human-readable usage for diagnostics.
     #[allow(dead_code)]
     pub fn free_bytes(&self) -> u64 {
@@ -187,8 +216,11 @@ impl GpuState {
         self.phys_handles.insert(block_id, phys_handle);
     }
 
-    pub fn track_va(&mut self, block_id: u64, vaddr: u64, size: u64) {
-        self.va_allocs.insert(block_id, VaAlloc { vaddr, size });
+    pub fn track_va(&mut self, block_id: u64, vaddr: u64, size: u64, from_pool: bool) {
+        self.va_allocs.insert(block_id, VaAlloc { vaddr, size, from_pool });
+        if !from_pool {
+            self.vas.remove(vaddr, size);
+        }
     }
 
     pub fn get_handle(&self, block_id: u64) -> Option<u64> {
@@ -221,11 +253,15 @@ impl GpuState {
         size > 0 && vaddr >= self.vas.base && vaddr.saturating_add(size) <= self.vas.base + self.vas.size
     }
 
-    /// Remove block tracking and return its VA to the pool.
+    /// Remove block tracking and return its VA to the pool if it was
+    /// pool-allocated.  Kernel-assigned VAs (from fault path) are NOT
+    /// returned to the pool — the kernel owns VA assignment for those.
     pub fn remove_block(&mut self, block_id: u64) {
         self.phys_handles.remove(&block_id);
         if let Some(va) = self.va_allocs.remove(&block_id) {
-            self.vas.free(va.vaddr, va.size);
+            if va.from_pool {
+                self.vas.free(va.vaddr, va.size);
+            }
         }
     }
 
