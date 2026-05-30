@@ -114,7 +114,8 @@ in POLARIS-managed GPU VA; the M3 runtime API gives a safe substrate for
 block-granular paging and offload. Given the raw-VMM fault result above, the
 near-term benchmarkable system is an explicit POLARIS KV pager: llama.cpp
 prefetches/reloads the blocks it is about to use and POLARIS offloads cold
-blocks under a resident-memory budget.
+blocks under a resident-memory budget. See `docs/fault-driven-analysis.md` for
+the current M4 feasibility audit and raw CUDA VMM fault evidence.
 
 **Driver takeover finding:** A standalone third-party module cannot cleanly
 preempt UVM after it has claimed replayable page faults. The practical path
