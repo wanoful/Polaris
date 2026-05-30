@@ -1148,6 +1148,7 @@ impl PolarisDevice {
                         gpu.cpu_pool_used_bytes = gpu.cpu_pool_used_bytes.saturating_sub(sz);
                     }
                 }
+                block.refcount = 0;
                 dev_info!(
                     self.dev,
                     "POLARIS: session {} destroy: block {} freed directly\n",
@@ -1464,9 +1465,14 @@ impl PolarisDevice {
         }
         arg.block_id = block_id;
         arg.gpu_vaddr = gpu_vaddr;
+        let defer_fault = arg.flags & POLARIS_RESERVE_FLAG_DEFER_FAULT != 0;
         drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
+
+        if defer_fault {
+            return Ok(0);
+        }
 
         // Trigger the GPU page-fault pipeline through the same entry point
         // that the patched nvidia-uvm.ko replayable-fault ISR uses.  This

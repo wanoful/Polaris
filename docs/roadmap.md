@@ -99,15 +99,22 @@ The implementation is being staged so each step is testable on real hardware:
   decision worker with `LLAMA_POLARIS_FAULT_WORKER=1`. A runtime integration
   smoke now verifies the kernel fault resolver's decision path by using
   `BLOCK_RESERVE` to queue an `ALLOC` decision, letting the runtime worker map
-  the block, and then reading/writing the returned GPU VA. The remaining M4
-  work is a true replayable GPU-fault smoke where a CUDA kernel touches an
-  intentionally unmapped POLARIS VA and the patched UVM bottom half drives the
-  same decision path.
+  the block, and then reading/writing the returned GPU VA. A second diagnostic
+  smoke intentionally leaves a raw CUDA VMM VA unmapped and launches a CUDA
+  kernel against it; on the current driver this produces a fatal NVIDIA Xid 31
+  MMU `FAULT_PDE ACCESS_TYPE_VIRT_WRITE` and `cudaErrorIllegalAddress`, with no
+  POLARIS decision queued. This is evidence that raw CUDA VMM holes are not
+  automatically serviced as UVM replayable faults. The next production path is
+  therefore explicit prefetch/offload from llama.cpp, while the true
+  fault-driven path remains a driver-hook research item.
 
 Until M3/M4 are complete end-to-end in llama.cpp, POLARIS is not yet a
 fault-driven KV pager. M2 proves that llama.cpp can run with KV tensors located
 in POLARIS-managed GPU VA; the M3 runtime API gives a safe substrate for
-block-granular paging and offload.
+block-granular paging and offload. Given the raw-VMM fault result above, the
+near-term benchmarkable system is an explicit POLARIS KV pager: llama.cpp
+prefetches/reloads the blocks it is about to use and POLARIS offloads cold
+blocks under a resident-memory budget.
 
 **Driver takeover finding:** A standalone third-party module cannot cleanly
 preempt UVM after it has claimed replayable page faults. The practical path
@@ -683,6 +690,7 @@ struct polaris_session_create_arg {
 #define POLARIS_RESERVE_FLAG_READ_MOSTLY (1 << 1)
 #define POLARIS_RESERVE_FLAG_WRITE_NEW   (1 << 2)
 #define POLARIS_RESERVE_FLAG_FULL_OVERWRITE_NO_PRESERVE (1 << 3)
+#define POLARIS_RESERVE_FLAG_DEFER_FAULT (1 << 4) // debug: register block but let real GPU fault trigger mapping
 #define POLARIS_RELEASE_FLAG_STREAM_QUIESCED (1 << 0)
 
 /* --- Block reserve (workload → kernel metadata, no GPU allocation) --- */
@@ -744,11 +752,16 @@ logical KV ranges; physical mapping is still driven by the fault decision path.
 
 `POLARIS_BLOCK_RESERVE` is the normal allocation-facing API after the
 interrupt change. It creates only logical metadata and returns a session-local
-GPU VA. It does not allocate physical GPU memory. The first GPU access to
-that VA triggers the UVM replayable fault path, and POLARIS then decides
-whether to allocate, reload, map an existing shared handle, or COW break.
+GPU VA. It does not allocate physical GPU memory. In the intended fault-driven
+design, the first GPU access to that VA triggers the UVM replayable fault path,
+and POLARIS then decides whether to allocate, reload, map an existing shared
+handle, or COW break. Current hardware tests show a narrower reality: an
+unmapped raw CUDA VMM VA touched by a normal CUDA kernel becomes a fatal RM/MMU
+fault rather than a replayable UVM fault. For now, production llama.cpp paging
+must call the explicit runtime map/reload path before graph execution.
 Overlapping reservations return `-EEXIST` unless `POLARIS_RESERVE_FLAG_OVERWRITE`
-is set.
+is set. `POLARIS_RESERVE_FLAG_DEFER_FAULT` exists only as a diagnostic switch
+for the raw-VMM true-fault test.
 
 `POLARIS_BLOCK_RELEASE` is a logical release, not an immediate unsafe
 `cuMemRelease`. The caller must either guarantee stream quiescence with
@@ -1531,8 +1544,12 @@ The minimum viable POLARIS must include:
 - [x] Rust in-process runtime with C ABI for llama.cpp
 - [x] Optional Rust userspace daemon `polarisd` for control-plane tasks
 - [x] CUDA VMM backend: real `cuMemCreate`, `cuMemMap`, `cuMemUnmap`
-- [x] Page-fault flow: GPU replayable fault enters patched UVM → POLARIS
-  queues executor decision → target process runtime maps → UVM replays faulting work
+- [x] Fault-decision flow: POLARIS queues executor decision → target process
+  runtime maps → CUDA can read/write the returned GPU VA
+- [ ] True replayable GPU page-fault flow: GPU fault enters patched UVM →
+  POLARIS queues executor decision → target process runtime maps → UVM replays
+  faulting work. Current raw CUDA VMM diagnostic fails with Xid 31 /
+  `FAULT_PDE ACCESS_TYPE_VIRT_WRITE`, so this is not yet proven.
 - [x] Block-level logical release: `BLOCK_RELEASE` for safe async reclaim
 - [x] Per-GPU memory accounting (GPU + CPU pool), validated against `nvidia-smi`
 - [x] Block-based KV Cache abstraction with token-range granularity
@@ -1556,16 +1573,20 @@ Avoid:
 - "We solved distributed multi-node inference"
 
 Claim instead:
-- "We implemented POLARIS, a Linux kernel service plus a narrow patch to
-  NVIDIA's open UVM module that orchestrates CUDA VMM to provide
-  kernel-level PagedAttention for LLM KV Cache management."
-- "POLARIS treats KV Cache blocks as OS-paged resources: a real NVIDIA UVM
-  replayable page fault on a missing block queues mapping work to the
-  faulting process runtime, then the faulting GPU work is replayed."
-- "POLARIS implements in-kernel copy-on-write with atomic reference counting
-  to enable memory-efficient beam search."
-- "POLARIS is evaluated against vLLM and SGLang on real KV Cache allocation
-  traces, demonstrating lower fragmentation under constrained GPU memory."
+- "We implemented POLARIS, a Linux kernel service plus a narrow in-process
+  CUDA VMM runtime that orchestrates block-granular KV Cache allocation,
+  offload, and reload for llama.cpp."
+- "POLARIS treats KV Cache blocks as OS-paged resources: the kernel owns the
+  logical block table and decision protocol, while the target process runtime
+  executes `cuMemMap`/`cuMemUnmap` in the correct CUDA context."
+- "The fault-decision path is validated through the same kernel-to-runtime
+  decision protocol used by the UVM hook. A true raw CUDA VMM fault diagnostic
+  currently fails with NVIDIA Xid 31, so automatic replayable-fault paging is
+  presented as an unresolved driver-path limitation rather than a completed
+  production feature."
+- "POLARIS is evaluated against llama.cpp baseline and vLLM/SGLang on real KV
+  Cache allocation traces, measuring throughput, latency, memory pressure, and
+  offload/reload behavior under constrained GPU memory."
 
 ---
 
