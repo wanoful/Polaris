@@ -73,6 +73,30 @@ policy updates, and multi-process orchestration. It is not the cross-process
 mapper. The first real runtime target is `../llama.cpp`, because llama.cpp owns
 its ggml CUDA buffers and KV cache directly rather than going through PyTorch.
 
+### Current Implementation Status
+
+The implementation is being staged so each step is testable on real hardware:
+
+- **M1 done:** `polaris-runtime` exposes an explicit C ABI for KV allocations:
+  reserve POLARIS VA, create CUDA VMM backing, map all blocks, unmap/free, and
+  clean up on runtime teardown. This validates the in-process CUDA VMM executor
+  without depending on the UVM fault hook.
+- **M2 done:** `../llama.cpp` can allocate CUDA KV-cache tensors from a
+  POLARIS-managed VA range when `LLAMA_POLARIS=1 LLAMA_POLARIS_KV=1` is set.
+  The ggml buffer keeps the normal CUDA buffer type, so CUDA graph scheduling
+  and kernel buffer-type checks still see a CUDA buffer while the pointer range
+  is owned by POLARIS.
+- **M3 next:** replace M2's full-map behavior with explicit per-block
+  map/unmap/offload/reload operations, driven by llama.cpp KV lifetime events
+  first. This is where POLARIS begins to differ from manual prefetch/allocation
+  under memory pressure.
+- **M4 next:** connect the patched NVIDIA UVM replayable-fault hook to the same
+  per-process runtime executor so unmapped KV block touches map on demand.
+
+Until M3/M4 are complete, POLARIS is not yet a fault-driven KV pager. M2 proves
+that llama.cpp can run with KV tensors located in POLARIS-managed GPU VA and
+gives a safe integration point for block-granular paging.
+
 **Driver takeover finding:** A standalone third-party module cannot cleanly
 preempt UVM after it has claimed replayable page faults. The practical path
 is to build a patched `nvidia-uvm.ko` from
