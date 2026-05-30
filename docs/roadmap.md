@@ -94,8 +94,15 @@ The implementation is being staged so each step is testable on real hardware:
   the llama process. The remaining M3 work is real policy integration: deciding
   which llama KV blocks are cold, offloading only those blocks, and ensuring all
   blocks needed by attention are resident before graph execution.
-- **M4 next:** connect the patched NVIDIA UVM replayable-fault hook to the same
-  per-process runtime executor so unmapped KV block touches map on demand.
+- **M4 in progress:** the patched `nvidia-uvm.ko` contains the POLARIS
+  replayable-fault filter and llama.cpp can start the in-process runtime
+  decision worker with `LLAMA_POLARIS_FAULT_WORKER=1`. A runtime integration
+  smoke now verifies the kernel fault resolver's decision path by using
+  `BLOCK_RESERVE` to queue an `ALLOC` decision, letting the runtime worker map
+  the block, and then reading/writing the returned GPU VA. The remaining M4
+  work is a true replayable GPU-fault smoke where a CUDA kernel touches an
+  intentionally unmapped POLARIS VA and the patched UVM bottom half drives the
+  same decision path.
 
 Until M3/M4 are complete end-to-end in llama.cpp, POLARIS is not yet a
 fault-driven KV pager. M2 proves that llama.cpp can run with KV tensors located
