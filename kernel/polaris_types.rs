@@ -177,6 +177,7 @@ pub struct PolarisGpu {
     pub va_range_flags: u32,
     pub va_range_registered: bool,
     pub healthy: bool,
+    pub next_va_offset: u64,
 }
 
 #[derive(Clone, Debug)]

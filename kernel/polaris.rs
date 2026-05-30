@@ -52,6 +52,7 @@ pub(crate) struct PolarisInner {
     next_session_id: u64,
     next_decision_id: u64,
     next_fault_id: u64,
+    next_range_id: u64,
     fault_generation: u64,
     daemon_attached: u32,
     gpus: KVec<PolarisGpu>,
@@ -128,9 +129,157 @@ fn polaris_resolve_gpu_fault(
                 && fault_address < b.gpu_vaddr.saturating_add(b.size_bytes)
         })
     {
-        Some((idx, _)) => idx,
+        Some((idx, _)) => Some(idx),
+        None => {
+            // COW path: the fault is in a child session's VA range.
+            // Find the owning session.
+            let owning_sid = inner.sessions.iter()
+                .find(|s| {
+                    fault_address >= s.gpu_vas_base
+                        && fault_address < s.gpu_vas_base.saturating_add(s.gpu_vas_size)
+                })
+                .map(|s| s.session_id);
+
+            // Look up the COW-shared block via the owner session's block_ids.
+            let mut found_idx = None;
+            if let Some(sid) = owning_sid {
+                // Collect COW-shared block data before pushing new block entries.
+                let shared_info: Option<(u64, u64, u64, u32, u32, PolarisPhase)> =
+                    if let Some(session) = inner.sessions.iter().find(|s| s.session_id == sid) {
+                        let mut info = None;
+                        for &bid in &session.block_ids {
+                            if let Some((_bi, b)) = inner.blocks.iter()
+                                .enumerate()
+                                .find(|(_, b)| b.block_id == bid && b.session_id != sid)
+                            {
+                                if b.state == PolarisBlockState::Resident && b.gpu_phys_handle != 0 {
+                                    info = Some((
+                                        b.gpu_phys_handle,
+                                        b.size_bytes,
+                                        b.gpu_vaddr,
+                                        b.token_start,
+                                        b.token_count,
+                                        b.phase,
+                                    ));
+                                    found_idx = Some(_bi);
+                                    break;
+                                } else {
+                                    found_idx = Some(_bi);
+                                    break;
+                                }
+                            }
+                        }
+                        info
+                    } else {
+                        None
+                    };
+
+                if let Some((phys_handle, sz, src_va, tok_start, tok_count, phase)) = shared_info {
+                    let new_block_id = inner.next_block_id;
+                    inner.next_block_id += 1;
+                    let new_fault_id = inner.next_fault_id;
+                    inner.next_fault_id += 1;
+                    let generation = inner.fault_generation;
+                    let decision_id = inner.next_decision_id;
+                    inner.next_decision_id += 1;
+
+                    inner.blocks.push(
+                        PolarisBlock {
+                            block_id: new_block_id,
+                            session_id: sid,
+                            token_start: tok_start,
+                            token_count: tok_count,
+                            home_gpu: gpu_id,
+                            gpu_vaddr: fault_address,
+                            gpu_phys_handle: 0,
+                            cpu_buf_addr: 0,
+                            size_bytes: sz,
+                            refcount: 1,
+                            state: PolarisBlockState::AllocPending,
+                            flags: PolarisBlockFlags::empty(),
+                            phase,
+                            last_touch_ns: 0,
+                            map_time_ns: 0,
+                            cow_src_handle: 0,
+                            retry_count: 0,
+                            pending_decision_id: decision_id,
+                            pending_fault_id: new_fault_id,
+                            pending_generation: generation,
+                            fault_timeout_ms: POLARIS_DEFAULT_FAULT_TIMEOUT_MS,
+                            completion_ptr: core::ptr::null_mut(),
+                        },
+                        GFP_KERNEL,
+                    )?;
+
+                    inner.pending_faults.push(
+                        PolarisFault {
+                            fault_id: new_fault_id,
+                            generation,
+                            gpu_id,
+                            fault_address,
+                            block_id: new_block_id,
+                            access_type,
+                            state: 0,
+                            enqueue_ns: unsafe { bindings::ktime_get_mono_fast_ns() },
+                            deadline_ns: 0,
+                            resolved_ns: 0,
+                        },
+                        GFP_KERNEL,
+                    )?;
+                    inner.pending_decisions.push(
+                        PolarisDecision {
+                            decision_id,
+                            fault_id: new_fault_id,
+                            generation,
+                            op: PolarisDecisionOp::MapExisting as u32,
+                            gpu_id,
+                            block_id: new_block_id,
+                            session_id: sid,
+                            src_handle: phys_handle,
+                            dst_handle: 0,
+                            src_vaddr: src_va,
+                            dst_vaddr: fault_address,
+                            size_bytes: sz,
+                            cpu_addr: 0,
+                            access_flags: access_type,
+                            timeout_ms: POLARIS_DEFAULT_FAULT_TIMEOUT_MS,
+                            _reserved: [0u64; 4],
+                        },
+                        GFP_KERNEL,
+                    )?;
+
+                    let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
+                    unsafe { bindings::init_completion(&raw mut comp); }
+                    inner.blocks.last_mut().unwrap().completion_ptr = &raw mut comp;
+                    drop(guard);
+
+                    let wait_ret = unsafe {
+                        bindings::wait_for_completion_interruptible_timeout(
+                            &raw mut comp,
+                            bindings::__msecs_to_jiffies(POLARIS_DEFAULT_FAULT_TIMEOUT_MS),
+                        )
+                    };
+                    let mut guard = POLARIS_STATE.lock();
+                    let inner = guard.as_mut().ok_or(ENODEV)?;
+                    if let Some(blk) = inner.blocks.iter_mut().find(|b| b.block_id == new_block_id) {
+                        blk.completion_ptr = core::ptr::null_mut();
+                        if wait_ret == 0 && blk.state != PolarisBlockState::Resident {
+                            blk.state = PolarisBlockState::Evicted;
+                            return Err(ETIMEDOUT);
+                        }
+                    }
+                    return Ok(PolarisUvmFaultResult::Handled);
+                }
+            }
+            found_idx
+        }
+    };
+
+    let block_idx = match block_idx {
+        Some(idx) => idx,
         None => return Ok(PolarisUvmFaultResult::Error),
     };
+
     let fault_id = inner.next_fault_id;
     inner.next_fault_id += 1;
     let generation = inner.fault_generation;
@@ -484,6 +633,7 @@ impl kernel::InPlaceModule for PolarisModule {
                 next_session_id: 1,
                 next_decision_id: 1,
                 next_fault_id: 1,
+                next_range_id: 1,
                 fault_generation: 1,
                 daemon_attached: 0,
                 gpus: KVec::new(),
@@ -543,8 +693,10 @@ impl PinnedDrop for PolarisModule {
 #[pin_data(PinnedDrop)]
 struct PolarisDevice {
     dev: ARef<Device>,
-    /// Whether this fd registered a GPU (belongs to the daemon).
+    /// Whether this fd registered as an executor.
     registered_gpu: Atomic<u32>,
+    registered_va_gpu: Atomic<u32>,
+    registered_va_range_id: Atomic<u64>,
 }
 
 #[vtable]
@@ -560,6 +712,8 @@ impl MiscDevice for PolarisDevice {
                 PolarisDevice {
                     dev: dev,
                     registered_gpu: Atomic::new(0),
+                    registered_va_gpu: Atomic::new(0),
+                    registered_va_range_id: Atomic::new(0),
                 }
             },
             GFP_KERNEL,
@@ -609,13 +763,35 @@ impl MiscDevice for PolarisDevice {
     }
 }
 
-    #[pinned_drop]
+#[pinned_drop]
 impl PinnedDrop for PolarisDevice {
     fn drop(self: Pin<&mut Self>) {
         if self.registered_gpu.load(Relaxed) != 0 {
-            dev_info!(self.dev, "POLARIS: daemon disconnected, evicting pending blocks\n");
             let mut guard = POLARIS_STATE.lock();
             if let Some(inner) = guard.as_mut() {
+                let range_id = self.registered_va_range_id.load(Relaxed);
+                if range_id != 0 {
+                    let range_gpu = self.registered_va_gpu.load(Relaxed);
+                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == range_gpu) {
+                        if gpu.va_range_id == range_id {
+                            gpu.va_range_id = 0;
+                            gpu.va_range_base = 0;
+                            gpu.va_range_length = 0;
+                            gpu.va_block_size = 0;
+                            gpu.va_range_flags = 0;
+                            gpu.va_range_registered = false;
+                            gpu.next_va_offset = 0;
+                            dev_info!(
+                                self.dev,
+                                "POLARIS: VA range {} on GPU {} unregistered\n",
+                                range_id,
+                                range_gpu
+                            );
+                        }
+                    }
+                }
+
+                dev_info!(self.dev, "POLARIS: executor disconnected, evicting pending blocks\n");
                 inner.daemon_attached = inner.daemon_attached.saturating_sub(1);
                 for block in inner.blocks.iter_mut() {
                     match block.state {
@@ -665,15 +841,26 @@ impl PolarisDevice {
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
-        // Idempotent: if this GPU ID is already registered, update its
-        // parameters instead of creating a duplicate entry.
+        // Idempotent: if this GPU ID is already registered, update only
+        // non-zero parameters. In-process runtimes attach with zero capacity
+        // fields so they do not overwrite the control-plane daemon's global
+        // GPU accounting.
         if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id) {
-            gpu.total_bytes = arg.total_bytes;
-            gpu.budget_bytes = arg.budget_bytes;
-            gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+            if arg.total_bytes != 0 {
+                gpu.total_bytes = arg.total_bytes;
+            }
+            if arg.budget_bytes != 0 {
+                gpu.budget_bytes = arg.budget_bytes;
+            }
+            if arg.cpu_pool_bytes != 0 {
+                gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+            }
             gpu.healthy = true;
             dev_info!(self.dev, "POLARIS: GPU {} re-registered\n", arg.gpu_id);
         } else {
+            if arg.total_bytes == 0 || arg.budget_bytes == 0 {
+                return Err(ENOENT);
+            }
             inner.gpus.push(
                 PolarisGpu {
                     gpu_id: arg.gpu_id,
@@ -691,14 +878,17 @@ impl PolarisDevice {
                     va_range_flags: 0,
                     va_range_registered: false,
                     healthy: true,
+                    next_va_offset: 0,
                 },
                 GFP_KERNEL,
             )?;
             dev_info!(self.dev, "POLARIS: GPU {} registered\n", arg.gpu_id);
         }
 
-        self.registered_gpu.store(1, Relaxed);
-        inner.daemon_attached += 1;
+        if self.registered_gpu.load(Relaxed) == 0 {
+            self.registered_gpu.store(1, Relaxed);
+            inner.daemon_attached += 1;
+        }
         Ok(0)
     }
 
@@ -715,16 +905,19 @@ impl PolarisDevice {
             return Err(EINVAL);
         }
 
-        let gpu = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id).ok_or(ENOENT)?;
         if arg.range_id == 0 {
-            arg.range_id = ((arg.gpu_id as u64) << 32) | 1;
+            arg.range_id = ((arg.gpu_id as u64) << 32) | inner.next_range_id;
+            inner.next_range_id += 1;
         }
+        let gpu = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id).ok_or(ENOENT)?;
         gpu.va_range_id = arg.range_id;
         gpu.va_range_base = arg.base;
         gpu.va_range_length = arg.length;
         gpu.va_block_size = arg.block_size;
         gpu.va_range_flags = arg.flags;
         gpu.va_range_registered = true;
+        self.registered_va_gpu.store(arg.gpu_id, Relaxed);
+        self.registered_va_range_id.store(arg.range_id, Relaxed);
 
         drop(guard);
         let mut writer = UserSlice::new(user_ptr, size).writer();
@@ -739,13 +932,25 @@ impl PolarisDevice {
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
         let (gpu_vas_base, gpu_vas_size) =
-            if let Some(gpu) = inner.gpus.iter().find(|g| g.gpu_id == arg.home_gpu) {
+            if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.home_gpu) {
                 if !gpu.healthy {
                 dev_err!(self.dev, "POLARIS: GPU {} is unhealthy, rejecting session\n", arg.home_gpu);
                 return Err(ENODEV);
             }
                 if gpu.va_range_registered {
-                    (gpu.va_range_base, gpu.va_range_length)
+                    let session_va = if arg.gpu_vas_bytes > 0 {
+                        arg.gpu_vas_bytes
+                    } else {
+                        POLARIS_DEFAULT_SESSION_VA_BYTES
+                    };
+                    let aligned_va = (session_va + POLARIS_VA_ALIGNMENT - 1) & !(POLARIS_VA_ALIGNMENT - 1);
+                    if gpu.next_va_offset + aligned_va > gpu.va_range_length {
+                        dev_err!(self.dev, "POLARIS: VA pool exhausted for GPU {}\n", arg.home_gpu);
+                        return Err(ENOMEM);
+                    }
+                    let base = gpu.va_range_base + gpu.next_va_offset;
+                    gpu.next_va_offset += aligned_va;
+                    (base, session_va)
                 } else {
                     (0, arg.gpu_vas_bytes)
                 }
@@ -1033,12 +1238,31 @@ impl PolarisDevice {
         let child_id = inner.next_session_id;
         inner.next_session_id += 1;
 
+        let (child_vas_base, child_vas_size) =
+            if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == parent_gpu) {
+                if gpu.va_range_registered {
+                    let va_needed = parent_vas_size;
+                    let aligned = (va_needed + POLARIS_VA_ALIGNMENT - 1) & !(POLARIS_VA_ALIGNMENT - 1);
+                    if gpu.next_va_offset + aligned > gpu.va_range_length {
+                        dev_err!(self.dev, "POLARIS: VA pool exhausted for GPU {}, rejecting branch\n", parent_gpu);
+                        return Err(ENOMEM);
+                    }
+                    let base = gpu.va_range_base + gpu.next_va_offset;
+                    gpu.next_va_offset += aligned;
+                    (base, parent_vas_size)
+                } else {
+                    (parent_vas_base, parent_vas_size)
+                }
+            } else {
+                (parent_vas_base, parent_vas_size)
+            };
+
         inner.sessions.push(
             PolarisSession {
                 session_id: child_id,
                 home_gpu: parent_gpu,
-                gpu_vas_base: parent_vas_base,
-                gpu_vas_size: parent_vas_size,
+                gpu_vas_base: child_vas_base,
+                gpu_vas_size: child_vas_size,
                 beam_width: parent_beam,
                 bytes_per_token: parent_bpt,
                 parent_session_id: parent_id,

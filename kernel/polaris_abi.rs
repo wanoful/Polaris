@@ -78,6 +78,8 @@ pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 pub const POLARIS_MAX_DECISIONS_PER_POLL: usize = 16;
 pub const POLARIS_MAX_SESSIONS_PER_LIST: usize = 64;
 pub const POLARIS_DEFAULT_BYTES_PER_TOKEN: u64 = 524_288;
+pub const POLARIS_DEFAULT_SESSION_VA_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+pub const POLARIS_VA_ALIGNMENT: u64 = 2 * 1024 * 1024; // 2 MiB (GPU allocation granularity)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // IOCTL Argument Structs (C-compatible, #[repr(C)] — cross the user/kernel boundary)
