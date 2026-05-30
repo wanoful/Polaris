@@ -1,7 +1,7 @@
 mod cuda_vmm;
 mod runtime;
 
-use runtime::{Runtime, RuntimeConfig};
+pub use runtime::{Runtime, RuntimeConfig};
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::ptr;
