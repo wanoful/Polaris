@@ -102,7 +102,14 @@ struct ExplicitKvAlloc {
     va: u64,
     size: u64,
     block_size: u64,
-    handles: Vec<u64>,
+    blocks: Vec<ExplicitKvBlock>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExplicitKvBlock {
+    Unmapped,
+    Resident { handle: u64 },
+    Offloaded { cpu_addr: u64 },
 }
 
 impl Runtime {
@@ -240,6 +247,34 @@ impl Runtime {
             .map_kv_all(va)
     }
 
+    pub fn map_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "runtime mutex poisoned".to_string())?
+            .map_kv_block(va, block_index)
+    }
+
+    pub fn unmap_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "runtime mutex poisoned".to_string())?
+            .unmap_kv_block(va, block_index)
+    }
+
+    pub fn offload_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "runtime mutex poisoned".to_string())?
+            .offload_kv_block(va, block_index)
+    }
+
+    pub fn reload_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "runtime mutex poisoned".to_string())?
+            .reload_kv_block(va, block_index)
+    }
+
     pub fn unmap_kv(&mut self, va: u64) -> Result<(), String> {
         self.inner
             .lock()
@@ -327,7 +362,7 @@ impl RuntimeInner {
                 va,
                 size: padded_size,
                 block_size,
-                handles: vec![0; block_count as usize],
+                blocks: vec![ExplicitKvBlock::Unmapped; block_count as usize],
             },
         );
         Ok(KvAllocationInfo {
@@ -345,7 +380,57 @@ impl RuntimeInner {
             .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
 
         cuda_vmm::push_context(self.gpu.context)?;
-        let result = map_explicit_kv_all(alloc, &mut self.gpu);
+        let result = map_explicit_kv_all(alloc, &mut self.gpu, &mut self.cpu_pool);
+        cuda_vmm::pop_context();
+        result
+    }
+
+    fn map_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        let alloc = self
+            .explicit_kv
+            .get_mut(&va)
+            .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
+
+        cuda_vmm::push_context(self.gpu.context)?;
+        let result = map_explicit_kv_block(alloc, &mut self.gpu, &mut self.cpu_pool, block_index);
+        cuda_vmm::pop_context();
+        result
+    }
+
+    fn unmap_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        let alloc = self
+            .explicit_kv
+            .get_mut(&va)
+            .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
+
+        cuda_vmm::push_context(self.gpu.context)?;
+        let result = unmap_explicit_kv_block(alloc, &mut self.gpu, block_index);
+        cuda_vmm::pop_context();
+        result
+    }
+
+    fn offload_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        let alloc = self
+            .explicit_kv
+            .get_mut(&va)
+            .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
+
+        cuda_vmm::push_context(self.gpu.context)?;
+        let result =
+            offload_explicit_kv_block(alloc, &mut self.gpu, &mut self.cpu_pool, block_index);
+        cuda_vmm::pop_context();
+        result
+    }
+
+    fn reload_kv_block(&mut self, va: u64, block_index: u64) -> Result<(), String> {
+        let alloc = self
+            .explicit_kv
+            .get_mut(&va)
+            .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
+
+        cuda_vmm::push_context(self.gpu.context)?;
+        let result =
+            reload_explicit_kv_block(alloc, &mut self.gpu, &mut self.cpu_pool, block_index);
         cuda_vmm::pop_context();
         result
     }
@@ -357,7 +442,7 @@ impl RuntimeInner {
             .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
 
         cuda_vmm::push_context(self.gpu.context)?;
-        let result = unmap_explicit_kv(alloc, &mut self.gpu);
+        let result = unmap_explicit_kv(alloc, &mut self.gpu, &mut self.cpu_pool);
         cuda_vmm::pop_context();
         result
     }
@@ -369,7 +454,7 @@ impl RuntimeInner {
             .ok_or_else(|| format!("unknown POLARIS KV allocation at {va:#x}"))?;
 
         cuda_vmm::push_context(self.gpu.context)?;
-        let result = unmap_explicit_kv(&mut alloc, &mut self.gpu);
+        let result = unmap_explicit_kv(&mut alloc, &mut self.gpu, &mut self.cpu_pool);
         cuda_vmm::pop_context();
         self.gpu.vas.free(alloc.va, alloc.size);
         result
@@ -378,7 +463,7 @@ impl RuntimeInner {
     fn cleanup(&mut self) {
         let _ = cuda_vmm::push_context(self.gpu.context);
         for (_, mut alloc) in self.explicit_kv.drain() {
-            let _ = unmap_explicit_kv(&mut alloc, &mut self.gpu);
+            let _ = unmap_explicit_kv(&mut alloc, &mut self.gpu, &mut self.cpu_pool);
             self.gpu.vas.free(alloc.va, alloc.size);
         }
         for (_, va) in self.gpu.va_allocs.drain() {
@@ -750,58 +835,217 @@ fn map_and_access(vaddr: u64, phys: u64, size: u64, device_ordinal: i32) -> Resu
     Ok(())
 }
 
-fn map_explicit_kv_all(alloc: &mut ExplicitKvAlloc, gpu: &mut GpuState) -> Result<(), String> {
-    for idx in 0..alloc.handles.len() {
-        if alloc.handles[idx] != 0 {
+fn map_explicit_kv_all(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
+) -> Result<(), String> {
+    for idx in 0..alloc.blocks.len() {
+        if matches!(alloc.blocks[idx], ExplicitKvBlock::Resident { .. }) {
             continue;
         }
-
-        let vaddr = alloc.va + (idx as u64 * alloc.block_size);
-        let phys =
-            cuda_vmm::create_physical(alloc.block_size, gpu.device_ordinal).map_err(|e| {
-                format!(
-                    "POLARIS KV cuMemCreate block {} at {vaddr:#x} failed: {e}",
-                    idx
-                )
-            })?;
-
-        if let Err(e) = map_and_access(vaddr, phys, alloc.block_size, gpu.device_ordinal) {
-            let _ = cuda_vmm::release_physical(phys);
-            return Err(format!(
-                "POLARIS KV map block {} at {vaddr:#x} failed: {e}",
-                idx
-            ));
-        }
-
-        alloc.handles[idx] = phys;
-        gpu.used_bytes += alloc.block_size;
+        map_explicit_kv_block(alloc, gpu, cpu_pool, idx as u64)?;
     }
     Ok(())
 }
 
-fn unmap_explicit_kv(alloc: &mut ExplicitKvAlloc, gpu: &mut GpuState) -> Result<(), String> {
-    let mut first_error = None;
-    for (idx, handle) in alloc.handles.iter_mut().enumerate() {
-        if *handle == 0 {
-            continue;
-        }
+fn validate_explicit_kv_block(alloc: &ExplicitKvAlloc, block_index: u64) -> Result<usize, String> {
+    let idx = usize::try_from(block_index)
+        .map_err(|_| format!("POLARIS KV block index out of range: {block_index}"))?;
+    if idx >= alloc.blocks.len() {
+        return Err(format!(
+            "POLARIS KV block index {} out of range, block_count={}",
+            block_index,
+            alloc.blocks.len()
+        ));
+    }
+    Ok(idx)
+}
 
-        let vaddr = alloc.va + (idx as u64 * alloc.block_size);
-        if let Err(e) = cuda_vmm::unmap_memory(vaddr, alloc.block_size) {
-            first_error.get_or_insert_with(|| {
-                format!("POLARIS KV unmap block {} at {vaddr:#x} failed: {e}", idx)
-            });
+fn explicit_kv_block_vaddr(alloc: &ExplicitKvAlloc, idx: usize) -> u64 {
+    alloc.va + (idx as u64 * alloc.block_size)
+}
+
+fn map_new_explicit_kv_block(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    idx: usize,
+) -> Result<(), String> {
+    let vaddr = explicit_kv_block_vaddr(alloc, idx);
+    let phys = cuda_vmm::create_physical(alloc.block_size, gpu.device_ordinal).map_err(|e| {
+        format!(
+            "POLARIS KV cuMemCreate block {} at {vaddr:#x} failed: {e}",
+            idx
+        )
+    })?;
+
+    if let Err(e) = map_and_access(vaddr, phys, alloc.block_size, gpu.device_ordinal) {
+        let _ = cuda_vmm::release_physical(phys);
+        return Err(format!(
+            "POLARIS KV map block {} at {vaddr:#x} failed: {e}",
+            idx
+        ));
+    }
+
+    alloc.blocks[idx] = ExplicitKvBlock::Resident { handle: phys };
+    gpu.used_bytes += alloc.block_size;
+    Ok(())
+}
+
+fn map_explicit_kv_block(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
+    block_index: u64,
+) -> Result<(), String> {
+    let idx = validate_explicit_kv_block(alloc, block_index)?;
+    match alloc.blocks[idx] {
+        ExplicitKvBlock::Resident { .. } => Ok(()),
+        ExplicitKvBlock::Unmapped => map_new_explicit_kv_block(alloc, gpu, idx),
+        ExplicitKvBlock::Offloaded { .. } => {
+            reload_explicit_kv_block(alloc, gpu, cpu_pool, block_index)
         }
-        if let Err(e) = cuda_vmm::release_physical(*handle) {
-            first_error.get_or_insert_with(|| {
-                format!(
-                    "POLARIS KV release block {} handle {:#x} failed: {e}",
-                    idx, *handle
-                )
-            });
+    }
+}
+
+fn unmap_explicit_kv_block(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    block_index: u64,
+) -> Result<(), String> {
+    let idx = validate_explicit_kv_block(alloc, block_index)?;
+    let ExplicitKvBlock::Resident { handle } = alloc.blocks[idx] else {
+        return Ok(());
+    };
+
+    let vaddr = explicit_kv_block_vaddr(alloc, idx);
+    cuda_vmm::unmap_memory(vaddr, alloc.block_size)
+        .map_err(|e| format!("POLARIS KV unmap block {} at {vaddr:#x} failed: {e}", idx))?;
+    cuda_vmm::release_physical(handle).map_err(|e| {
+        format!(
+            "POLARIS KV release block {} handle {:#x} failed: {e}",
+            idx, handle
+        )
+    })?;
+
+    alloc.blocks[idx] = ExplicitKvBlock::Unmapped;
+    gpu.used_bytes = gpu.used_bytes.saturating_sub(alloc.block_size);
+    Ok(())
+}
+
+fn offload_explicit_kv_block(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
+    block_index: u64,
+) -> Result<(), String> {
+    let idx = validate_explicit_kv_block(alloc, block_index)?;
+    let ExplicitKvBlock::Resident { handle } = alloc.blocks[idx] else {
+        return match alloc.blocks[idx] {
+            ExplicitKvBlock::Offloaded { .. } => Ok(()),
+            ExplicitKvBlock::Unmapped => Err(format!(
+                "POLARIS KV block {} cannot be offloaded before it is mapped",
+                idx
+            )),
+            ExplicitKvBlock::Resident { .. } => unreachable!(),
+        };
+    };
+
+    let vaddr = explicit_kv_block_vaddr(alloc, idx);
+    let Some(cpu_addr) = cpu_pool.allocate(alloc.block_size) else {
+        return Err(format!(
+            "POLARIS KV CPU pool exhausted while offloading block {}",
+            idx
+        ));
+    };
+
+    if let Err(e) = cuda_vmm::copy_dtoh(cpu_addr, vaddr, alloc.block_size) {
+        cpu_pool.free(cpu_addr, alloc.block_size);
+        return Err(format!("POLARIS KV offload copy block {} failed: {e}", idx));
+    }
+    if let Err(e) = cuda_vmm::unmap_memory(vaddr, alloc.block_size) {
+        cpu_pool.free(cpu_addr, alloc.block_size);
+        return Err(format!(
+            "POLARIS KV offload unmap block {} at {vaddr:#x} failed: {e}",
+            idx
+        ));
+    }
+    if let Err(e) = cuda_vmm::release_physical(handle) {
+        cpu_pool.free(cpu_addr, alloc.block_size);
+        return Err(format!(
+            "POLARIS KV offload release block {} handle {:#x} failed: {e}",
+            idx, handle
+        ));
+    }
+
+    alloc.blocks[idx] = ExplicitKvBlock::Offloaded { cpu_addr };
+    gpu.used_bytes = gpu.used_bytes.saturating_sub(alloc.block_size);
+    Ok(())
+}
+
+fn reload_explicit_kv_block(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
+    block_index: u64,
+) -> Result<(), String> {
+    let idx = validate_explicit_kv_block(alloc, block_index)?;
+    let ExplicitKvBlock::Offloaded { cpu_addr } = alloc.blocks[idx] else {
+        return match alloc.blocks[idx] {
+            ExplicitKvBlock::Resident { .. } => Ok(()),
+            ExplicitKvBlock::Unmapped => Err(format!(
+                "POLARIS KV block {} cannot be reloaded before it is offloaded",
+                idx
+            )),
+            ExplicitKvBlock::Offloaded { .. } => unreachable!(),
+        };
+    };
+
+    let vaddr = explicit_kv_block_vaddr(alloc, idx);
+    let phys = cuda_vmm::create_physical(alloc.block_size, gpu.device_ordinal).map_err(|e| {
+        format!(
+            "POLARIS KV reload cuMemCreate block {} at {vaddr:#x} failed: {e}",
+            idx
+        )
+    })?;
+    if let Err(e) = map_and_access(vaddr, phys, alloc.block_size, gpu.device_ordinal) {
+        let _ = cuda_vmm::release_physical(phys);
+        return Err(format!(
+            "POLARIS KV reload map block {} at {vaddr:#x} failed: {e}",
+            idx
+        ));
+    }
+    if let Err(e) = cuda_vmm::copy_htod(vaddr, cpu_addr, alloc.block_size) {
+        let _ = cuda_vmm::unmap_memory(vaddr, alloc.block_size);
+        let _ = cuda_vmm::release_physical(phys);
+        return Err(format!("POLARIS KV reload copy block {} failed: {e}", idx));
+    }
+
+    cpu_pool.free(cpu_addr, alloc.block_size);
+    alloc.blocks[idx] = ExplicitKvBlock::Resident { handle: phys };
+    gpu.used_bytes += alloc.block_size;
+    Ok(())
+}
+
+fn unmap_explicit_kv(
+    alloc: &mut ExplicitKvAlloc,
+    gpu: &mut GpuState,
+    cpu_pool: &mut CpuPool,
+) -> Result<(), String> {
+    let mut first_error = None;
+    for idx in 0..alloc.blocks.len() {
+        match alloc.blocks[idx] {
+            ExplicitKvBlock::Unmapped => {}
+            ExplicitKvBlock::Resident { .. } => {
+                if let Err(e) = unmap_explicit_kv_block(alloc, gpu, idx as u64) {
+                    first_error.get_or_insert(e);
+                }
+            }
+            ExplicitKvBlock::Offloaded { cpu_addr } => {
+                cpu_pool.free(cpu_addr, alloc.block_size);
+                alloc.blocks[idx] = ExplicitKvBlock::Unmapped;
+            }
         }
-        *handle = 0;
-        gpu.used_bytes = gpu.used_bytes.saturating_sub(alloc.block_size);
     }
 
     match first_error {
@@ -1019,6 +1263,7 @@ impl CpuPool {
         self.used = self.used.saturating_sub(size);
         self.free_ranges.push((addr, size));
         self.free_ranges.sort_by_key(|(start, _)| *start);
+        self.coalesce();
     }
 
     fn track(&mut self, block_id: u64, addr: u64) {
@@ -1031,6 +1276,24 @@ impl CpuPool {
 
     fn get(&self, block_id: u64) -> Option<u64> {
         self.allocations.get(&block_id).copied()
+    }
+
+    fn coalesce(&mut self) {
+        if self.free_ranges.len() < 2 {
+            return;
+        }
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.free_ranges.len());
+        for (start, size) in self.free_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.0 + last.1;
+                if start <= last_end {
+                    last.1 = last.1.max(start + size - last.0);
+                    continue;
+                }
+            }
+            merged.push((start, size));
+        }
+        self.free_ranges = merged;
     }
 }
 

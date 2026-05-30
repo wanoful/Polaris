@@ -199,6 +199,103 @@ pub unsafe extern "C" fn polaris_runtime_map_kv_all(runtime: *mut Runtime, va: u
 ///
 /// `runtime` must be a pointer previously returned by
 /// `polaris_runtime_create`. `va` must identify a live allocation returned by
+/// `polaris_runtime_alloc_kv`; `block_index` must be in range for that
+/// allocation.
+#[no_mangle]
+pub unsafe extern "C" fn polaris_runtime_map_kv_block(
+    runtime: *mut Runtime,
+    va: u64,
+    block_index: u64,
+) -> i32 {
+    if runtime.is_null() {
+        return set_errno_error(libc::EINVAL, "null runtime in polaris_runtime_map_kv_block");
+    }
+
+    match unsafe { &mut *runtime }.map_kv_block(va, block_index) {
+        Ok(()) => 0,
+        Err(e) => set_error(e),
+    }
+}
+
+/// # Safety
+///
+/// `runtime` must be a pointer previously returned by
+/// `polaris_runtime_create`. `va` must identify a live allocation returned by
+/// `polaris_runtime_alloc_kv`; `block_index` must be in range for that
+/// allocation.
+#[no_mangle]
+pub unsafe extern "C" fn polaris_runtime_unmap_kv_block(
+    runtime: *mut Runtime,
+    va: u64,
+    block_index: u64,
+) -> i32 {
+    if runtime.is_null() {
+        return set_errno_error(
+            libc::EINVAL,
+            "null runtime in polaris_runtime_unmap_kv_block",
+        );
+    }
+
+    match unsafe { &mut *runtime }.unmap_kv_block(va, block_index) {
+        Ok(()) => 0,
+        Err(e) => set_error(e),
+    }
+}
+
+/// # Safety
+///
+/// `runtime` must be a pointer previously returned by
+/// `polaris_runtime_create`. `va` must identify a live allocation returned by
+/// `polaris_runtime_alloc_kv`; `block_index` must be in range for that
+/// allocation and currently resident.
+#[no_mangle]
+pub unsafe extern "C" fn polaris_runtime_offload_kv_block(
+    runtime: *mut Runtime,
+    va: u64,
+    block_index: u64,
+) -> i32 {
+    if runtime.is_null() {
+        return set_errno_error(
+            libc::EINVAL,
+            "null runtime in polaris_runtime_offload_kv_block",
+        );
+    }
+
+    match unsafe { &mut *runtime }.offload_kv_block(va, block_index) {
+        Ok(()) => 0,
+        Err(e) => set_error(e),
+    }
+}
+
+/// # Safety
+///
+/// `runtime` must be a pointer previously returned by
+/// `polaris_runtime_create`. `va` must identify a live allocation returned by
+/// `polaris_runtime_alloc_kv`; `block_index` must be in range for that
+/// allocation and currently offloaded.
+#[no_mangle]
+pub unsafe extern "C" fn polaris_runtime_reload_kv_block(
+    runtime: *mut Runtime,
+    va: u64,
+    block_index: u64,
+) -> i32 {
+    if runtime.is_null() {
+        return set_errno_error(
+            libc::EINVAL,
+            "null runtime in polaris_runtime_reload_kv_block",
+        );
+    }
+
+    match unsafe { &mut *runtime }.reload_kv_block(va, block_index) {
+        Ok(()) => 0,
+        Err(e) => set_error(e),
+    }
+}
+
+/// # Safety
+///
+/// `runtime` must be a pointer previously returned by
+/// `polaris_runtime_create`. `va` must identify a live allocation returned by
 /// `polaris_runtime_alloc_kv`.
 #[no_mangle]
 pub unsafe extern "C" fn polaris_runtime_unmap_kv(runtime: *mut Runtime, va: u64) -> i32 {

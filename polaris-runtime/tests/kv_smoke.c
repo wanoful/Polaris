@@ -122,15 +122,55 @@ int main(void) {
     }
 
     int failed = 0;
-    failed |= check_polaris(polaris_runtime_map_kv_all(rt, kv.va), "polaris_runtime_map_kv_all");
+    const uint64_t block0 = kv.va;
+    const uint64_t block1 = kv.va + kv.block_size;
+
+    failed |= check_polaris(polaris_runtime_map_kv_block(rt, kv.va, 0),
+                            "polaris_runtime_map_kv_block block0");
     if (!failed) {
-        failed |= copy_and_verify(kv.va, (size_t)kv.size, 0x31);
+        failed |= copy_and_verify(block0, (size_t)kv.block_size, 0x31);
     }
-    failed |= check_polaris(polaris_runtime_unmap_kv(rt, kv.va), "polaris_runtime_unmap_kv");
-    failed |= check_polaris(polaris_runtime_map_kv_all(rt, kv.va), "polaris_runtime_map_kv_all remap");
+
+    failed |= check_polaris(polaris_runtime_offload_kv_block(rt, kv.va, 0),
+                            "polaris_runtime_offload_kv_block block0");
+    failed |= check_polaris(polaris_runtime_map_kv_block(rt, kv.va, 1),
+                            "polaris_runtime_map_kv_block block1");
     if (!failed) {
-        failed |= copy_and_verify(kv.va, (size_t)kv.size, 0x79);
+        failed |= copy_and_verify(block1, (size_t)kv.block_size, 0x52);
     }
+
+    failed |= check_polaris(polaris_runtime_reload_kv_block(rt, kv.va, 0),
+                            "polaris_runtime_reload_kv_block block0");
+    if (!failed) {
+        uint8_t * dst = malloc((size_t)kv.block_size);
+        uint8_t * expected = malloc((size_t)kv.block_size);
+        if (!dst || !expected) {
+            fprintf(stderr, "malloc failed\n");
+            free(dst);
+            free(expected);
+            failed = 1;
+        } else {
+            fill_pattern(expected, (size_t)kv.block_size, 0x31);
+            memset(dst, 0, (size_t)kv.block_size);
+            failed |= check_cuda(cuMemcpyDtoH_v2(dst, (CUdeviceptr)block0, (size_t)kv.block_size),
+                                 "cuMemcpyDtoH reloaded block0");
+            if (!failed && memcmp(expected, dst, (size_t)kv.block_size) != 0) {
+                fprintf(stderr, "offload/reload verification failed for block0\n");
+                failed = 1;
+            }
+            free(dst);
+            free(expected);
+        }
+    }
+
+    failed |= check_polaris(polaris_runtime_unmap_kv_block(rt, kv.va, 1),
+                            "polaris_runtime_unmap_kv_block block1");
+    failed |= check_polaris(polaris_runtime_map_kv_all(rt, kv.va),
+                            "polaris_runtime_map_kv_all after block ops");
+    if (!failed) {
+        failed |= copy_and_verify(block1, (size_t)kv.block_size, 0x79);
+    }
+
     failed |= check_polaris(polaris_runtime_free_kv(rt, kv.va), "polaris_runtime_free_kv");
 
     CUcontext popped = NULL;
@@ -141,6 +181,6 @@ int main(void) {
     if (failed) {
         return 1;
     }
-    printf("POLARIS explicit KV allocation smoke passed\n");
+    printf("POLARIS explicit KV block allocation/offload smoke passed\n");
     return 0;
 }

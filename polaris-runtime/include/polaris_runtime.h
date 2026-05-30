@@ -46,6 +46,10 @@ int polaris_runtime_alloc_kv(polaris_runtime_t * runtime,
                              uint64_t alignment,
                              polaris_kv_allocation_t * out_allocation);
 int polaris_runtime_map_kv_all(polaris_runtime_t * runtime, uint64_t va);
+int polaris_runtime_map_kv_block(polaris_runtime_t * runtime, uint64_t va, uint64_t block_index);
+int polaris_runtime_unmap_kv_block(polaris_runtime_t * runtime, uint64_t va, uint64_t block_index);
+int polaris_runtime_offload_kv_block(polaris_runtime_t * runtime, uint64_t va, uint64_t block_index);
+int polaris_runtime_reload_kv_block(polaris_runtime_t * runtime, uint64_t va, uint64_t block_index);
 int polaris_runtime_unmap_kv(polaris_runtime_t * runtime, uint64_t va);
 int polaris_runtime_free_kv(polaris_runtime_t * runtime, uint64_t va);
 void polaris_runtime_stop(polaris_runtime_t * runtime);
