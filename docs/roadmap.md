@@ -88,9 +88,12 @@ The implementation is being staged so each step is testable on real hardware:
   is owned by POLARIS.
 - **M3 in progress:** `polaris-runtime` now exposes explicit per-block
   `map/unmap/offload/reload` operations and the C smoke test verifies
-  offload/reload data preservation on real CUDA VMM memory. The remaining M3
-  work is wiring these operations to llama.cpp KV lifetime events without
-  letting attention kernels touch unmapped historical KV blocks.
+  offload/reload data preservation on real CUDA VMM memory. `../llama.cpp` also
+  has an opt-in `LLAMA_POLARIS_KV_BLOCK_API=1` mode that allocates KV through
+  block operations and performs a safe clear-time offload/reload cycle inside
+  the llama process. The remaining M3 work is real policy integration: deciding
+  which llama KV blocks are cold, offloading only those blocks, and ensuring all
+  blocks needed by attention are resident before graph execution.
 - **M4 next:** connect the patched NVIDIA UVM replayable-fault hook to the same
   per-process runtime executor so unmapped KV block touches map on demand.
 
