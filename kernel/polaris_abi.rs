@@ -110,6 +110,40 @@ pub struct PolarisRegisterVaRangeArg {
     pub _reserved: [u64; 4],
 }
 
+// ─── v4: fault-capable VA-space registration ────────────────────────────────
+//
+// The shim creates a fault-capable, externally-owned GPU VA-space
+// (NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | IS_EXTERNALLY_OWNED),
+// hands it to UVM via UvmRegisterGpuVaSpace, then announces it to polaris.ko
+// with POLARIS_REGISTER_VASPACE. va_space_token is the duped RM VA-space
+// handle UVM also sees — polaris.ko uses it as the per-(worker, gpu) key
+// when the UVM fault hook dispatches into it.
+//
+// managed_base / managed_length carve the VA window inside the polaris-owned
+// VA-space within which the fault hook is allowed to install PTEs. Anything
+// outside falls back to NOT_MINE so stock UVM handles it (or faults fatally
+// when it's truly unbacked).
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisRegisterVaSpaceArg {
+    pub gpu_id: u32,
+    pub _reserved0: u32,
+    pub va_space_token: u64,
+    pub managed_base: u64,
+    pub managed_length: u64,
+    pub _reserved1: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisUnregisterVaSpaceArg {
+    pub gpu_id: u32,
+    pub _reserved0: u32,
+    pub va_space_token: u64,
+    pub _reserved1: [u64; 2],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct PolarisSessionCreateArg {

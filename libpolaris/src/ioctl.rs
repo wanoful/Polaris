@@ -90,6 +90,12 @@ pub const POLARIS_LIST_SESSIONS: u32 =
 pub const POLARIS_SET_POLICY: u32 =
     iow!(MAGIC, 0x0F, PolarisSetPolicyArg);
 
+pub const POLARIS_REGISTER_VASPACE: u32 =
+    iow!(MAGIC, 0x10, PolarisRegisterVaSpaceArg);
+
+pub const POLARIS_UNREGISTER_VASPACE: u32 =
+    iow!(MAGIC, 0x11, PolarisUnregisterVaSpaceArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.

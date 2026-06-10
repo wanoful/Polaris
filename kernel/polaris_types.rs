@@ -64,6 +64,13 @@ pub const POLARIS_LIST_SESSIONS: u32 =
 pub const POLARIS_SET_POLICY: u32 =
     kernel::ioctl::_IOW::<PolarisSetPolicyArg>(POLARIS_IOCTL_MAGIC, 0x0F);
 
+// v4 fault-capable VA-space registration (shim → polaris.ko).
+pub const POLARIS_REGISTER_VASPACE: u32 =
+    kernel::ioctl::_IOW::<PolarisRegisterVaSpaceArg>(POLARIS_IOCTL_MAGIC, 0x10);
+
+pub const POLARIS_UNREGISTER_VASPACE: u32 =
+    kernel::ioctl::_IOW::<PolarisUnregisterVaSpaceArg>(POLARIS_IOCTL_MAGIC, 0x11);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -180,6 +187,18 @@ pub struct PolarisGpu {
     pub next_va_offset: u64,
 }
 
+/// v4 fault-capable VA-space registered by libpolaris-shim. One entry per
+/// (worker pid, gpu) pair; va_space_token is the duped RM GPU VA-space handle
+/// and matches what UVM hands the fault hook in uvm_polaris_dispatch_fault.
+#[derive(Clone, Debug)]
+pub struct PolarisVaSpace {
+    pub gpu_id: u32,
+    pub pid: i32,
+    pub va_space_token: u64,
+    pub managed_base: u64,
+    pub managed_length: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PolarisFault {
     pub fault_id: u64,
@@ -254,3 +273,9 @@ unsafe impl kernel::transmute::AsBytes for PolarisSetPolicyArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisListSessionsArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisListSessionsArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisRegisterVaSpaceArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRegisterVaSpaceArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisUnregisterVaSpaceArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisUnregisterVaSpaceArg {}
