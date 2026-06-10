@@ -33,11 +33,6 @@ use kernel::{
 
 use polaris_types::*;
 
-// Return values for the C-callable NVIDIA UVM fault hook.
-const POLARIS_UVM_FAULT_NOT_MINE: i32 = 0;
-const POLARIS_UVM_FAULT_HANDLED: i32 = 1;
-const POLARIS_UVM_FAULT_ERROR: i32 = -1;
-
 #[derive(PartialEq)]
 enum PolarisUvmFaultResult {
     NotMine,
@@ -58,6 +53,7 @@ pub(crate) struct PolarisInner {
     gpus: KVec<PolarisGpu>,
     blocks: KVec<PolarisBlock>,
     sessions: KVec<PolarisSession>,
+    va_spaces: KVec<PolarisVaSpace>,
     pending_decisions: KVec<PolarisDecision>,
     pending_faults: KVec<PolarisFault>,
     eviction_policy: PolarisEvictionPolicy,
@@ -81,20 +77,6 @@ kernel::sync::global_lock! {
 // kernel has already zeroed the refcount, so calling module_put again
 // would trigger BUG().
 static MODULE_EXITING: Atomic<u32> = Atomic::new(0);
-
-/// C-callable hook for patched NVIDIA UVM replayable GPU page faults.
-#[no_mangle]
-pub extern "C" fn polaris_uvm_handle_gpu_fault(
-    gpu_id: u32,
-    fault_address: u64,
-    access_type: u32,
-) -> i32 {
-    match polaris_resolve_gpu_fault(gpu_id, fault_address, access_type) {
-        Ok(PolarisUvmFaultResult::NotMine) => POLARIS_UVM_FAULT_NOT_MINE,
-        Ok(PolarisUvmFaultResult::Handled) => POLARIS_UVM_FAULT_HANDLED,
-        Ok(PolarisUvmFaultResult::Error) | Err(_) => POLARIS_UVM_FAULT_ERROR,
-    }
-}
 
 fn polaris_resolve_gpu_fault(
     gpu_id: u32,
@@ -639,6 +621,7 @@ impl kernel::InPlaceModule for PolarisModule {
                 gpus: KVec::new(),
                 blocks: KVec::new(),
                 sessions: KVec::new(),
+                va_spaces: KVec::new(),
                 pending_decisions: KVec::new(),
                 pending_faults: KVec::new(),
                 eviction_policy: PolarisEvictionPolicy::Fifo,
@@ -755,6 +738,8 @@ impl MiscDevice for PolarisDevice {
             POLARIS_GET_GLOBAL_STATS => me.handle_get_global_stats(user_ptr, size),
             POLARIS_LIST_SESSIONS => me.handle_list_sessions(user_ptr, size),
             POLARIS_SET_POLICY => me.handle_set_policy(user_ptr, size),
+            POLARIS_REGISTER_VASPACE => me.handle_register_va_space(user_ptr, size),
+            POLARIS_UNREGISTER_VASPACE => me.handle_unregister_va_space(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -2107,6 +2092,73 @@ impl PolarisDevice {
 
         let mut writer = UserSlice::new(user_ptr, size).writer();
         writer.write(&arg)?;
+        Ok(0)
+    }
+
+    // v4: libpolaris-shim announces a fault-capable VA-space it has just
+    // created and registered with UVM. We stash (gpu_id, va_space_token,
+    // managed window) so the UVM fault hook can resolve incoming faults
+    // back to a worker. M1 is a stub that records and validates inputs;
+    // M2 wires the table into the fault dispatcher.
+    fn handle_register_va_space(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let arg: PolarisRegisterVaSpaceArg = reader.read()?;
+
+        if arg.va_space_token == 0 || arg.managed_length == 0 {
+            return Err(EINVAL);
+        }
+
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+
+        if !inner.gpus.iter().any(|g| g.gpu_id == arg.gpu_id) {
+            return Err(ENOENT);
+        }
+        if inner.va_spaces.iter().any(|v| {
+            v.gpu_id == arg.gpu_id && v.va_space_token == arg.va_space_token
+        }) {
+            return Err(EEXIST);
+        }
+
+        // TODO(M2): record current task's pid for crash reaping. The
+        // chardev fd close path is the primary reaping hook; pid is for
+        // diagnostics only and stays 0 until task::current() is wired up.
+        inner.va_spaces.push(
+            PolarisVaSpace {
+                gpu_id: arg.gpu_id,
+                pid: 0,
+                va_space_token: arg.va_space_token,
+                managed_base: arg.managed_base,
+                managed_length: arg.managed_length,
+            },
+            GFP_KERNEL,
+        )?;
+
+        dev_info!(
+            self.dev,
+            "POLARIS: registered v4 VA-space gpu={} token=0x{:x} base=0x{:x} len=0x{:x}\n",
+            arg.gpu_id, arg.va_space_token, arg.managed_base, arg.managed_length
+        );
+        Ok(0)
+    }
+
+    fn handle_unregister_va_space(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let arg: PolarisUnregisterVaSpaceArg = reader.read()?;
+
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+
+        let idx = inner.va_spaces.iter().position(|v| {
+            v.gpu_id == arg.gpu_id && v.va_space_token == arg.va_space_token
+        }).ok_or(ENOENT)?;
+        inner.va_spaces.swap_remove(idx);
+
+        dev_info!(
+            self.dev,
+            "POLARIS: unregistered v4 VA-space gpu={} token=0x{:x}\n",
+            arg.gpu_id, arg.va_space_token
+        );
         Ok(0)
     }
 }
