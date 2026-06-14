@@ -1,3 +1,4 @@
 [submodule "third_party/open-gpu-kernel-modules"]
 	path = third_party/open-gpu-kernel-modules
 	url = https://github.com/wanoful/open-gpu-kernel-modules.git
+	branch = polaris-v4

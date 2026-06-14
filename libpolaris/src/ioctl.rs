@@ -96,6 +96,21 @@ pub const POLARIS_REGISTER_VASPACE: u32 =
 pub const POLARIS_UNREGISTER_VASPACE: u32 =
     iow!(MAGIC, 0x11, PolarisUnregisterVaSpaceArg);
 
+pub const POLARIS_REGISTER_STATIC_BLOCK: u32 =
+    iow!(MAGIC, 0x12, PolarisRegisterStaticBlockArg);
+
+pub const POLARIS_UNMAP_STATIC_BLOCK: u32 =
+    iow!(MAGIC, 0x13, PolarisUnmapStaticBlockArg);
+
+pub const POLARIS_REGISTER_BLOCK_MAPPING: u32 =
+    iow!(MAGIC, 0x14, PolarisRegisterBlockMappingArg);
+
+pub const POLARIS_UNMAP_BLOCK_MAPPINGS: u32 =
+    iowr!(MAGIC, 0x15, PolarisUnmapBlockMappingsArg);
+
+pub const POLARIS_SPILL_BLOCK: u32 =
+    iowr!(MAGIC, 0x16, PolarisSpillBlockArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.
@@ -129,4 +144,49 @@ pub fn ioctl_write<T>(fd: i32, cmd: u32, arg: &T) -> Result<(), i32> {
     } else {
         Ok(())
     }
+}
+
+/// Register a v4 fault-capable VA-space with polaris.ko.
+pub fn register_vaspace(fd: i32, arg: &PolarisRegisterVaSpaceArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_REGISTER_VASPACE, arg)
+}
+
+/// Query a logical block's current state.
+pub fn block_get_state(fd: i32, arg: &mut PolarisBlockGetStateArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_BLOCK_GET_STATE, arg)
+}
+
+/// Branch a session, sharing its current block table entries with COW semantics.
+pub fn session_branch(fd: i32, arg: &mut PolarisSessionBranchArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_SESSION_BRANCH, arg)
+}
+
+/// Unregister a v4 VA-space and any static M2 blocks attached to it.
+pub fn unregister_vaspace(fd: i32, arg: &PolarisUnregisterVaSpaceArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_UNREGISTER_VASPACE, arg)
+}
+
+/// Register an M2 static external allocation block for synthetic fault tests.
+pub fn register_static_block(fd: i32, arg: &PolarisRegisterStaticBlockArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_REGISTER_STATIC_BLOCK, arg)
+}
+
+/// Unmap an M2/M3 diagnostic static block after it has been fault-mapped once.
+pub fn unmap_static_block(fd: i32, arg: &PolarisUnmapStaticBlockArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_UNMAP_STATIC_BLOCK, arg)
+}
+
+/// Register a v4 logical block mapping for spill teardown.
+pub fn register_block_mapping(fd: i32, arg: &PolarisRegisterBlockMappingArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_REGISTER_BLOCK_MAPPING, arg)
+}
+
+/// Unmap all UVM-observed v4 mappings for a logical block.
+pub fn unmap_block_mappings(fd: i32, arg: &mut PolarisUnmapBlockMappingsArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_UNMAP_BLOCK_MAPPINGS, arg)
+}
+
+/// Unmap observed UVM mappings for a logical block and queue an OFFLOAD decision.
+pub fn spill_block(fd: i32, arg: &mut PolarisSpillBlockArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_SPILL_BLOCK, arg)
 }

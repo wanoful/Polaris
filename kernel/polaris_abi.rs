@@ -71,6 +71,7 @@ pub const POLARIS_RESERVE_FLAG_WRITE_NEW: u32 = 1 << 2;
 pub const POLARIS_RESERVE_FLAG_FULL_OVERWRITE_NO_PRESERVE: u32 = 1 << 3;
 pub const POLARIS_RESERVE_FLAG_DEFER_FAULT: u32 = 1 << 4;
 pub const POLARIS_RELEASE_FLAG_STREAM_QUIESCED: u32 = 1 << 0;
+pub const POLARIS_REGISTER_GPU_FLAG_TRANSIENT: u32 = 1 << 0;
 
 pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 
@@ -115,9 +116,9 @@ pub struct PolarisRegisterVaRangeArg {
 // The shim creates a fault-capable, externally-owned GPU VA-space
 // (NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING | IS_EXTERNALLY_OWNED),
 // hands it to UVM via UvmRegisterGpuVaSpace, then announces it to polaris.ko
-// with POLARIS_REGISTER_VASPACE. va_space_token is the duped RM VA-space
-// handle UVM also sees — polaris.ko uses it as the per-(worker, gpu) key
-// when the UVM fault hook dispatches into it.
+// with POLARIS_REGISTER_VASPACE. va_space_token is the user RM VA-space
+// handle UVM also stores in gpu_va_space->user_rm_va_space — polaris.ko uses
+// it as the per-(worker, gpu) key when the UVM fault hook dispatches into it.
 //
 // managed_base / managed_length carve the VA window inside the polaris-owned
 // VA-space within which the fault hook is allowed to install PTEs. Anything
@@ -129,10 +130,11 @@ pub struct PolarisRegisterVaRangeArg {
 pub struct PolarisRegisterVaSpaceArg {
     pub gpu_id: u32,
     pub _reserved0: u32,
+    pub rm_client_token: u64,
     pub va_space_token: u64,
     pub managed_base: u64,
     pub managed_length: u64,
-    pub _reserved1: [u64; 4],
+    pub _reserved1: [u64; 3],
 }
 
 #[repr(C)]
@@ -140,8 +142,68 @@ pub struct PolarisRegisterVaSpaceArg {
 pub struct PolarisUnregisterVaSpaceArg {
     pub gpu_id: u32,
     pub _reserved0: u32,
+    pub rm_client_token: u64,
     pub va_space_token: u64,
-    pub _reserved1: [u64; 2],
+    pub _reserved1: [u64; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisRegisterStaticBlockArg {
+    pub gpu_id: u32,
+    pub rm_control_fd: i32,
+    pub rm_client_token: u64,
+    pub va_space_token: u64,
+    pub base: u64,
+    pub length: u64,
+    pub offset: u64,
+    pub h_client: u32,
+    pub h_memory: u32,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisUnmapStaticBlockArg {
+    pub gpu_id: u32,
+    pub _reserved0: u32,
+    pub rm_client_token: u64,
+    pub va_space_token: u64,
+    pub base: u64,
+    pub length: u64,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisRegisterBlockMappingArg {
+    pub block_id: u64,
+    pub gpu_id: u32,
+    pub _reserved0: u32,
+    pub rm_client_token: u64,
+    pub va_space_token: u64,
+    pub base: u64,
+    pub length: u64,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisUnmapBlockMappingsArg {
+    pub block_id: u64,
+    pub flags: u32,
+    pub unmapped_count: u32,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisSpillBlockArg {
+    pub block_id: u64,
+    pub flags: u32,
+    pub unmapped_count: u32,
+    pub decision_id: u64,
+    pub _reserved: [u64; 3],
 }
 
 #[repr(C)]

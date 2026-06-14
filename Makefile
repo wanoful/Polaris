@@ -2,16 +2,39 @@
 #
 # Variables (override on command line or via environment):
 #   KDIR          - Kernel source/build tree
+#   NVIDIA_KO_DIR - Patched open-gpu-kernel-modules tree or kernel-open dir
 #   CC            - C compiler (default: cc)
 #   POLARIS_RUSTC - Path to rustc for kernel builds (auto-detected on Arch)
 #
 # Examples:
 #   make KDIR=/path/to/kernel          # specify kernel tree
+#   make kernel NVIDIA_KO_DIR=/home/wano/workspace/open-gpu-kernel-modules
 #   make kernel CC=clang               # build kernel module with clang
 #   make setup-pacman-rustc            # one-time setup on Arch
 
 KDIR          ?= /lib/modules/$(shell uname -r)/build
 CC            ?= cc
+DEFAULT_NVIDIA_KO_DIR := $(abspath $(CURDIR)/third_party/open-gpu-kernel-modules)
+SIBLING_NVIDIA_KO_DIR := $(abspath $(CURDIR)/../open-gpu-kernel-modules)
+
+ifeq ($(origin NVIDIA_KO_DIR),undefined)
+    NVIDIA_KO_DIR := $(DEFAULT_NVIDIA_KO_DIR)
+    NVIDIA_KO_DIR_FROM_DEFAULT := 1
+else
+    NVIDIA_KO_DIR_FROM_DEFAULT := 0
+endif
+
+ifneq (,$(wildcard $(NVIDIA_KO_DIR)/kernel-open/Module.symvers))
+    POLARIS_EXTRA_SYMBOLS ?= $(abspath $(NVIDIA_KO_DIR)/kernel-open/Module.symvers)
+else ifneq (,$(wildcard $(NVIDIA_KO_DIR)/Module.symvers))
+    POLARIS_EXTRA_SYMBOLS ?= $(abspath $(NVIDIA_KO_DIR)/Module.symvers)
+else ifeq ($(NVIDIA_KO_DIR_FROM_DEFAULT),1)
+    ifneq (,$(wildcard $(SIBLING_NVIDIA_KO_DIR)/kernel-open/Module.symvers))
+        POLARIS_EXTRA_SYMBOLS ?= $(abspath $(SIBLING_NVIDIA_KO_DIR)/kernel-open/Module.symvers)
+    else ifneq (,$(wildcard $(SIBLING_NVIDIA_KO_DIR)/Module.symvers))
+        POLARIS_EXTRA_SYMBOLS ?= $(abspath $(SIBLING_NVIDIA_KO_DIR)/Module.symvers)
+    endif
+endif
 
 # --- auto-detect pacman rustc for kernel builds (Arch Linux) ------------------
 # The Linux kernel's Rust-for-Linux requires the *exact* rustc build that
@@ -46,13 +69,14 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  KDIR=<path>              Kernel source/build tree"
+	@echo "  NVIDIA_KO_DIR=<path>     Patched open-gpu-kernel-modules tree for UVM symbols"
 	@echo "  POLARIS_RUSTC=<path>     rustc for kernel builds (auto-detected)"
 	@echo "  CC=<compiler>            C compiler (default: cc)"
 
 all: kernel userspace
 
 kernel:
-	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules CC=$(CC) RUSTC="$(POLARIS_RUSTC)"
+	$(MAKE) -C $(KDIR) M=$(PWD)/kernel modules CC=$(CC) RUSTC="$(POLARIS_RUSTC)" KBUILD_EXTRA_SYMBOLS="$(POLARIS_EXTRA_SYMBOLS)"
 
 userspace:
 	cargo build --release

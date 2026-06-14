@@ -17,7 +17,8 @@ POLARIS (**P**aged **O**perating **L**ayer for **A**ccelerated **R**outing and *
 - Research claim defined: OS-level paging for KV Cache with kernel-authoritative block table, COW, and eviction policies.
 
 ### Phase 1a: NVIDIA UVM Fault Hook Spike **[DONE]**
-- Patched `nvidia-uvm.ko` exists at `third_party/open-gpu-kernel-modules/`.
+- Patched `nvidia-uvm.ko` is tracked as the `third_party/open-gpu-kernel-modules`
+  submodule on the `polaris-v4` branch.
 - The hook (`polaris_uvm_handle_gpu_fault`, exported from `kernel/polaris_export.c`) is callable from the UVM replayable-fault bottom half via C symbol.
 - `kernel/polaris_uvm.h` defines the C header for the hook.
 - **Diagnostic result:** A CUDA kernel touching a raw unmapped CUDA VMM VA produces `Xid 31`, `FAULT_PDE`, `cudaErrorIllegalAddress` — raw CUDA VMM holes are *not* automatically serviced as UVM replayable faults on driver 610.43.02. The hook works but a fully transparent fault-driven path is not achievable without a different VA substrate or a deeper driver integration. The explicit prefetch/offload path remains the benchmarkable route. See `docs/fault-driven-analysis.md` for full evidence.

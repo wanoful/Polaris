@@ -1,0 +1,302 @@
+# M2 Static-Block Fault Diagnostic
+
+This directory contains the staged M2 diagnostic for the v4 fault path:
+
+```text
+UVM synthetic fault
+  -> uvm_polaris_dispatch_fault()
+  -> polaris.ko handle_gpu_fault
+  -> uvm_polaris_map_external_allocation()
+  -> HANDLED
+```
+
+The M3 diagnostic extension adds:
+
+```text
+POLARIS_UNMAP_STATIC_BLOCK
+  -> uvm_polaris_unmap_external_allocation()
+  -> second synthetic fault remaps the same external range
+```
+
+The block-level M3 diagnostic adds the production-oriented teardown key:
+
+```text
+POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
+  -> synthetic fault records the observed gpu_va_space_ptr
+  -> POLARIS_UNMAP_BLOCK_MAPPINGS(block_id)
+  -> second synthetic fault remaps the same external range
+```
+
+The diagnostic creates real RM objects, registers a fault-capable GPU
+VA-space with UVM, creates a UVM external range, registers the same
+`(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
+optionally asks UVM's builtin test ioctl to dispatch a synthetic fault through
+the live hook.
+
+## Prerequisites
+
+- Patched `nvidia-uvm.ko` from the `polaris-v4` driver branch loaded.
+- UVM builtin tests enabled so `UVM_TEST_POLARIS_DISPATCH_FAULT` is accepted.
+- `polaris.ko` built against the patched UVM `Module.symvers` and loaded.
+- CUDA headers and `libcuda.so` available.
+- The `third_party/open-gpu-kernel-modules` submodule, or pass
+  `NVIDIA_KO_DIR=/path/to/open-gpu-kernel-modules`.
+
+Build Polaris and the diagnostic:
+
+```sh
+make kernel
+make -C tests/m2
+```
+
+Build with explicit paths:
+
+```sh
+make kernel NVIDIA_KO_DIR=/path/to/open-gpu-kernel-modules
+make -C tests/m2 NVIDIA_KO_DIR=/path/to/open-gpu-kernel-modules CUDA_HOME=/usr/local/cuda
+```
+
+## Setup-Only Probe
+
+This validates RM client/device/VA-space/memory allocation, UVM GPU/VA-space
+registration, UVM external-range creation, and polaris.ko static-block
+registration. It pre-maps the external allocation through the stock UVM ioctl
+and does not dispatch a Polaris-serviced fault:
+
+```sh
+sudo tests/m2/m2_static_block_setup
+```
+
+Optional positional arguments:
+
+```text
+tests/m2/m2_static_block_setup [cuda_ordinal] [polaris_gpu_id] [base]
+```
+
+## Synthetic Fault Dispatch
+
+This leaves the external range unmapped, probes UVM for the exact dispatch key,
+registers that key with polaris.ko, then dispatches a synthetic write fault:
+
+```sh
+sudo tests/m2/m2_static_block_setup --dispatch-fault
+```
+
+Expected success ends with:
+
+```text
+M2 Polaris fault-dispatch test passed.
+```
+
+The test also prints the observed UVM dispatch key:
+
+```text
+UVM dispatch key: gpu_id=<id> client=0x<rm_client> token=0x<user_rm_va_space> result=1
+```
+
+`result=1` is `UVM_POLARIS_FAULT_HANDLED`.
+
+## Unmap / Refault Diagnostic
+
+This validates the first M3 spill primitive. It fault-maps the static block,
+asks polaris.ko to unmap it through the new UVM bridge, then dispatches a
+second synthetic fault that must remap the same external range:
+
+```sh
+sudo tests/m2/m2_static_block_setup --unmap-refault
+```
+
+Expected success ends with:
+
+```text
+M2 Polaris unmap/refault test passed.
+```
+
+## Block Unmap / Refault Diagnostic
+
+This validates the next M3 teardown primitive. It creates a real Polaris
+session and logical block, registers that block's worker mapping against the
+same static external allocation, fault-maps it, unmaps by `block_id` through
+`POLARIS_UNMAP_BLOCK_MAPPINGS`, verifies one observed mapping was unmapped,
+then dispatches a second synthetic fault that must remap the range:
+
+```sh
+sudo tests/m2/m2_static_block_setup --block-unmap-refault
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris block unmap/refault test passed.
+```
+
+This still does not perform device-to-host copy or RM allocation release. It
+only proves the block-to-worker mapping registry and UVM unmap/refault
+teardown path that production spill will build on.
+
+## Spill Ioctl Validation
+
+This validates the public M3 spill ioctl surface for the static harness. It
+creates a real Polaris session and logical block, registers its worker mapping,
+then calls `POLARIS_SPILL_BLOCK` while the logical block is still unresident.
+The expected result is `ENOENT`: the ioctl exists, decodes correctly, validates
+the block, and refuses to queue an `OFFLOAD` decision without a resident
+physical handle.
+
+```sh
+sudo tests/m2/m2_static_block_setup --spill-validation
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris spill ioctl validation passed.
+```
+
+Positive spill execution still needs a daemon/runtime-created resident logical
+block. The static RM harness maps a diagnostic RM allocation through UVM, but
+that allocation is not stored as `gpu_phys_handle` in the logical block table,
+so it cannot prove device-to-host copy or RM allocation release.
+
+For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
+contains an ignored root-only test that uses a fake userspace executor to
+complete `ALLOC`, `OFFLOAD`, and `RELOAD` decisions. It validates that
+`POLARIS_SPILL_BLOCK` queues the expected `OFFLOAD` decision and that a later
+overwrite reserve of the same offloaded block queues `RELOAD`, without
+exercising NVIDIA UVM channel registration.
+
+The same ignored test file also covers the first M4 COW control-plane slice:
+branching a session increments parent block refcounts, overwrite reserve on
+the child creates a private block, and the queued `COW_BREAK` decision carries
+the writer's destination VA. The test also checks that the child session's
+block table contains only the new private block after the split, so teardown
+does not accidentally release the parent's remaining block.
+
+It also covers the first multi-worker mapping cleanup slice without CUDA:
+two v4 worker VA-spaces register mappings for the same logical block, explicit
+`POLARIS_UNREGISTER_VASPACE` removes only the first worker's mapping, and
+closing the second worker fd reaps the remaining mapping. The test checks
+`v4_va_spaces` and `block_mappings` in `/sys/kernel/polaris/stats` after each
+step.
+
+Two additional ignored tests cover logical block lifetime cleanup without CUDA:
+`SESSION_DESTROY` and `BLOCK_RELEASE` both remove stale block mappings for a
+deferred, unmapped logical block. Those tests require a freshly loaded
+`polaris.ko` built with the block-mapping cleanup fix.
+
+`child_block_release_decrements_inherited_shared_block` covers the COW-shared
+release case: after `SESSION_BRANCH`, the child releases an inherited block
+through `BLOCK_RELEASE`, the parent's block remains, and its refcount drops
+from 2 to 1.
+`child_block_release_reaps_only_child_mapping_for_shared_block` extends that
+coverage to block-to-worker mappings: parent and child mappings are registered
+for the shared block, child release reaps only the child's mapping, and the
+parent mapping remains until its VA-space is explicitly unregistered.
+
+`worker_process_exit_reaps_vaspace_and_block_mapping` covers the first M6
+worker-lifetime control-plane slice. It spawns a child process that opens
+`/dev/polaris`, registers one v4 VA-space and block mapping, then the parent
+kills the child and verifies fd-close cleanup drops both `v4_va_spaces` and
+`block_mappings`. The same path records the registering pid and exposes a
+`v4_worker_pids` aggregate in `/sys/kernel/polaris/stats`; it does not yet
+exercise a real UVM `gpu_va_space_ptr` invalidation callback.
+
+The M5 shim allocator slice is build-covered under `libpolaris-shim`:
+`make -C libpolaris-shim all tests` builds the LD_PRELOAD library plus
+`build/smoke` and `build/managed_alloc`. `managed_alloc` resolves the shim's
+`cuMemAlloc_v2` / `cuMemFree_v2` interposers without linking CUDA and is meant
+to be run with `POLARIS_SHIM_MANAGE_ALLOCATIONS=1` after a freshly loaded
+`polaris.ko` is available. It validates the shim's allocator ioctl path over a
+provided harness VA-space. With `POLARIS_SHIM_CREATE_EXTERNAL_RANGES=1` and
+`POLARIS_SHIM_UVM_FD=<fd>`, the shim also creates the UVM external range on
+the already-registered UVM VA-space fd and frees it with `UVM_FREE` during
+explicit or exit cleanup.
+With `POLARIS_SHIM_BOOTSTRAP_RM_UVM=1`, the shim creates the RM/UVM VA-space
+itself and enables external-range creation automatically; this is the M5 path,
+not an M2 bridge diagnostic.
+Set `POLARIS_SHIM_TEST_LARGE_WINDOW=1` in bootstrapped mode to request three
+managed blocks in one allocation. This validates that the shim derived a
+managed window from the RM/UVM VA-space instead of using the old 4 MiB harness
+window.
+Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate common CUDA runtime setup
+pass-throughs (`cudaSetDevice`, `cudaGetDevice`, version queries, device
+count, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,
+`cudaDeviceGetAttribute`, peer-access probes, memory info, error query
+helpers, `cudaStreamWaitEvent`, `cudaStreamIsCapturing`, and stream/event
+lifecycle) before allocation.
+Set `POLARIS_SHIM_TEST_HOST_APIS=1` to validate pinned-host pass-throughs used
+by llama.cpp (`cudaMallocHost`, `cudaHostAlloc`, `cudaHostGetDevicePointer`,
+`cudaFreeHost`, `cudaHostRegister`, and `cudaHostUnregister`) before the
+managed allocation smoke.
+Set `POLARIS_SHIM_TEST_REUSE=1` to validate that explicit frees return token
+spans to the shim allocator and that an allocation larger than the configured
+managed window fails cleanly.
+Set `POLARIS_SHIM_TEST_ATTRS=1` to validate shim-serviced driver and runtime
+pointer-attribute metadata, including allocator-probe attributes such as
+`IS_MANAGED`, `DEVICE_ORDINAL`, and `MEMPOOL_HANDLE`, plus
+`cuMemGetAddressRange_v2` for a shim-managed pointer.
+Set `POLARIS_SHIM_TEST_RUNTIME_ALLOC=1` to run the same managed-allocation
+smoke through the runtime `cudaMalloc` / `cudaFree` interposers instead of
+the driver `cuMemAlloc_v2` / `cuMemFree_v2` interposers.
+Set `POLARIS_SHIM_TEST_MANAGED_ALLOC=1` to run it through
+`cudaMallocManaged` / `cudaFree`. This covers the llama.cpp
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY` allocation path while still treating the
+returned Polaris pointer as external-range device memory for metadata queries.
+Set `POLARIS_SHIM_TEST_ADVISE=1` with `POLARIS_SHIM_TEST_MANAGED_ALLOC=1` to
+validate that `cudaMemAdvise` against that Polaris pointer is accepted as a
+no-op compatibility hint.
+Set `POLARIS_SHIM_TEST_ASYNC_ALLOC=1` to run it through
+`cudaMallocAsync` / `cudaFreeAsync`; this implies the runtime allocation path.
+Set `POLARIS_SHIM_TEST_DRIVER_ASYNC_ALLOC=1` to run the same smoke through
+the driver stream-ordered allocation surface
+`cuMemAllocAsync_v2` / `cuMemFreeAsync_v2`.
+Set `POLARIS_SHIM_STRICT_MANAGED_ALLOC=1` when validating allocator
+exhaustion so oversize allocations fail in the shim instead of falling back to
+ordinary CUDA memory.
+Set `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and/or
+`POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` to restrict which allocations are
+managed by Polaris. Allocations outside the size policy intentionally fall
+through to CUDA even in strict mode. `POLARIS_SHIM_TEST_FILTER=1` validates
+this path for runtime `cudaMalloc` by checking that a 1 MiB allocation falls
+through when the minimum managed size is larger, then allocating an in-policy
+Polaris pointer.
+Set `POLARIS_SHIM_TEST_MEMCPY=1` to validate that runtime
+`cudaMemcpy` / `cudaMemcpyAsync` / `cudaMemcpy2DAsync` /
+`cudaMemcpyPeerAsync` / `cudaMemcpy3DPeerAsync` and driver
+`cuMemcpyHtoD_v2` / `cuMemcpyDtoH_v2` / generic `cuMemcpy_v2` calls involving
+shim-managed Polaris pointers are caught by the shim and return
+`cudaErrorNotSupported` instead of falling through to CUDA.
+Set `POLARIS_SHIM_TEST_MEMSET=1` to validate the same guard behavior for
+runtime `cudaMemset` / `cudaMemsetAsync` and driver `cuMemsetD8_v2` /
+`cuMemsetD16_v2` / `cuMemsetD32_v2` plus their async variants.
+Set `POLARIS_SHIM_TEST_IPC=1` to validate that driver and runtime IPC handle
+export calls reject shim-managed Polaris pointers with `cudaErrorNotSupported`.
+Set `POLARIS_SHIM_TEST_GRAPH=1` to validate that runtime
+`cudaStreamBeginCapture`, `cudaStreamEndCapture`, and `cudaGraphLaunch`, plus
+driver `cuStreamBeginCapture_v2`, reject graph capture/launch while
+shim-managed Polaris allocations are live.
+Set `POLARIS_SHIM_TEST_VMM=1` to validate that CUDA driver VMM symbols used by
+llama.cpp resolve through the shim and reach the real driver through a safe
+invalid-argument probe.
+Set `POLARIS_SHIM_TEST_LAUNCH=1` to validate that runtime and driver kernel
+launch symbols and related helper symbols resolve through the shim without
+executing kernels.
+Set `POLARIS_SHIM_TEST_LEAK=1` when running `managed_alloc` to validate the
+shim's process-exit cleanup for outstanding managed allocations.
+
+## Notes
+
+- This is not the production shim path. It intentionally uses direct RM/UVM
+  ioctls from the harness so M2 can validate the kernel bridge before
+  the production workload path is complete.
+- The harness registers its GPU entry as transient. After the fd closes,
+  `/sys/kernel/polaris/stats` should show `gpus: 0`, `v4_va_spaces: 0`, and
+  `static_blocks: 0`; after `--block-unmap-refault` or `--spill-validation`,
+  it should also show `block_mappings: 0`. Hook counters remain cumulative
+  for the loaded module.
+- UVM dispatch and Polaris registration use
+  `(gpu_id, rm_client_token, va_space_token)`. RM object handles are only
+  unique within an RM client, so the client token is required when concurrent
+  diagnostics use recycled `hVaSpace` values.
+- The default VA base is `0x1000000000` and the managed range is 4 MiB.
+- The static block is 2 MiB.

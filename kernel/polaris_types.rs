@@ -71,6 +71,21 @@ pub const POLARIS_REGISTER_VASPACE: u32 =
 pub const POLARIS_UNREGISTER_VASPACE: u32 =
     kernel::ioctl::_IOW::<PolarisUnregisterVaSpaceArg>(POLARIS_IOCTL_MAGIC, 0x11);
 
+pub const POLARIS_REGISTER_STATIC_BLOCK: u32 =
+    kernel::ioctl::_IOW::<PolarisRegisterStaticBlockArg>(POLARIS_IOCTL_MAGIC, 0x12);
+
+pub const POLARIS_UNMAP_STATIC_BLOCK: u32 =
+    kernel::ioctl::_IOW::<PolarisUnmapStaticBlockArg>(POLARIS_IOCTL_MAGIC, 0x13);
+
+pub const POLARIS_REGISTER_BLOCK_MAPPING: u32 =
+    kernel::ioctl::_IOW::<PolarisRegisterBlockMappingArg>(POLARIS_IOCTL_MAGIC, 0x14);
+
+pub const POLARIS_UNMAP_BLOCK_MAPPINGS: u32 =
+    kernel::ioctl::_IOWR::<PolarisUnmapBlockMappingsArg>(POLARIS_IOCTL_MAGIC, 0x15);
+
+pub const POLARIS_SPILL_BLOCK: u32 =
+    kernel::ioctl::_IOWR::<PolarisSpillBlockArg>(POLARIS_IOCTL_MAGIC, 0x16);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -188,15 +203,45 @@ pub struct PolarisGpu {
 }
 
 /// v4 fault-capable VA-space registered by libpolaris-shim. One entry per
-/// (worker pid, gpu) pair; va_space_token is the duped RM GPU VA-space handle
-/// and matches what UVM hands the fault hook in uvm_polaris_dispatch_fault.
+/// (worker pid, gpu) pair; rm_client_token and va_space_token are the user RM
+/// client and GPU VA-space handles UVM stored from UvmRegisterGpuVaSpace and
+/// replays to the fault hook.
 #[derive(Clone, Debug)]
 pub struct PolarisVaSpace {
     pub gpu_id: u32,
     pub pid: i32,
+    pub rm_client_token: u64,
     pub va_space_token: u64,
     pub managed_base: u64,
     pub managed_length: u64,
+}
+
+/// M2 microbenchmark-only static mapping: one externally-created RM memory
+/// allocation mapped on first fault into a registered UVM GPU VA-space.
+#[derive(Clone, Debug)]
+pub struct PolarisStaticBlock {
+    pub gpu_id: u32,
+    pub rm_client_token: u64,
+    pub va_space_token: u64,
+    pub base: u64,
+    pub length: u64,
+    pub offset: u64,
+    pub rm_control_fd: i32,
+    pub h_client: u32,
+    pub h_memory: u32,
+}
+
+/// v4 block-to-worker mapping tracked for production spill teardown. A
+/// mapping becomes unmap-capable after a UVM fault records gpu_va_space_ptr.
+#[derive(Clone, Debug)]
+pub struct PolarisBlockMapping {
+    pub block_id: u64,
+    pub gpu_id: u32,
+    pub rm_client_token: u64,
+    pub va_space_token: u64,
+    pub base: u64,
+    pub length: u64,
+    pub last_gpu_va_space_ptr: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -279,3 +324,18 @@ unsafe impl kernel::transmute::AsBytes for PolarisRegisterVaSpaceArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisUnregisterVaSpaceArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisUnregisterVaSpaceArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisRegisterStaticBlockArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRegisterStaticBlockArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisUnmapStaticBlockArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisUnmapStaticBlockArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisRegisterBlockMappingArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRegisterBlockMappingArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisUnmapBlockMappingsArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisUnmapBlockMappingsArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisSpillBlockArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisSpillBlockArg {}

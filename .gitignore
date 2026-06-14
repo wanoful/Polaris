@@ -47,3 +47,6 @@ benchmarks/results/
 *.csv
 *.png
 *.pdf
+
+# Test harness binaries
+/tests/m2/m2_static_block_setup

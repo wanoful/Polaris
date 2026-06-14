@@ -1,6 +1,6 @@
 # POLARIS Roadmap v4
 
-Date: 2026-06-10
+Date: 2026-06-10 (revised 2026-06-12 after polaris-v4 driver branch landed)
 
 This roadmap supersedes v3. v3 adopted Method A (explicit-lease CUDA VMM
 paging) because raw CUDA VMM VA holes produce fatal MMU faults, not
@@ -14,13 +14,49 @@ The worker is oblivious. polarisd decides. polaris.ko executes.
 ## Direction
 
 > Transparent kernel-directed KV paging on a UVM-registered fault-capable
-> VA-space. A small LD_PRELOAD shim hides VA-space setup. polaris.ko owns
-> a copy-engine channel, a VRAM partition, and all PTE installs. polarisd
-> owns the block table and policy. Workers run unmodified.
+> VA-space. A small LD_PRELOAD shim hides VA-space setup and registers each
+> KV range as a UVM external range. polaris.ko owns a VRAM partition (RM
+> allocations whose handles UVM can map) and the policy mirror that drives
+> fault servicing; PTE installs go through UVM's existing external-range map
+> path via a new GPL-exported bridge. polarisd owns the block table and
+> policy. Workers run with a CUDA-driver-visible managed/external pointer
+> and require no source changes for the basic `cudaMalloc` / `cudaMallocManaged`
+> + kernel access
+> + free path.
 
 The lease API from v3 is not part of the production path. v3 lease code may
 remain as a fallback for diagnostics and for non-fault-capable contexts but
 should not be the integration target.
+
+## What changed in this revision
+
+This revision reconciles the original 2026-06-10 plan with the three commits
+that actually landed on the `polaris-v4` driver branch
+(`eaed5057`, `30e9c9a5`, `00debab0`). The revisions:
+
+- The driver-side hook is the **only** kernel ABI Polaris commits to. PMM and
+  channel-manager exports (the original commits 3 and 4) are dropped from the
+  plan: PMM stays internal to UVM, and PTE installs go through a single new
+  bridge `uvm_polaris_map_external_allocation()` that reuses UVM's external-
+  range path instead of giving polaris.ko its own CE channel.
+- polaris.ko's VRAM does not come from carving a PMA partition. polaris.ko
+  allocates RM memory objects (one per block, page-size-aligned) and hands
+  `(h_client, h_memory)` to UVM through the bridge. UVM does the actual PTE
+  programming and TLB invalidate.
+- The hook contract is single-fault (`gpu_id, rm_client_token,
+  va_space_token, gpu_va_space_ptr, fault_address, access_type`),
+  RCU-published, module-owner refcounted. UVM dispatches under
+  `service_lock` + va_space read lock already held; the hook may sleep but
+  should not block userspace IPC.
+- `va_space_token` is the **user RM VA-space handle** that the shim sees
+  through `UvmRegisterGpuVaSpace`, not the duped handle UVM keeps.
+  `rm_client_token` is the user RM client handle from the same registration.
+  The shim must pass both handles to polaris.ko because RM object handles are
+  scoped to an RM client.
+- Application transparency is downgraded from "no source changes ever" to:
+  llama.cpp's `cudaMalloc` KV path is transparent through the shim;
+  PyTorch / vLLM still require an allocator backend in M7 because their
+  caching allocators bypass driver-API interception.
 
 ## Why this works where raw CUDA VMM did not
 
@@ -47,52 +83,87 @@ CUDA app code                 intercept allocator,      block→worker map,     
 | Layer | Owns | Does not own |
 |-------|------|--------------|
 | worker | its CUDA context, the VA-space object, its own kernels | mapping, unmapping, block IDs, eviction |
-| shim | per-process VA-space creation, allocator interception, ioctl registration with polaris.ko | data movement, policy, block state |
-| polaris.ko | VRAM partition, CE channel, PTE installs into all registered worker VA-spaces, block→worker mapping, fault hot path | logical block lifecycle, eviction decisions, host buffer slot assignment |
-| polarisd | block table, eviction/spill policy, host pinned pool slot assignment, COW arbitration | PTE writes, CE submissions, fault servicing |
+| shim | per-process VA-space creation, allocator interception, UVM external-range registration for KV VA, ioctl registration with polaris.ko | data movement, policy, block state, PTE programming |
+| polaris.ko | block→worker map, policy mirror, fault hook implementation, RM allocation pool for KV chunks, host pinned pool DMA mapping, scheduling slow-path upcalls to polarisd | direct PTE writes (delegated to UVM through the bridge), the fault buffer, CE channel state |
+| polarisd | block table, eviction/spill policy, host pinned pool slot assignment, COW arbitration, mirror push to polaris.ko | PTE writes, fault servicing, hot-path decisions |
 
 ## Driver-side changes (open-gpu-kernel-modules)
 
-Rebase from `polaris-610.43.02`. Discard the `pvm-driver` branch entirely.
-Land three small commits against stock UVM, no RM changes.
+Status: landed on branch `polaris-v4` (commits `eaed5057`, `30e9c9a5`,
+`00debab0` on top of `polaris-610.43.02`). Total UVM diff is ~280 LOC.
+RM is untouched. The `pvm-driver` branch is frozen as a research artifact
+and is not part of the v4 production path.
 
-1. `uvm: export polaris fault hook registration`
-   - Add `polaris_uvm_register_hook(struct polaris_uvm_ops *)`,
-     `polaris_uvm_unregister_hook()`. Hook ops vector carries one function:
-     `int handle_gpu_fault(u32 gpu_id, u64 va_space_token, u64 addr, u32 access)`.
-   - Weak default returns `POLARIS_UVM_FAULT_NOT_MINE`.
-   - `EXPORT_SYMBOL_GPL`.
+The three commits, as actually landed:
 
-2. `uvm: call polaris hook in replayable fault service path`
-   - In `uvm_gpu_replayable_faults.c`, inside `service_fault_batch_dispatch`
-     (called from `service_fault_batch`), after the per-fault VA-space has
-     been resolved by `uvm_parent_gpu_fault_entry_to_va_space` and before
-     the managed/ATS branch dispatches, call the registered hook with the
-     decoded `(gpu, va_space_token, addr, access)`.
-   - `HANDLED` → mark fault for replay and skip UVM managed/ATS servicing.
-   - `NOT_MINE` → fall through to stock UVM path.
-   - `ERROR` → route through existing UVM fatal/cancel path.
-   - Define `va_space_token` as a stable kernel handle the shim and
-     polaris.ko both reference (RM VA-space handle is the natural choice).
+1. `uvm: export polaris fault hook registration` (`eaed5057`)
+   - Adds `kernel-open/nvidia-uvm/uvm_polaris.{c,h}`: a single-slot
+     RCU-protected `uvm_polaris_ops` pointer with `EXPORT_SYMBOL_GPL`'d
+     `uvm_polaris_register_hook()` / `uvm_polaris_unregister_hook()`.
+   - Registration uses `cmpxchg` to enforce a single owner;
+     unregister waits via `synchronize_rcu()` so in-flight dispatchers
+     finish before the caller is allowed to free its storage.
+   - `uvm_polaris_dispatch_fault()` resolves `(gpu_id, rm_client_token,
+     va_space_token, gpu_va_space_ptr, fault_address, access_type)` from a
+     `uvm_gpu_va_space_t *` and calls the hook under
+     `try_module_get(ops->owner)` so polaris.ko cannot be rmmod'd while
+     a fault is mid-flight.
+   - `va_space_token` is the **user RM VA-space handle**
+     (`gpu_va_space->user_rm_va_space`) and `rm_client_token` is the user RM
+     client handle (`gpu_va_space->user_rm_client`). Both are populated from
+     `UvmRegisterGpuVaSpace`; polaris.ko uses the pair as the stable
+     per-worker key in its block→worker map.
 
-3. `uvm: expose pmm reservation entry point` (only when needed)
-   - `EXPORT_SYMBOL_GPL` wrappers for `uvm_pmm_gpu_alloc_kernel` /
-     `uvm_pmm_gpu_free` so polaris.ko can carve a VRAM partition at module
-     init.
-   - Defer until commit 1+2 are working; option A (use PMM directly) first.
+2. `uvm: call polaris hook in replayable fault service path` (`30e9c9a5`)
+   - Inserts a call to `uvm_polaris_dispatch_fault()` at the top of
+     `service_fault_batch_dispatch` in
+     `kernel-open/nvidia-uvm/uvm_gpu_replayable_faults.c`, immediately
+     after the per-fault VA-space is resolved by `service_fault_batch()`
+     and before any managed-VA or ATS lookup runs.
+   - `HANDLED`: set `current_entry->filtered = true`, `*block_faults = 1`,
+     return `NV_OK`. UVM's outer loop then advances past this entry and
+     issues its normal batch replay; polaris.ko has already serviced the
+     fault end-to-end (RM allocation, host→VRAM copy if needed, PTE install
+     through the bridge in commit 3 below).
+   - `ERROR`: route through the existing `service_fault_batch_fatal_notify`
+     path with `NV_ERR_OPERATING_SYSTEM` and `UVM_FAULT_CANCEL_VA_MODE_ALL`.
+   - `NOT_MINE`: fall through unchanged to the stock managed/ATS dispatch.
+   - The dispatcher uses RCU internally, so this adds a
+     `rcu_read_lock`/`rcu_read_unlock` pair per fault on the hot path.
 
-4. `uvm: export channel manager and push primitives for polaris`
-   - `EXPORT_SYMBOL_GPL` a minimal CE-channel surface that lets polaris.ko
-     run spill/reload copies through UVM's existing channel infrastructure
-     instead of standing up its own: channel-manager create/destroy,
-     `uvm_push_begin`/`_end`, the CE memcopy helper, and tracker wait.
-   - Defer until M3 actually needs it; land commits 1+2 first.
+3. `uvm: add polaris PTE bridge and fault dispatch test` (`00debab0`)
+   - Adds `uvm_polaris_map_external_allocation()` (in
+     `uvm_map_external.c`, GPL-exported): polaris.ko passes the
+     `gpu_va_space_ptr` it received in `handle_gpu_fault`, the VA range
+     `(base, length, offset)`, and the RM allocation handle
+     `(rm_control_fd, h_client, h_memory)`; UVM looks up the
+     `uvm_va_range_external_t` covering the range and calls
+     `uvm_map_external_allocation_on_gpu()` to install the PTEs. PTE
+     programming and TLB invalidate stay UVM's responsibility.
+   - This replaces the original v4 commit-4 plan (export the channel
+     manager and PMM so polaris.ko could push CE work itself). Reusing
+     UVM's existing external-range path is significantly less surface
+     area and avoids re-implementing channel/tracker bookkeeping.
+   - Adds `UVM_TEST_POLARIS_DISPATCH_FAULT` ioctl so the hook can be
+     end-to-end tested by synthesizing a fault from userspace, without
+     real GPU hardware-faulting traffic. Enabled only with builtin tests.
 
-Total expected diff against stock UVM: ~150–200 LOC, almost all in the
-export wrappers. Survives driver bumps with small rebases — the export
-surface is the only ABI we commit to, and it stays small. No RM changes,
-no PVM neutral bridge, no backend arbitration, no access-counter
-translator. Delete the entire pvm-driver branch contents.
+What this means for polaris.ko's VRAM model: polaris.ko does **not** carve
+a PMA partition or own a CE channel. It allocates per-block RM memory
+objects (page-size-aligned device memory), records `(h_client, h_memory)`
+in the block table, and when a fault arrives calls the bridge to map the
+right block into the faulting worker's VA range. Spill / reload is then
+"unmap the external range across all workers holding it" + "free the RM
+allocation" + "the next access re-faults and gets a fresh allocation".
+
+What is **not** done in the driver tree and stays deferred:
+
+- PMM and channel-manager GPL exports — out of scope after the bridge
+  approach landed.
+- A real RM ISR/bottom-half handoff into polaris-owned fault servicing —
+  not needed for v4; UVM keeps interrupt ownership.
+- The full PVM neutral RM bridge that lived on `pvm-driver` — explicitly
+  abandoned. The branch stays for reference only.
 
 ## Polaris-side components
 
@@ -100,35 +171,58 @@ translator. Delete the entire pvm-driver branch contents.
 
 New in v4. Replaces the v3 "kernel as lease bookkeeper" role.
 
-- **VA-space registry**: ioctl `POLARIS_REGISTER_VASPACE(gpu, va_space_fd,
-  managed_range)` from the shim. Kernel takes a refcount on the RM VA-space
-  object, records the worker pid, stores the `(gpu, va_space_token, range)`
-  tuple for hook lookups.
-- **Block→worker map**: `block_id → {(va_space_token, va)}`. Refcounted.
+- **VA-space registry**: ioctl
+  `POLARIS_REGISTER_VASPACE(gpu, rm_client_token, user_rm_va_space,
+  managed_range)` from the shim. The `rm_client_token` and
+  `user_rm_va_space` fields are the same RM handles the shim passed to
+  `UvmRegisterGpuVaSpace`; they match what UVM passes on the fault hot path.
+  polaris.ko records `(gpu, rm_client_token, va_space_token, range,
+  worker pid, owning gpu_va_space_ptr-on-first-fault)` for hook lookups.
+- **Block→worker map**: `block_id → {(rm_client_token, va_space_token, va)}`.
+  Refcounted.
   Drives spill teardown across all workers that share a block.
-- **VRAM partition**: option A first (call `uvm_pmm_gpu_alloc` per chunk),
-  option B (carve a contiguous reservation) only if PMM policy fights us.
-- **CE channel**: one per GPU, allocated through UVM's channel manager via
-  the GPL-exported entry points (commit 4). Used exclusively for
-  spill/reload copies. polaris.ko does not reimplement channel state — it
-  borrows UVM's, so RM channel conventions, pushbuffer layout, and tracker
-  semantics stay UVM's problem across driver bumps.
+- **VRAM block pool**: per-block RM allocations (one per logical block,
+  page-size-aligned device memory) obtained through RM's standard
+  allocation path. polaris.ko keeps the `(h_client, h_memory)` tuple for
+  each resident block and reuses it across re-mappings. **No PMA carve-out,
+  no CE channel ownership.**
+- **PTE install through UVM bridge**: on fault, after picking which block
+  to materialize, polaris.ko calls
+  `uvm_polaris_map_external_allocation(gpu_va_space_ptr, base, length,
+  offset, rm_control_fd, h_client, h_memory)`. UVM does the actual PTE
+  programming, TLB invalidate, and tracker bookkeeping on its existing
+  external-range path.
 - **Host pinned pool DMA mapping**: ioctl to ingest a polarisd-allocated
-  pinned region, build sg-list, hand to CE.
+  pinned region, build sg-list, and hand to UVM-side copy infrastructure
+  for spill/reload. (Data movement on cold→hot transitions still goes
+  through the same UVM-owned channel polaris.ko piggybacks on via the
+  external-range path; for spill, polaris.ko unmaps and lets the next
+  fault re-materialize with fresh content from host.)
 - **Fault hook implementation**:
-  1. `(va_space_token, addr)` → block_id via registry.
+  1. `(rm_client_token, va_space_token, fault_address)` → block_id via registry.
   2. Block state from kernel-side policy mirror.
-  3. Resident in VRAM → install PTE in this worker's VA-space → `HANDLED`.
-  4. Resident on host → allocate VRAM chunk (recursive eviction if pool
-     full, per kernel-side policy mirror), CE-copy host→VRAM, install
-     PTE, `HANDLED`.
-  5. No block known for this VA → `NOT_MINE` (UVM falls through to
-     managed/fatal as appropriate).
+  3. Block resident in VRAM (RM alloc still held) → call
+     `uvm_polaris_map_external_allocation` to (re)install PTE → `HANDLED`.
+  4. Block offloaded to host pinned pool → allocate fresh RM device alloc,
+     copy host → device through whatever copy path is wired (initial slice
+     can use `cuMemcpyHtoDAsync` from a polaris-owned worker thread that
+     has the right context; later optimizations may push directly), call
+     bridge, `HANDLED`.
+  5. No block known for this VA → `NOT_MINE`.
+  6. Hard failure (OOM, RM alloc fails, bridge returns error) → `ERROR`
+     so UVM cancels the fault through `service_fault_batch_fatal_notify`.
 - **Policy mirror**: shadow of polarisd's per-block flags (pinned, movable,
   priority, COW group). Refreshed by ioctl from polarisd. Read-only on
   the fault path. No userspace round-trip in hot path.
 - **Slow-path upcalls**: netlink or chardev read queue for events polarisd
-  must arbitrate (new block on cold fault, COW split on write-to-shared).
+  must arbitrate (cold fault on a VA range that has no logical block yet,
+  COW split on write-to-shared).
+- **Hook lifecycle**: at module init, publish ops vector via
+  `uvm_polaris_register_hook()`; at exit, call
+  `uvm_polaris_unregister_hook()` which waits via `synchronize_rcu()` so no
+  in-flight dispatcher is still inside polaris.ko before the module unloads.
+  UVM additionally pins the module via `try_module_get(ops->owner)` for
+  each dispatch.
 
 ### libpolaris-shim.so
 
@@ -136,17 +230,40 @@ New in v4. The transparency layer that v3 did not need.
 
 - `LD_PRELOAD` (or installed as a CUDA driver-API hook layer).
 - On `cuInit` / first CUDA call: create a fault-capable externally-owned
-  VA-space, register with UVM via `UvmRegisterGpuVaSpace`, hand the token
-  to polaris.ko.
+  GPU VA-space (via the existing RM path that already sets
+  `NV_VASPACE_ALLOCATION_FLAGS_ENABLE_PAGE_FAULTING |
+  IS_EXTERNALLY_OWNED`), register it with UVM via `UvmRegisterGpuVaSpace`,
+  hand the **same RM client and RM VA-space handles** to polaris.ko via
+  `POLARIS_REGISTER_VASPACE`. These handles are what UVM stores into
+  `gpu_va_space->user_rm_client` / `gpu_va_space->user_rm_va_space` and
+  replays back on the hook, so the shim and polaris.ko must agree on them
+  byte-for-byte.
 - Intercept `cuMemAlloc`, `cudaMalloc`, and the PyTorch/llama.cpp
-  allocator-backend entry points used by target workloads. Reserve VA
-  inside the Polaris VA-space, return the pointer, **do not map**.
-- Tell polaris.ko which VA range backs which logical Polaris allocation
-  (so the fault hook can resolve `addr → block_id`).
-- Intercept `cuMemFree` / `cudaFree` to deregister the range.
-- Out-of-scope for v1: capturing `cuMemAllocAsync`, stream-ordered
-  allocators, multi-context apps. Add only when a target workload needs
-  them.
+  allocator-backend entry points used by target workloads. For each
+  allocation:
+  1. Reserve VA inside the Polaris VA-space (return the pointer).
+  2. Register the VA range with UVM as an **external range**
+     (`UvmCreateExternalRange` or equivalent) — required by the bridge,
+     because `uvm_polaris_map_external_allocation` looks up an existing
+     `uvm_va_range_external_t` covering the fault address.
+  3. Tell polaris.ko which VA range backs which logical Polaris allocation
+     via `POLARIS_REGISTER_RANGE` (so the fault hook can resolve
+     `rm_client_token + va_space_token + addr → block_id`).
+  4. Do **not** map any pages. Faults populate them on demand.
+- Intercept `cuMemFree` / `cudaFree` to unregister the range, drop the
+  external range, and let polaris.ko reclaim block table state.
+- Application transparency limits (see also "Application transparency"
+  below):
+  - The basic `cudaMalloc` + kernel-deref + `cudaMemcpy` + `cudaFree` path
+    is transparent.
+  - CUDA IPC (`cuIpcGetMemHandle`) and CUDA Graph capture of KV
+    accesses are not transparent; KV ranges in those APIs are out of
+    scope for v1 and must either fall back to the v3 lease path or be
+    documented as unsupported.
+  - PyTorch caching allocator ownership of KV memory remains out of scope
+    for M5. The shim now covers runtime stream-ordered symbols for smoke
+    tests, but M7 still needs an explicit allocator backend to make
+    framework-owned KV allocations intentional.
 
 ### polarisd
 
@@ -191,18 +308,29 @@ Keep most of v3's identity; change the control surface.
 
 ```
 worker GPU dereferences ptr in Polaris range
-  → MMU miss → replayable fault → UVM ISR
-  → polaris_uvm_handle_gpu_fault(gpu, va_space_token, addr, READ)
-  → polaris.ko: (token, addr) → block B
-  → B.location = host:slot H
-  → allocate VRAM chunk C (evict victim per mirror policy if pool full)
-  → CE copy: H → C, wait semaphore
-  → write PTE: VA → C in this worker's VA-space
-  → return HANDLED
-  → UVM replays the faulting work
+  → MMU miss → replayable fault → UVM ISR / bottom half
+  → service_fault_batch() resolves (gpu_va_space, fault_address)
+  → service_fault_batch_dispatch() calls uvm_polaris_dispatch_fault()
+  → polaris.ko's handle_gpu_fault(gpu_id, rm_client_token,
+                                  va_space_token, gpu_va_space_ptr,
+                                  addr, access)
+  → (rm_client_token, va_space_token, addr) → block B
+  → B's state = host-resident, slot H
+  → ensure a device-side RM allocation D for B (allocate if missing)
+  → copy H → D (initial slice uses async memcpy; later replaced with
+    a UVM-borrowed copy path)
+  → call uvm_polaris_map_external_allocation(gpu_va_space_ptr,
+        B's VA base, B's length, 0,
+        D.rm_control_fd, D.h_client, D.h_memory)
+  → UVM programs the PTEs, batches TLB invalidate, returns
+  → polaris.ko returns HANDLED
+  → UVM marks current_entry filtered, advances *block_faults
+  → outer loop replays the fault batch → GPU re-issues the access
 ```
 
-No IPC to polarisd on this path. Budget: tens of microseconds.
+No IPC to polarisd on this path. Hot-path budget: tens to a few hundred
+microseconds; the bridge call itself walks UVM's external-range map and
+PTE batch, which is bounded by block size, not VA-space size.
 
 ### Spill (policy-driven)
 
@@ -210,9 +338,10 @@ No IPC to polarisd on this path. Budget: tens of microseconds.
 polarisd: pick block B per LRU/phase
   → ioctl POLARIS_SPILL(B, prefer_slot=H)
   → polaris.ko: for each (worker, va) in B.mappings:
-       unmap PTE in worker's VA-space, enqueue TLB invalidate
-     CE copy: C → H, wait semaphore
-     free chunk C back to pool
+       unmap PTE in worker's VA-space (via the same external-range path)
+       enqueue TLB invalidate
+     copy D → H (sync wait on the copy)
+     release D's RM allocation back to the pool
   → reply: B at host:H
   → polarisd updates block table
 ```
@@ -226,7 +355,8 @@ fault → polaris.ko: no block known for (token, addr)
   → if VA in shim-registered range that has no block yet:
        upcall to polarisd, block until reply
        polarisd: create block, push state, reply
-       polaris.ko: allocate VRAM, optionally zero, install PTE, HANDLED
+       polaris.ko: allocate RM device memory, optionally zero,
+                   call bridge to install PTE, HANDLED
   → else: NOT_MINE → UVM fatal
 ```
 
@@ -239,90 +369,418 @@ fault with access=WRITE on block B with refcount>1
   → polaris.ko sees mirror flag B.cow=true, refcount>1
   → upcall to polarisd
   → polarisd: allocate new block B', record split, push state
-  → polaris.ko: CE copy B→B', install PTE for B' in this worker only,
-                leave other workers mapped to B, return HANDLED
+  → polaris.ko: allocate new RM device alloc D' for B',
+                copy D → D' (async),
+                call bridge to install PTE for B' in this worker only,
+                leave other workers mapped to D, return HANDLED
 ```
 
 ## Correctness Invariants
 
-1. PTE installs happen only from polaris.ko, only against VA-spaces
-   registered by a shim instance whose pid still exists.
-2. CE submissions and the resulting PTE update for a single fault are
-   ordered: copy completion is observed before PTE write.
-3. Spill tears down PTEs in every worker holding the block before the CE
-   copy starts, and TLB invalidation completes before VRAM is freed.
+1. PTE installs happen only through `uvm_polaris_map_external_allocation`,
+   only against `gpu_va_space_ptr` values polaris.ko received in
+   `handle_gpu_fault` from a still-live worker, only against VA ranges
+   the shim registered as UVM external ranges.
+2. The RM allocation D backing a block must remain alive for the full
+   span from "bridge call begins" through "UVM completes its TLB invalidate
+   and the worker has replayed the faulting access". polaris.ko refcounts
+   D against active mappings and pending hook returns.
+3. Spill tears down PTEs in every worker holding the block before the
+   data is reused for a different block. The unmap and the
+   reallocation/reload of D for a different block must not overlap.
 4. Policy mirror is read-only on the fault path; updates from polarisd
    are applied under a sequence number the fault path snapshots.
 5. The fault hook never blocks on polarisd except on cold-fault and COW
    slow paths, and those paths must be reachable only when the fault
    would otherwise be fatal anyway.
 6. Worker process death drops the VA-space refcount; polaris.ko reaps
-   all PTE state for that worker before allowing block table reuse.
+   all block→worker mapping entries for that worker before allowing
+   block-table reuse. The `try_module_get(ops->owner)` UVM holds across
+   each dispatch prevents polaris.ko from unloading while a hook call is
+   in flight; `uvm_polaris_unregister_hook()` waits via
+   `synchronize_rcu()` before returning to the caller's module exit.
+
+## Application transparency
+
+This section replaces the original v4 claim of unconditional zero source
+changes. The honest position:
+
+**Transparent through shim, no source changes**:
+- `cudaMalloc` / `cuMemAlloc_v2` / `cudaFree` paths
+- Direct kernel dereference (`kernel<<<...>>>(p)` then `p[i]`)
+- `cudaMemcpy` between Polaris pointers and host
+- Pointer arithmetic and sub-range arguments
+
+**Requires Polaris allocations to be registered as external ranges**:
+- `cuPointerGetAttribute` queries for `CU_POINTER_ATTRIBUTE_MEMORY_TYPE`
+  and `CU_POINTER_ATTRIBUTE_DEVICE_POINTER` — driver must recognize the
+  VA. The shim's external-range registration is what makes this work.
+
+**Not transparent in v1**:
+- `cuIpcGetMemHandle` and IPC-based sharing.
+- CUDA Graph capture of accesses that depend on faulting in KV pages.
+- PyTorch caching allocator ownership of KV memory — even though the shim can
+  interpose runtime allocation symbols such as `cudaMallocAsync`, M7 still
+  needs an allocator backend to force PyTorch KV allocations through Polaris
+  deliberately.
+
+The course / paper claim should be: **llama.cpp's KV cache path is
+transparent**; vLLM and PyTorch require an explicit backend.
 
 ## Non-Goals
 
 - Kernel-side shared page tables across worker VA-spaces. Each worker
-  keeps a private page table. Sharing is at the *physical block* level,
+  keeps a private page table. Sharing is at the *RM allocation* level,
   not the PTE level.
-- A neutral RM bridge ("PVM"). polaris.ko talks to UVM and RM through
-  existing exported APIs and the one new hook.
+- A neutral RM bridge ("PVM"). polaris.ko talks to UVM through
+  `uvm_polaris_*` and to RM only via standard allocation APIs.
 - Replacing UVM. UVM continues to own managed memory, ATS, fault
-  arbitration, and the ISR. Polaris is a tenant.
+  arbitration, the ISR, and external-range PTE programming on
+  Polaris's behalf.
 - Userspace residency leases as a required framework API.
 - Access-counter-driven residency policy in v1. Add only when measurement
   shows stock policy is the bottleneck.
+- PMA partition carving in polaris.ko.
+- A polaris-owned CE channel.
 
 ## Milestones
 
-### M1: Driver hook lands
+### M1: Driver hook lands ✅ (driver tree)
 
-- UVM patches 1 and 2 above, against `polaris-610.43.02`.
-- Stub polaris.ko registers the hook, returns `NOT_MINE` for everything.
-- CI: build the driver, load, register, unregister, unload cleanly.
+Done on `polaris-v4`: commits `eaed5057` + `30e9c9a5` + `00debab0`.
+The UVM side of M1/M2/M3 is materially complete:
 
-### M2: Fault-capable VA-space end-to-end
+- `uvm_polaris_register_hook` / `uvm_polaris_unregister_hook` exported.
+- Hook dispatched per fault in `service_fault_batch_dispatch` with
+  HANDLED / ERROR / NOT_MINE semantics.
+- `uvm_polaris_map_external_allocation` bridge available so polaris.ko
+  does not need its own CE channel.
+- `UVM_TEST_POLARIS_DISPATCH_FAULT` ioctl for synthetic-fault e2e tests
+  without GPU hardware faulting.
 
-- Shim creates a fault-capable VA-space, registers with UVM, registers
-  with polaris.ko.
-- polaris.ko hot path returns `HANDLED` for one statically-pre-mapped
-  block in a microbenchmark process.
-- Verifies the fault → hook → PTE-install → replay path on real
-  hardware.
+Polaris-side status:
 
-### M3: CE-driven spill/reload
+- polaris.ko publishes the ops vector at init and unregisters it at exit.
+- The M2 static-block fault path is wired: registered VA-spaces and static
+  RM allocation blocks are mirrored into a small fast lookup table, and a
+  matching synthetic UVM fault calls `uvm_polaris_map_external_allocation`
+  before returning `HANDLED`.
+- The M3 unmap/refault diagnostic path is wired: UVM exports
+  `uvm_polaris_unmap_external_allocation`, polaris.ko exposes
+  `POLARIS_UNMAP_STATIC_BLOCK` plus the logical-block
+  `POLARIS_REGISTER_BLOCK_MAPPING` / `POLARIS_UNMAP_BLOCK_MAPPINGS`
+  teardown pair, and the M2 harness validates fault-map → unmap →
+  refault-map on real hardware through both the static and block-mapping
+  paths.
+- VA-space lookup is keyed by `(gpu_id, rm_client_token, va_space_token)`.
+  `va_space_token` is an RM object handle and is only unique inside the RM
+  client. The UVM hook now dispatches both user RM handles, and the builtin
+  test ioctl reports both so concurrent harnesses do not cross-match.
+- `make kernel` now consumes the patched UVM `Module.symvers` from the
+  sibling `../open-gpu-kernel-modules` checkout when available.
 
-- UVM commit 4 lands the channel-manager / push GPL exports.
-- polaris.ko allocates a CE channel through UVM's channel manager and owns
-  the VRAM partition (option A, via PMM).
-- Spill ioctl and reload-on-fault paths implemented.
-- Single-worker microbenchmark: allocate > VRAM partition, dereference
-  pattern that forces spill/reload, validate data integrity.
+Still to do on the Polaris side for M1/M2:
 
-### M4: Multi-worker block sharing
+- CI: build the driver, load polaris.ko, register / unregister, unload
+  cleanly. Use the test ioctl to confirm dispatch returns expected codes
+  with and without a registered hook.
 
-- Refcounted `block → {worker, va}` map.
+### M2: Fault-capable VA-space end-to-end ✅
+
+- M2 harness creates a fault-capable VA-space, registers it with UVM,
+  probes the exact `(gpu_id, rm_client_token, user_rm_va_space)` key UVM
+  will dispatch, and registers that key with polaris.ko.
+- M2 harness registers one external range and one static RM allocation block
+  so the bridge can resolve it.
+- polaris.ko hot path returns `HANDLED` for that statically-pre-allocated
+  block by calling `uvm_polaris_map_external_allocation` directly.
+- Hardware validation passed on an RTX 5070 Ti / driver 610.43.02 with
+  patched `nvidia-uvm.ko` loaded and builtin UVM tests enabled:
+  `tests/m2/m2_static_block_setup`, `--dispatch-fault`, and the M3
+  `--unmap-refault` and `--block-unmap-refault` diagnostics all pass.
+- Production shim still needs in-shim RM/UVM VA-space creation and external-
+  range registration; current shim only bootstraps a harness-created
+  VA-space through environment variables.
+
+### M3: External-allocation-driven spill/reload
+
+- polaris.ko owns a pool of RM device allocations (one per logical block,
+  page-size-aligned). `nvidia-uvm.ko`'s commit-3/4 PMM/CE exports are
+  **not** needed; the bridge replaces them.
+- First slice complete: `uvm_polaris_unmap_external_allocation` tears down an
+  external mapping for the UVM GPU VA-space observed on a previous fault, and
+  `POLARIS_UNMAP_STATIC_BLOCK` proves the same block can refault and remap.
+- Second slice complete: polaris.ko has a logical block-mapping registry
+  keyed by `block_id`; the fault hook records the observed
+  `gpu_va_space_ptr` for registered block mappings; and
+  `POLARIS_UNMAP_BLOCK_MAPPINGS` unmaps all observed UVM mappings for that
+  block. The M2 harness's `--block-unmap-refault` mode creates a real
+  session/block, registers its mapping, fault-maps it, unmaps by `block_id`,
+  verifies `unmapped_count == 1`, and refaults successfully.
+- Third slice complete: `POLARIS_SPILL_BLOCK` is in the ABI. It first tears
+  down observed UVM mappings with the same block-level unmap helper, then
+  queues the existing `OFFLOAD` decision for resident logical blocks so
+  polarisd performs device → host copy and physical-handle release through
+  the normal completion path. The M2 harness validates the ioctl's unresident
+  block rejection (`--spill-validation`), but the static RM harness cannot
+  positively execute copy/release because it does not create a daemon-owned
+  CUDA VMM resident block.
+- Remaining production spill test: create a resident logical block through
+  the daemon/runtime path, call `POLARIS_SPILL_BLOCK`, verify polarisd copies
+  device → host, releases the physical handle, completes the decision, and
+  updates kernel residency state to `CpuOffloaded`.
+- Kernel state-machine coverage added: `libpolaris` has an ignored
+  root-only `kernel_spill_state` test that drives
+  `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through
+  `GET_DECISION` / `COMPLETE_OPERATION` without invoking CUDA. This catches
+  the M3 control-plane contract even when the CUDA/UVM channel path is not
+  safe to run. It is build-covered by `cargo test`; execution requires a
+  freshly loaded `polaris.ko`.
+- Reload state-machine fix: overwriting an existing single-ref block now
+  triggers synchronous fault resolution when the block is not resident,
+  so `CpuOffloaded` blocks queue `RELOAD` instead of returning an unmapped
+  VA.
+- Reload on fault: re-allocate RM device memory, copy host → device, call
+  bridge, return HANDLED.
+- Single-worker microbenchmark: register external range larger than the
+  block pool, drive a deref pattern that forces spill/reload, validate
+  data integrity.
+
+### M4: Multi-worker block sharing + COW
+
+- Refcounted `block → {(rm_client_token, va_space_token, va)}` map.
 - Spill tears down across all workers.
-- COW split slow path (read-only beam-search workload).
+- COW split slow path (read-only beam-search workload): polaris.ko sees
+  write fault on refcount>1 block, upcalls polarisd, allocates fresh
+  device alloc for the writer, calls bridge for the new mapping, leaves
+  other workers mapped to the original.
+- First control-plane slice wired: `SESSION_BRANCH` refcounts parent
+  blocks, overwrite reserve on a shared child block creates a private block
+  and queues `COW_BREAK`, and the COW decision now carries the writer's
+  destination VA instead of `0` so userspace maps the private copy at the
+  faulting session VA. The child session's inherited block reference is
+  replaced with the private block during the split, so destroying the child
+  cannot later drop the parent's still-live block. `libpolaris/tests/kernel_spill_state.rs`
+  includes an ignored root-only fake-executor test for this branch/overwrite
+  path and validates the child block table after the split.
+- Multi-worker cleanup slice wired: the same ignored test file registers two
+  v4 worker VA-spaces for one logical block, registers one block mapping per
+  worker, then verifies explicit `POLARIS_UNREGISTER_VASPACE` and fd-close
+  cleanup remove only the matching worker's mapping before all v4 state
+  returns to zero. This covers the control-plane ownership rules for
+  block-to-worker mappings without invoking CUDA/UVM channel registration.
+- Block-lifetime cleanup slice wired: logical block mappings are reaped when
+  the logical block is removed by `BLOCK_RELEASE`, direct `SESSION_DESTROY`,
+  or successful daemon `FREE` completion. Ignored non-CUDA tests cover the
+  release and deferred-block session-destroy paths; execution requires a
+  freshly loaded `polaris.ko` because the currently pinned module may not
+  contain this cleanup fix.
+- COW-shared release cleanup wired: `BLOCK_RELEASE` now resolves blocks
+  through the session's accessible block-id list, so a child can release an
+  inherited shared block directly and decrement the shared refcount without
+  waiting for session teardown. When a shared release only decrements the
+  refcount, mappings in the releasing session's VA interval are reaped while
+  mappings for surviving sharers remain registered.
 
 ### M5: llama.cpp via shim
 
-- Shim intercepts llama.cpp's CUDA allocator.
-- Run llama.cpp end-to-end against shim+polaris.ko+polarisd, no source
-  changes to llama.cpp.
+- Shim intercepts llama.cpp's CUDA allocator for KV tensors.
+- First allocator-interposition slice wired: `libpolaris-shim.so` now exports
+  `cuMemAlloc`, `cuMemAlloc_v2`, `cudaMalloc`, `cudaMallocManaged`,
+  `cuMemFree`, `cuMemFree_v2`, and `cudaFree`. In opt-in harness mode
+  (`POLARIS_SHIM_MANAGE_ALLOCATIONS=1`)
+  the shim creates a Polaris session over the provided managed VA window,
+  reserves deferred logical blocks, registers block-to-worker mappings, and
+  returns Polaris VAs without mapping pages. This is build-covered by
+  `make -C libpolaris-shim all tests`; execution against live faults still
+  requires a freshly loaded module and a real UVM external range.
+- External-range slice wired for bootstrapper-owned UVM VA-spaces:
+  `POLARIS_SHIM_CREATE_EXTERNAL_RANGES=1` plus `POLARIS_SHIM_UVM_FD=<fd>`
+  makes each shim-managed allocation call `UVM_CREATE_EXTERNAL_RANGE` on the
+  same initialized UVM VA-space fd used for `UVM_REGISTER_GPU_VASPACE`, and
+  explicit frees call `UVM_FREE` for that range. This moves allocator-span
+  external-range lifecycle into the shim while full in-shim RM/UVM VA-space
+  creation is still pending.
+- In-shim RM/UVM bootstrap slice wired behind
+  `POLARIS_SHIM_BOOTSTRAP_RM_UVM=1`: the shim allocates an RM root client,
+  device, subdevice, and a fault-capable externally-owned `FERMI_VASPACE_A`,
+  initializes `/dev/nvidia-uvm`, calls `UVM_REGISTER_GPU` and
+  `UVM_REGISTER_GPU_VASPACE`, registers those same RM handles with
+  polaris.ko, and feeds the registered UVM fd into the external-range helper.
+  This removes the M2 harness requirement for VA-space and range creation,
+  but still needs live llama.cpp validation and production allocator-window
+  policy.
+- Shim allocator reuse wired: freed logical allocation spans are coalesced and
+  reused for later `cuMemAlloc` / `cudaMalloc` calls instead of permanently
+  advancing a one-way token cursor. The managed window is still fixed-size,
+  but ordinary alloc/free churn no longer exhausts it after successful frees.
+- Pointer-query compatibility slice wired: `cuMemGetAddressRange` /
+  `cuMemGetAddressRange_v2`, `cuPointerGetAttribute`,
+  `cuPointerGetAttributes`, and runtime `cudaPointerGetAttributes` now answer
+  metadata for shim-managed Polaris pointers, including allocator-probe
+  attributes (`HOST_POINTER`, `IS_MANAGED`, `DEVICE_ORDINAL`, and
+  `MEMPOOL_HANDLE`), so allocator/runtime code that probes CUDA pointer
+  metadata can proceed before a real GPU dereference.
+- Runtime allocator smoke wired: the non-fault `managed_alloc` harness can
+  drive the shim through `cudaMalloc` / `cudaFree` with
+  `POLARIS_SHIM_TEST_RUNTIME_ALLOC=1`, covering the allocator entry points
+  expected from llama.cpp before attempting a real GPU dereference.
+- Runtime managed-allocation smoke wired: the shim now exports
+  `cudaMallocManaged` and routes in-policy calls through the same Polaris
+  allocator table, with fallback to real CUDA for out-of-policy or non-strict
+  failures. The harness covers this with `POLARIS_SHIM_TEST_MANAGED_ALLOC=1`,
+  matching llama.cpp's `GGML_CUDA_ENABLE_UNIFIED_MEMORY` allocation branch.
+  Polaris-serviced pointers continue to report as device memory rather than
+  CUDA managed memory because they are external-range VAs owned by Polaris.
+- Stream-ordered allocation smoke wired: the shim now exports runtime
+  `cudaMallocAsync` / `cudaFreeAsync` and driver
+  `cuMemAllocAsync` / `cuMemAllocAsync_v2` /
+  `cuMemFreeAsync` / `cuMemFreeAsync_v2`, routes successful allocations
+  through the same fixed managed-window allocator, and the harness can
+  exercise these surfaces with `POLARIS_SHIM_TEST_ASYNC_ALLOC=1` and
+  `POLARIS_SHIM_TEST_DRIVER_ASYNC_ALLOC=1`.
+- Strict managed-allocation mode wired:
+  `POLARIS_SHIM_STRICT_MANAGED_ALLOC=1` makes exhausted or failed Polaris
+  allocations return CUDA allocation errors instead of silently falling back
+  to non-Polaris CUDA memory. This gives M5 KV-only experiments a way to
+  prove the allocation path stayed inside the managed window.
+- Size-policy allocator filter wired:
+  `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and
+  `POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` restrict Polaris interception to
+  selected allocation sizes. Out-of-policy allocations intentionally fall
+  through to the real CUDA allocator even in strict mode, while in-policy
+  failures keep strict-mode CUDA error behavior. The `managed_alloc` harness
+  covers this with `POLARIS_SHIM_TEST_FILTER=1` so M5 can target KV-sized
+  allocations without hijacking small CUDA runtime/control allocations.
+- Allocator observability wired:
+  `POLARIS_SHIM_REPORT_STATS=1` prints an exit-time summary of intercepted
+  allocation/free calls, size-policy pass-throughs, Polaris successes and
+  failures, real CUDA fallback calls/results, live managed bytes, and peak
+  live managed bytes. This gives llama.cpp/KV experiments a low-friction way
+  to confirm the size filter selected the intended allocations before running
+  the riskier kernel-deref fault path.
+- Bootstrapped managed-window default improved: in
+  `POLARIS_SHIM_BOOTSTRAP_RM_UVM=1` mode, the shim now derives the managed
+  allocator window from the RM-reported fault-capable VA-space instead of the
+  old 4 MiB harness default, with `POLARIS_SHIM_MANAGED_LENGTH_CAP` limiting
+  the default bring-up window. Explicit `POLARIS_SHIM_MANAGED_BASE` /
+  `POLARIS_SHIM_MANAGED_LENGTH` overrides still work for targeted smoke
+  tests.
+- Runtime setup compatibility slice wired: the shim forwards common runtime
+  setup calls (`cudaSetDevice`, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,
+  `cudaGetDevice`, `cudaGetDeviceCount`, `cudaGetDeviceProperties`,
+  `cudaDeviceGetAttribute`, `cudaDeviceCanAccessPeer`,
+  `cudaDeviceEnablePeerAccess`, `cudaRuntimeGetVersion`,
+  `cudaDriverGetVersion`, and `cudaDeviceSynchronize`) and records runtime
+  device selection before RM/UVM bootstrap when `POLARIS_SHIM_CUDA_ORDINAL` is
+  not explicit. It also forwards memory/error query calls commonly used by CUDA allocator probes
+  (`cudaMemGetInfo`, `cuMemGetInfo_v2`, runtime/driver error-name and
+  error-string helpers, `cudaGetLastError`, and `cudaPeekAtLastError`) plus
+  ordinary runtime stream/event lifecycle calls including
+  `cudaStreamWaitEvent` and `cudaStreamIsCapturing`. The `managed_alloc`
+  harness covers these with `POLARIS_SHIM_TEST_RUNTIME_SETUP=1`.
+- Managed-memory advice compatibility wired: `cudaMemAdvise` on a
+  shim-managed Polaris pointer returns success as a no-op instead of handing
+  the external-range VA to CUDA's managed-memory subsystem. Non-Polaris
+  pointers still fall through to the real runtime. The harness covers this
+  with `POLARIS_SHIM_TEST_ADVISE=1`.
+- llama.cpp host/query compatibility slice wired: the shim forwards pinned
+  host memory APIs (`cudaMallocHost`, `cudaHostAlloc`,
+  `cudaHostGetDevicePointer`, `cudaFreeHost`, `cudaHostRegister`, and
+  `cudaHostUnregister`) plus kernel query/tuning helpers
+  (`cudaFuncSetAttribute`, `cudaFuncGetAttributes`, and
+  `cudaOccupancyMaxActiveBlocksPerMultiprocessor`). The harness covers the
+  host-memory subset with `POLARIS_SHIM_TEST_HOST_APIS=1`; function helpers
+  are build-covered and left as pass-throughs because meaningful execution
+  needs real kernel symbols.
+- Memory-operation guard slice wired: the shim interposes common runtime and
+  driver copy/fill calls (`cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemset`,
+  `cudaMemsetAsync`, `cudaMemcpy2DAsync`, `cudaMemcpyPeerAsync`,
+  `cudaMemcpy3DPeerAsync`, `cuMemcpyHtoD_v2`, `cuMemcpyDtoH_v2`, generic
+  `cuMemcpy_v2`, their async variants, and
+  `cuMemsetD8` / `cuMemsetD16` / `cuMemsetD32` variants), classifies whether
+  a shim-managed Polaris pointer is involved, and fails such operations with
+  `cudaErrorNotSupported` instead of handing unmapped Polaris VA to CUDA.
+  This is intentionally a guard/scaffold; true transparent host copies and
+  fills still need the host/device data path from the reload/offload
+  machinery.
+- IPC guard slice wired: the shim interposes `cuIpcGetMemHandle` and
+  `cudaIpcGetMemHandle` and rejects shim-managed Polaris pointers with
+  `cudaErrorNotSupported`, matching v1's no-IPC contract while allowing
+  non-Polaris IPC calls to fall through.
+- CUDA Graph guard/pass-through slice wired: the shim interposes runtime
+  `cudaStreamBeginCapture`, `cudaStreamEndCapture`, and `cudaGraphLaunch`
+  plus driver `cuStreamBeginCapture` / `cuStreamBeginCapture_v2`, returning
+  the stream-capture unsupported error while shim-managed Polaris allocations
+  are live. Runtime graph lifecycle/update calls (`cudaGraphInstantiate`,
+  `cudaGraphExecUpdate`, `cudaGraphDestroy`, and `cudaGraphExecDestroy`) pass
+  through for non-Polaris graph management. The `managed_alloc` harness covers
+  the runtime and driver guards with `POLARIS_SHIM_TEST_GRAPH=1`.
+- CUDA VMM compatibility slice wired: the shim interposes and forwards the
+  driver VMM pool primitives used by llama.cpp's CUDA backend
+  (`cuMemAddressReserve`, `cuMemAddressFree`, `cuMemCreate`, `cuMemRelease`,
+  `cuMemMap`, `cuMemUnmap`, `cuMemSetAccess`, and
+  `cuMemGetAllocationGranularity`). These remain pass-through diagnostics and
+  workload-compatibility surfaces, not the v4 production path, because raw CUDA
+  VMM VA is still not fault-capable. The `managed_alloc` harness can validate
+  symbol coverage and driver pass-through with a non-deref invalid-argument
+  probe with
+  `POLARIS_SHIM_TEST_VMM=1`.
+- Kernel-launch compatibility slice wired: the shim interposes and forwards
+  runtime `cudaLaunchKernel` / `cudaLaunchKernelExC` and driver
+  `cuLaunchKernel` / `cuLaunchKernelEx` so llama.cpp's ordinary `<<<...>>>`
+  launches and CUDA 11.8+ PDL launch path stay visible through the shim. These
+  are pass-throughs rather than guards because the production v4 path requires
+  real kernels to fault on Polaris-managed VA. The `managed_alloc` harness
+  covers symbol routing without executing kernels via
+  `POLARIS_SHIM_TEST_LAUNCH=1`; intentionally invalid launch calls are not
+  used because some CUDA runtime paths dereference launch metadata before
+  returning an error.
+- Remaining llama.cpp helper compatibility wired: the shim forwards driver
+  device/context setup (`cuDeviceGet`, `cuDeviceGetAttribute`,
+  `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`), runtime peer/PCI helpers
+  (`cudaDeviceDisablePeerAccess`, `cudaDeviceGetPCIBusId`), host/cooperative
+  launch helpers (`cudaLaunchHostFunc`, `cudaLaunchHostFunc_v2`,
+  `cudaLaunchCooperativeKernel`), `cudaOccupancyMaxPotentialBlockSize`, and
+  graph node helpers (`cudaGraphGetNodes`, `cudaGraphNodeGetType`,
+  `cudaGraphKernelNodeGetParams`, `cudaGraphKernelNodeSetParams`). The
+  harness exercises safe query/host-callback calls and otherwise validates
+  symbol coverage without running kernels.
+- Run llama.cpp end-to-end against shim+polaris.ko+polarisd, with both the
+  ordinary `cudaMalloc` KV path and the `cudaMallocManaged` path selected by
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. CUDA Graph mode may need to be disabled
+  (or KV ranges excluded from graph capture); document the decision per
+  integration option.
+- Remaining production shim work: validate the bootstrapped path against
+  llama.cpp's actual KV allocation path, replace the fixed managed-window
+  reservation model with workload-appropriate VA management, and document or
+  disable CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening
 
-- Worker crash reaping.
-- Module unload with workers still attached (refcount drains).
-- Tracing for: faults serviced, faults rejected, spills, reloads, CE
-  occupancy, policy-mirror sequence drift.
-- Stress: dynamic KV growth, fragmentation pressure, OOM behavior.
+- Worker crash reaping (drop block→worker map entries when the
+  `gpu_va_space_ptr` goes away under us).
+- First worker-lifetime control-plane slice wired: v4 VA-space registrations
+  record the registering process pid for diagnostics, `/sys/kernel/polaris/stats`
+  reports `v4_worker_pids`, and an ignored non-CUDA test spawns a worker
+  process that registers a VA-space plus block mapping and verifies process
+  exit closes the fd and reaps both entries. This validates the current
+  chardev ownership hook; true UVM `gpu_va_space_ptr` invalidation callbacks
+  remain deferred.
+- Module unload with workers still attached: rely on UVM's
+  `try_module_get` + `synchronize_rcu` ordering; verify under stress.
+- Tracing for: faults serviced, faults rejected, spills, reloads, bridge
+  call latency, policy-mirror sequence drift.
+- Stress: dynamic KV growth, fragmentation pressure, OOM behavior on
+  both VRAM (RM alloc fails) and host pinned pool sides.
 
 ### M7: PyTorch / vLLM integration
 
-- Confirm or add PyTorch allocator backend interception.
-- Run vLLM under shim+polaris.ko+polarisd.
+- PyTorch caching allocator backend (`PYTORCH_CUDA_ALLOC_CONF`-driven or
+  custom backend) — LD_PRELOAD is not sufficient.
+- Run vLLM under shim+polaris.ko+polarisd. Document remaining gaps
+  (CUDA Graphs, IPC, paged-attention kernels that bypass the allocator).
 
 ## Out-of-Scope For v4
 
@@ -340,7 +798,7 @@ beats the v3 lease path on a real workload.
 - v3 explicit-lease API: keep behind `--legacy-lease` for diagnostics.
 - v3 kernel block-state machine: keep, polaris.ko v4 builds on it.
 - v3 offload/reload mechanics in polaris-runtime: keep for diagnostic
-  shell. Production path moves to polaris.ko's CE channel.
+  shell. Production reload now goes through `uvm_polaris_map_external_allocation`.
 - v3 llama.cpp fault-worker mode: delete.
 - v3 README claims about production replayable-fault paging: rewrite
   once M5 lands.
@@ -348,16 +806,29 @@ beats the v3 lease path on a real workload.
 ## Open Questions
 
 1. Can the shim reliably intercept PyTorch's caching allocator without
-   a custom backend? If not, M7 needs a `PYTORCH_CUDA_ALLOC_CONF`
-   backend ship.
-2. PMM partition (option B) vs per-chunk PMM calls (option A): need a
-   measurement on M3 to decide.
+   a custom backend? Confirmed **no** — M7 needs a
+   `PYTORCH_CUDA_ALLOC_CONF` backend ship. M5 stays llama.cpp-only.
+2. ~~PMM partition (option B) vs per-chunk PMM calls (option A)~~ — moot.
+   polaris.ko allocates per-block RM memory objects and lets the
+   `uvm_polaris_map_external_allocation` bridge install PTEs through
+   UVM's external-range path. PMM is not exported.
 3. Cold-fault upcall mechanism: netlink, chardev, or io_uring-style
    submission queue? Pick when M2 lands.
-4. Multi-GPU: one polaris.ko CE channel per GPU is mechanical; the
+4. Multi-GPU: one polaris.ko block pool per GPU is mechanical; the
    polarisd block table needs explicit GPU affinity. Decide before M4.
-5. UVM rebases: how often do the call sites in
-   `uvm_gpu_replayable_faults.c` (`service_fault_batch_dispatch`,
-   `uvm_parent_gpu_fault_entry_to_va_space`) and the channel-manager
-   export surface shift across driver versions? Track across 535 / 545 /
-   550 / 555 / 560.
+5. UVM rebases: how often does `service_fault_batch_dispatch`'s prologue
+   and the `uvm_va_range_external_t` lookup surface shift across driver
+   versions? Track across 535 / 545 / 550 / 555 / 560 / next.
+6. Host→device copy path for cold reload: the bridge handles PTE install,
+   but moving bytes from the pinned host pool into the freshly allocated
+   RM device memory still needs a concrete path. Initial slice uses an
+   in-context `cuMemcpyHtoDAsync` on a polaris-owned helper thread; M3
+   should evaluate whether UVM exposes a cheaper kernel-side copy
+   primitive without needing the dropped channel-manager export.
+7. Lock-budget audit on the hook hot path: the dispatcher runs with
+   va_space read lock + service_lock held; the bridge re-acquires them.
+   Measure bridge call latency under contention before M5.
+8. Stable VA-space key: today it is
+   `(gpu_id, gpu_va_space->user_rm_client, gpu_va_space->user_rm_va_space)`.
+   RM object handles are scoped to an RM client, so `va_space_token` alone is
+   not globally unique.

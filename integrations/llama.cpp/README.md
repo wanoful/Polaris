@@ -1,77 +1,140 @@
-# llama.cpp POLARIS Integration Plan
+# llama.cpp POLARIS v4 Integration
 
-This integration links `polaris-runtime` into llama.cpp and routes CUDA KV
-cache storage through a process-local CUDA VMM VA range managed by POLARIS.
+The v4 llama.cpp path is an unmodified-worker path: build llama.cpp normally,
+load `polaris.ko`, and run the binary with `libpolaris-shim.so` in
+`LD_PRELOAD`. The shim creates a fault-capable RM/UVM VA-space, registers the
+same RM client and user VA-space handles with `polaris.ko`, and intercepts CUDA
+allocation calls so selected buffers are returned from the Polaris-managed VA
+window.
 
-## Why llama.cpp First
+This replaces the older source-patch plan that linked `polaris-runtime` into
+llama.cpp and used raw CUDA VMM reservations. Raw CUDA VMM VA is not
+fault-capable, so it remains diagnostic/pass-through surface only.
 
-llama.cpp owns its ggml CUDA buffers and KV cache directly. That makes it a
-better first integration target than vLLM or SGLang, where most allocation
-policy sits above CUDA in PyTorch-oriented managers. The first comparison should
-therefore be:
+## Target Allocation Paths
 
-- llama.cpp baseline vs. llama.cpp + POLARIS for live tokens/s and memory.
-- vLLM/SGLang native managers vs. POLARIS trace replay for allocator behavior.
+The shim currently covers the llama.cpp CUDA allocation paths needed for M5:
 
-## Patch Points
+- `cudaMalloc` / `cudaFree`
+- `cudaMallocManaged` / `cudaFree`, for builds using
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY`
+- `cudaMallocAsync` / `cudaFreeAsync`
+- `cuMemAlloc_v2` / `cuMemFree_v2`
+- `cuMemAllocAsync_v2` / `cuMemFreeAsync_v2`
 
-The useful upstream files are:
-
-- `src/llama-kv-cache.cpp`
-  - KV tensors are created in the cache constructor.
-  - Accessors such as `get_k`, `get_v`, `cpy_k`, and `cpy_v` should keep seeing
-    stable contiguous GPU VAs.
-- `ggml/include/ggml-backend.h`
-  - Backend buffer API boundary used by KV tensor allocation.
-- `ggml/src/ggml-cuda/ggml-cuda.cu`
-  - CUDA backend allocation path.
-  - Existing CUDA VMM pool code is the closest local model for POLARIS-backed
-    virtual allocation.
-
-## Minimal First Version
-
-1. Add a CMake option, for example `LLAMA_POLARIS=ON`.
-2. Include `polaris_runtime.h` and link `libpolaris_runtime`.
-3. Initialize `polaris_runtime_t` after the CUDA backend has selected the
-   device/context.
-4. Reserve a POLARIS VA span large enough for KV cache tensors and expose the
-   returned `va_base` to the KV allocation path.
-5. Register session/block metadata through existing POLARIS ioctls when
-   llama.cpp reserves KV token ranges.
-6. Start the runtime thread or call `polaris_runtime_poll_once()` at safe points.
-7. Preserve ggml tensor pointer arithmetic: tensors should point into the
-   reserved virtual span even when physical GPU memory is not mapped yet.
-
-## Build Sketch
-
-From the POLARIS repo:
+Use the shim size policy to select likely KV-sized allocations without
+capturing small CUDA runtime/control allocations:
 
 ```sh
-cargo build -p polaris-runtime
+POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>
+POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>
+POLARIS_SHIM_STRICT_MANAGED_ALLOC=1
+POLARIS_SHIM_REPORT_STATS=1
 ```
 
-From the llama.cpp repo:
+Strict mode is important for experiments: if an in-policy allocation cannot be
+served by the Polaris allocator, the allocation fails instead of silently
+falling back to normal CUDA memory.
+
+## CUDA API Compatibility
+
+The shim forwards common setup/query APIs used by llama.cpp, including device
+selection, runtime/driver version checks, memory-info probes, stream/event
+lifecycle calls, pinned-host memory APIs, and kernel function query helpers.
+It also forwards runtime and driver kernel-launch entry points, including
+`cudaLaunchKernelExC` for llama.cpp's CUDA 11.8+ PDL path.
+Driver device/context helpers (`cuDeviceGet`, `cuDeviceGetAttribute`,
+`cuDevicePrimaryCtxRetain`, and `cuCtxSetCurrent`), PCI/peer helpers, host
+launch callbacks, cooperative launch, occupancy-potential queries, and graph
+node inspection/update helpers are pass-throughs as well.
+
+The shim also forwards CUDA driver VMM pool primitives used by llama.cpp's CUDA
+backend:
+
+- `cuMemAddressReserve`
+- `cuMemAddressFree`
+- `cuMemCreate`
+- `cuMemRelease`
+- `cuMemMap`
+- `cuMemUnmap`
+- `cuMemSetAccess`
+- `cuMemGetAllocationGranularity`
+
+These VMM calls are pass-through compatibility surfaces. They do not create
+Polaris-managed, fault-capable memory.
+
+## Guarded Surfaces
+
+CUDA copies/fills involving Polaris pointers currently return
+`cudaErrorNotSupported`. This is intentional until the production
+reload/offload data path wires transparent host/device copies.
+
+CUDA IPC export for Polaris pointers is also rejected.
+
+CUDA Graph capture and launch are guarded while Polaris allocations are live:
+`cudaStreamBeginCapture`, `cudaStreamEndCapture`, `cudaGraphLaunch`,
+`cuStreamBeginCapture`, and `cuStreamBeginCapture_v2` return the stream-capture
+unsupported error. For llama.cpp M5 runs, disable CUDA Graph mode or keep
+Polaris-managed KV ranges out of graph capture/replay.
+
+## Safe Bring-Up Smoke
+
+From the Polaris repo, build the shim and kernel:
 
 ```sh
-cmake -B build-polaris \
-  -DLLAMA_CUDA=ON \
-  -DLLAMA_POLARIS=ON \
-  -DPOLARIS_ROOT=/home/wano/workspace/Polaris
-cmake --build build-polaris -j
+make -C libpolaris-shim clean all tests
+make kernel KDIR=/lib/modules/$(uname -r)/build
 ```
 
-The first patch should keep the integration optional and compile-time gated.
-If `LLAMA_POLARIS` is off, llama.cpp must use its existing CUDA allocation path
-unchanged.
+Run the non-dereferencing shim smoke before testing a real workload:
 
-## Correctness Notes
+```sh
+sudo rmmod polaris 2>/dev/null || true
+sudo insmod kernel/polaris.ko
+sudo env \
+  POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
+  POLARIS_SHIM_TEST_RUNTIME_SETUP=1 \
+  POLARIS_SHIM_TEST_HOST_APIS=1 \
+  POLARIS_SHIM_TEST_MANAGED_ALLOC=1 \
+  POLARIS_SHIM_TEST_ADVISE=1 \
+  POLARIS_SHIM_TEST_LARGE_WINDOW=1 \
+  POLARIS_SHIM_TEST_ATTRS=1 \
+  POLARIS_SHIM_TEST_MEMCPY=1 \
+  POLARIS_SHIM_TEST_GRAPH=1 \
+  POLARIS_SHIM_TEST_VMM=1 \
+  POLARIS_SHIM_TEST_LAUNCH=1 \
+  POLARIS_SHIM_REPORT_STATS=1 \
+  POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
+  POLARIS_SHIM_TRANSIENT_GPU=1 \
+  POLARIS_SHIM_GPU_ID=0 \
+  POLARIS_SHIM_BLOCK_SIZE=0x200000 \
+  LD_PRELOAD=$PWD/libpolaris-shim/libpolaris-shim.so \
+  libpolaris-shim/build/managed_alloc
+cat /sys/kernel/polaris/stats
+sudo rmmod polaris
+```
 
-- `polarisd` must not call `cuMemMap` on behalf of llama.cpp. CUDA VMM mappings
-  are context-local, so the executor runs inside llama.cpp.
-- Multiple processes may reserve overlapping numeric GPU VA values. The kernel
-  fault path ultimately needs process/context identity in addition to the fault
-  address. Address-only lookup is enough for single-process bring-up, not for
-  the final multi-process claim.
-- Standard beam search mostly benefits from refcounted prefix sharing. COW break
-  remains a correctness path for explicit overwrite/speculative cases, but it
-  does not need a cross-process COW manager for the first llama.cpp prototype.
+This smoke does not launch kernels, does not map raw CUDA VMM memory, and does
+not dereference Polaris GPU pointers. The launch checks verify symbol coverage
+without invoking CUDA launch entry points.
+
+## Workload Run Shape
+
+Build llama.cpp with CUDA enabled using its normal upstream options. Then run
+with the shim preloaded:
+
+```sh
+sudo env \
+  POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
+  POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
+  POLARIS_SHIM_REPORT_STATS=1 \
+  POLARIS_SHIM_GPU_ID=0 \
+  POLARIS_SHIM_BLOCK_SIZE=0x200000 \
+  POLARIS_SHIM_MIN_MANAGED_ALLOC=<kv-floor-bytes> \
+  LD_PRELOAD=/home/wano/workspace/Polaris/libpolaris-shim/libpolaris-shim.so \
+  /path/to/llama.cpp/build/bin/<llama-binary> <args>
+```
+
+The next production milestone is validating this against llama.cpp's actual KV
+allocation path, then moving from the fixed managed-window allocator to
+workload-appropriate VA management.
