@@ -538,6 +538,19 @@ Still to do on the Polaris side for M1/M2:
   This removes the static-block table as a requirement for the live UVM bridge
   diagnostic, but it still uses harness/shim-created RM backing rather than
   daemon-created spill/reload backing.
+- Completion-backed bridge slice complete: successful
+  `POLARIS_COMPLETE_OPERATION` replies can now carry optional RM backing
+  metadata for resident logical blocks (`rm_control_fd`, `h_client`,
+  `h_memory`, `length`). polaris.ko stores that metadata on `ALLOC`, `RELOAD`,
+  and `COW_BREAK` completions, clears it on offload/free/error transitions, and
+  uses it for the same logical block fault mapping path as
+  `POLARIS_REGISTER_BLOCK_BACKING`. The M2 harness's
+  `--complete-backed-refault` mode reserves a real logical block without
+  `DEFER_FAULT`, completes the queued `ALLOC` decision with diagnostic RM
+  metadata, registers the worker mapping, fault-maps, unmaps by `block_id`, and
+  refaults successfully. This closes the kernel ABI gap for daemon/runtime
+  executors to publish UVM-bridge-mapable residency, but the executor still
+  needs real daemon-owned RM allocation and host/device copy wiring.
 - Real CUDA-kernel compatibility slice wired: exact UVM hook lookup remains
   keyed by `(gpu_id, rm_client_token, va_space_token)`, but when a real
   runtime CUDA kernel faults on a Polaris VA from CUDA's own registered

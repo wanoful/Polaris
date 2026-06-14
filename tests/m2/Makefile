@@ -17,6 +17,7 @@ CPPFLAGS += \
 	-I$(NVIDIA_KERNEL_OPEN)/nvidia-uvm \
 	-I$(NVIDIA_COMMON_INC) \
 	-I$(NVIDIA_UNIX_INC)
+LDFLAGS += -pthread
 LDLIBS += -lcuda
 
 .PHONY: all clean
@@ -24,7 +25,7 @@ LDLIBS += -lcuda
 all: m2_static_block_setup
 
 m2_static_block_setup: m2_static_block_setup.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
 	rm -f m2_static_block_setup

@@ -597,6 +597,14 @@ struct PolarisFaultMapping {
     h_memory: u32,
 }
 
+#[derive(Clone, Copy)]
+struct PolarisCompletedRmBacking {
+    rm_control_fd: i32,
+    h_client: u32,
+    h_memory: u32,
+    length: u64,
+}
+
 struct PolarisStaticBlockKey {
     gpu_id: u32,
     rm_client_token: u64,
@@ -731,6 +739,42 @@ fn polaris_clear_block_rm_backing(block: &mut PolarisBlock) {
     block.rm_h_memory = 0;
     block.rm_backing_length = 0;
     block.rm_backing_offset = 0;
+}
+
+fn polaris_complete_rm_backing(
+    arg: &PolarisCompleteOperationArg,
+) -> Result<Option<PolarisCompletedRmBacking>> {
+    let has_backing = arg.rm_control_fd != 0
+        || arg.rm_h_client != 0
+        || arg.rm_h_memory != 0
+        || arg.rm_backing_length != 0;
+    if !has_backing {
+        return Ok(None);
+    }
+    if arg.rm_h_client == 0 || arg.rm_h_memory == 0 || arg.rm_backing_length == 0 {
+        return Err(EINVAL);
+    }
+    Ok(Some(PolarisCompletedRmBacking {
+        rm_control_fd: arg.rm_control_fd,
+        h_client: arg.rm_h_client,
+        h_memory: arg.rm_h_memory,
+        length: arg.rm_backing_length,
+    }))
+}
+
+fn polaris_apply_completed_rm_backing(
+    block: &mut PolarisBlock,
+    backing: Option<PolarisCompletedRmBacking>,
+) {
+    if let Some(backing) = backing {
+        block.rm_control_fd = backing.rm_control_fd;
+        block.rm_h_client = backing.h_client;
+        block.rm_h_memory = backing.h_memory;
+        block.rm_backing_length = backing.length;
+        block.rm_backing_offset = 0;
+    } else {
+        polaris_clear_block_rm_backing(block);
+    }
 }
 
 fn polaris_snapshot_block_mappings(inner: &PolarisInner, block_id: u64) -> Result<KVec<PolarisMappingUnmap>> {
@@ -2857,8 +2901,14 @@ impl PolarisDevice {
             return Ok(0);
         }
 
-            // ── Success path ──
+        // ── Success path ──
         if arg.result == 0 {
+            let completed_rm_backing = polaris_complete_rm_backing(&arg)?;
+            if let Some(backing) = completed_rm_backing {
+                if backing.length < inner.blocks[block_idx].size_bytes {
+                    return Err(EINVAL);
+                }
+            }
             let prev_state;
             let gpu_id;
             let sz;
@@ -2878,7 +2928,7 @@ impl PolarisDevice {
                     PolarisBlockState::AllocPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
-                        polaris_clear_block_rm_backing(block);
+                        polaris_apply_completed_rm_backing(block, completed_rm_backing);
                         block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
                     }
                     PolarisBlockState::OffloadPending => {
@@ -2891,7 +2941,7 @@ impl PolarisDevice {
                     PolarisBlockState::ReloadPending | PolarisBlockState::CowPending => {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
-                        polaris_clear_block_rm_backing(block);
+                        polaris_apply_completed_rm_backing(block, completed_rm_backing);
                         let now = unsafe { bindings::ktime_get_mono_fast_ns() };
                         block.map_time_ns = now;
                         block.last_touch_ns = now;

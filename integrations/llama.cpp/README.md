@@ -166,6 +166,10 @@ legacy static-block entry and the logical block's RM backing tuple, so the
 kernel can validate logical-block UVM bridge mapping without a separate static
 table entry. It does not make CUDA runtime host copies into Polaris external
 VA safe, and it still does not implement daemon-backed spill/reload.
+The kernel also accepts RM backing metadata on successful
+`POLARIS_COMPLETE_OPERATION` replies, which is the intended path for a future
+daemon/runtime executor to publish UVM-bridge-mapable resident blocks; the
+current llama shim strict gate still uses explicit static-RM test backing.
 
 Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
 `llama-bench` commands complete and `/sys/kernel/polaris/stats` shows both

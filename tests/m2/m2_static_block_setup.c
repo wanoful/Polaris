@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/ioctl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -175,11 +176,62 @@ struct polaris_spill_block_arg {
     uint64_t _reserved[3];
 };
 
+enum {
+    POLARIS_DECISION_OP_ALLOC = 0,
+    POLARIS_DECISION_OP_FREE = 1,
+    POLARIS_DECISION_OP_MAP_EXISTING = 2,
+    POLARIS_DECISION_OP_UNMAP = 3,
+    POLARIS_DECISION_OP_OFFLOAD = 4,
+    POLARIS_DECISION_OP_RELOAD = 5,
+    POLARIS_DECISION_OP_COW_BREAK = 6,
+};
+
+#define POLARIS_MAX_DECISIONS_PER_POLL 16
+
+struct polaris_decision {
+    uint64_t decision_id;
+    uint64_t fault_id;
+    uint64_t generation;
+    uint32_t op;
+    uint32_t gpu_id;
+    uint64_t block_id;
+    uint64_t session_id;
+    uint64_t src_handle;
+    uint64_t dst_handle;
+    uint64_t src_vaddr;
+    uint64_t dst_vaddr;
+    uint64_t size_bytes;
+    uint64_t cpu_addr;
+    uint32_t access_flags;
+    uint32_t timeout_ms;
+    uint64_t _reserved[4];
+};
+
+struct polaris_get_decision_arg {
+    uint32_t count;
+    uint32_t _reserved;
+    struct polaris_decision decisions[POLARIS_MAX_DECISIONS_PER_POLL];
+};
+
+struct polaris_complete_operation_arg {
+    uint64_t decision_id;
+    uint64_t generation;
+    int32_t result;
+    int32_t rm_control_fd;
+    uint64_t output_handle;
+    uint64_t output_cpu_addr;
+    uint32_t rm_h_client;
+    uint32_t rm_h_memory;
+    uint64_t rm_backing_length;
+};
+
 #define POLARIS_REGISTER_GPU _IOW(POLARIS_IOCTL_MAGIC, 0x01, struct polaris_register_gpu_arg)
 #define POLARIS_REGISTER_VA_RANGE _IOWR(POLARIS_IOCTL_MAGIC, 0x02, struct polaris_register_va_range_arg)
 #define POLARIS_SESSION_CREATE _IOWR(POLARIS_IOCTL_MAGIC, 0x03, struct polaris_session_create_arg)
 #define POLARIS_SESSION_DESTROY _IOW(POLARIS_IOCTL_MAGIC, 0x04, struct polaris_session_destroy_arg)
 #define POLARIS_BLOCK_RESERVE _IOWR(POLARIS_IOCTL_MAGIC, 0x07, struct polaris_block_reserve_arg)
+#define POLARIS_GET_DECISION _IOWR(POLARIS_IOCTL_MAGIC, 0x0b, struct polaris_get_decision_arg)
+#define POLARIS_COMPLETE_OPERATION _IOWR(POLARIS_IOCTL_MAGIC, 0x0c, struct polaris_complete_operation_arg)
 #define POLARIS_REGISTER_VASPACE _IOW(POLARIS_IOCTL_MAGIC, 0x10, struct polaris_register_vaspace_arg)
 #define POLARIS_UNREGISTER_VASPACE _IOW(POLARIS_IOCTL_MAGIC, 0x11, struct polaris_unregister_vaspace_arg)
 #define POLARIS_REGISTER_STATIC_BLOCK _IOW(POLARIS_IOCTL_MAGIC, 0x12, struct polaris_register_static_block_arg)
@@ -231,6 +283,14 @@ struct m2_state {
     bool uvm_vaspace_registered;
     bool polaris_vaspace_registered;
     uint64_t polaris_session_id;
+};
+
+struct completion_executor_args {
+    struct m2_state *state;
+    uint32_t gpu_id;
+    uint64_t expected_base;
+    uint64_t completed_block_id;
+    int result;
 };
 
 static int nv_ioctl_checked(int fd, unsigned int esc, void *arg, size_t size, const char *what)
@@ -632,12 +692,79 @@ static int unmap_static_block(struct m2_state *s,
     return 0;
 }
 
+static void *complete_backing_executor(void *arg)
+{
+    struct completion_executor_args *args = arg;
+    struct m2_state *s = args->state;
+
+    args->result = -1;
+    for (int attempt = 0; attempt < 500; ++attempt) {
+        struct polaris_get_decision_arg get = {0};
+
+        if (ioctl(s->polaris_fd, POLARIS_GET_DECISION, &get) != 0) {
+            fprintf(stderr,
+                    "POLARIS_GET_DECISION executor failed: errno=%d (%s)\n",
+                    errno,
+                    strerror(errno));
+            return NULL;
+        }
+
+        for (uint32_t i = 0; i < get.count && i < POLARIS_MAX_DECISIONS_PER_POLL; ++i) {
+            const struct polaris_decision *decision = &get.decisions[i];
+            if (decision->op != POLARIS_DECISION_OP_ALLOC ||
+                decision->gpu_id != args->gpu_id ||
+                decision->dst_vaddr != args->expected_base ||
+                decision->size_bytes != POLARIS_BLOCK_SIZE) {
+                continue;
+            }
+
+            struct polaris_complete_operation_arg complete = {
+                .decision_id = decision->decision_id,
+                .generation = decision->generation,
+                .result = 0,
+                .rm_control_fd = s->ctl_fd,
+                .output_handle = 0,
+                .output_cpu_addr = 0,
+                .rm_h_client = s->h_client,
+                .rm_h_memory = s->h_memory,
+                .rm_backing_length = POLARIS_BLOCK_SIZE,
+            };
+
+            if (ioctl(s->polaris_fd, POLARIS_COMPLETE_OPERATION, &complete) != 0) {
+                fprintf(stderr,
+                        "POLARIS_COMPLETE_OPERATION executor failed: errno=%d (%s)\n",
+                        errno,
+                        strerror(errno));
+                return NULL;
+            }
+
+            args->completed_block_id = decision->block_id;
+            args->result = 0;
+            printf("POLARIS completed ALLOC with RM backing: block=%llu decision=%llu hClient=0x%x hMemory=0x%x len=0x%llx\n",
+                   (unsigned long long)decision->block_id,
+                   (unsigned long long)decision->decision_id,
+                   s->h_client,
+                   s->h_memory,
+                   (unsigned long long)POLARIS_BLOCK_SIZE);
+            return NULL;
+        }
+
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "timed out waiting for ALLOC decision at base=0x%llx\n",
+            (unsigned long long)args->expected_base);
+    return NULL;
+}
+
 static int register_logical_block_mapping(struct m2_state *s,
                                           uint32_t gpu_id,
                                           uint64_t rm_client_token,
                                           uint64_t va_space_token,
                                           uint64_t base,
                                           uint64_t length,
+                                          bool defer_fault,
                                           uint64_t *block_id_out)
 {
     struct polaris_register_va_range_arg range = {
@@ -657,7 +784,7 @@ static int register_logical_block_mapping(struct m2_state *s,
         .token_start = 0,
         .token_count = 1,
         .phase = 2,
-        .flags = POLARIS_RESERVE_FLAG_DEFER_FAULT,
+        .flags = defer_fault ? POLARIS_RESERVE_FLAG_DEFER_FAULT : 0,
     };
 
     if (polaris_ioctl_checked(s->polaris_fd,
@@ -706,13 +833,14 @@ static int register_logical_block_mapping(struct m2_state *s,
         return -1;
 
     *block_id_out = reserve.block_id;
-    printf("POLARIS registered logical block mapping: block=%llu gpu=%u client=0x%llx token=0x%llx base=0x%llx len=0x%llx\n",
+    printf("POLARIS registered logical block mapping: block=%llu gpu=%u client=0x%llx token=0x%llx base=0x%llx len=0x%llx defer=%s\n",
            (unsigned long long)reserve.block_id,
            gpu_id,
            (unsigned long long)rm_client_token,
            (unsigned long long)va_space_token,
            (unsigned long long)base,
-           (unsigned long long)length);
+           (unsigned long long)length,
+           defer_fault ? "yes" : "no");
     return 0;
 }
 
@@ -946,6 +1074,7 @@ int main(int argc, char **argv)
     bool unmap_refault = false;
     bool block_unmap_refault = false;
     bool logical_backed_refault = false;
+    bool complete_backed_refault = false;
     bool spill_validation = false;
     uint64_t block_id = 0;
     struct m2_state s = {
@@ -979,6 +1108,12 @@ int main(int argc, char **argv)
             logical_backed_refault = true;
             continue;
         }
+        if (strcmp(argv[i], "--complete-backed-refault") == 0) {
+            dispatch_fault = true;
+            block_unmap_refault = true;
+            complete_backed_refault = true;
+            continue;
+        }
         if (strcmp(argv[i], "--spill-validation") == 0) {
             spill_validation = true;
             continue;
@@ -996,7 +1131,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -1021,15 +1156,58 @@ int main(int argc, char **argv)
                       polaris_va_space_token,
                       base,
                       POLARIS_MANAGED_SIZE,
-                      !logical_backed_refault) != 0)
+                      !logical_backed_refault && !complete_backed_refault) != 0)
         goto out;
-    if (block_unmap_refault || spill_validation) {
+    if (complete_backed_refault) {
+        pthread_t executor;
+        struct completion_executor_args exec_args = {
+            .state = &s,
+            .gpu_id = polaris_gpu_id,
+            .expected_base = base,
+        };
+        int thread_ret = pthread_create(&executor,
+                                        NULL,
+                                        complete_backing_executor,
+                                        &exec_args);
+        if (thread_ret != 0) {
+            fprintf(stderr,
+                    "pthread_create completion executor failed: %s\n",
+                    strerror(thread_ret));
+            goto out;
+        }
+
         if (register_logical_block_mapping(&s,
                                            polaris_gpu_id,
                                            polaris_rm_client_token,
                                            polaris_va_space_token,
                                            base,
                                            POLARIS_BLOCK_SIZE,
+                                           false,
+                                           &block_id) != 0) {
+            (void)pthread_join(executor, NULL);
+            goto out;
+        }
+        if (pthread_join(executor, NULL) != 0) {
+            fprintf(stderr, "pthread_join completion executor failed\n");
+            goto out;
+        }
+        if (exec_args.result != 0 || exec_args.completed_block_id != block_id) {
+            fprintf(stderr,
+                    "completion executor result=%d completed_block=%llu expected_block=%llu\n",
+                    exec_args.result,
+                    (unsigned long long)exec_args.completed_block_id,
+                    (unsigned long long)block_id);
+            goto out;
+        }
+    }
+    if ((block_unmap_refault || spill_validation) && !complete_backed_refault) {
+        if (register_logical_block_mapping(&s,
+                                           polaris_gpu_id,
+                                           polaris_rm_client_token,
+                                           polaris_va_space_token,
+                                           base,
+                                           POLARIS_BLOCK_SIZE,
+                                           true,
                                            &block_id) != 0)
             goto out;
     }
@@ -1069,7 +1247,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (logical_backed_refault)
+    if (complete_backed_refault)
+        puts("M3 Polaris completion-backed block refault test passed.");
+    else if (logical_backed_refault)
         puts("M3 Polaris logical-backed block refault test passed.");
     else if (block_unmap_refault)
         puts("M3 Polaris block unmap/refault test passed.");

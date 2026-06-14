@@ -38,6 +38,20 @@ POLARIS_REGISTER_BLOCK_BACKING(block_id, RM allocation tuple)
   -> second synthetic fault remaps through the logical mapping again
 ```
 
+The completion-backed M3 diagnostic proves the same logical backing can be
+published through the decision-completion path instead of a sideband backing
+ioctl:
+
+```text
+POLARIS_BLOCK_RESERVE(block_id) without DEFER_FAULT
+  -> POLARIS_GET_DECISION returns ALLOC for the block
+  -> POLARIS_COMPLETE_OPERATION carries RM hClient/hMemory/length metadata
+  -> POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
+  -> synthetic fault maps the completed logical block through the UVM bridge
+  -> POLARIS_UNMAP_BLOCK_MAPPINGS(block_id)
+  -> second synthetic fault remaps through the completed logical backing
+```
+
 The diagnostic creates real RM objects, registers a fault-capable GPU
 VA-space with UVM, creates a UVM external range, registers the same
 `(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
@@ -167,6 +181,32 @@ M3 Polaris logical-backed block refault test passed.
 This is still a bridge diagnostic. The RM object is created by the harness, not
 by polarisd, and no host/device copy or daemon-backed spill/reload decision is
 executed.
+
+## Completion-Backed Block Refault Diagnostic
+
+This validates the production-facing completion contract for RM-backed resident
+blocks. Unlike `--logical-backed-refault`, it does not call
+`POLARIS_REGISTER_BLOCK_BACKING`. Instead, the harness reserves a logical block
+without `POLARIS_RESERVE_FLAG_DEFER_FAULT`, runs a small executor thread that
+polls `POLARIS_GET_DECISION`, completes the queued `ALLOC` decision with the
+diagnostic RM backing metadata in `POLARIS_COMPLETE_OPERATION`, registers the
+worker mapping, fault-maps through the completed logical backing, unmaps by
+`block_id`, then refaults:
+
+```sh
+sudo tests/m2/m2_static_block_setup --complete-backed-refault
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris completion-backed block refault test passed.
+```
+
+This closes the kernel ABI gap for daemon/runtime executors to publish
+UVM-bridge-mapable RM backing as part of normal decision completion. It still
+uses a harness-created RM object and does not yet implement daemon-owned RM
+allocation or host/device copy for production spill/reload.
 
 ## Spill Ioctl Validation
 

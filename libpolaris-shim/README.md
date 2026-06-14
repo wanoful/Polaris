@@ -129,6 +129,10 @@ table. Real CUDA kernels may fault through CUDA's own UVM-registered VA-space
 rather than the shim-created RM/UVM VA-space; for that case polaris.ko services
 the fault only when a single unambiguous logical block mapping covers the
 faulting GPU/address. This remains test backing, not daemon-backed spill/reload.
+polaris.ko can also store RM backing from successful `POLARIS_COMPLETE_OPERATION`
+replies, which is the production-facing route for daemon/runtime executors; the
+shim's static RM backend intentionally stays on the explicit test-registration
+path until daemon-owned RM allocation is wired.
 Set `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and/or
 `POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` to restrict which allocation sizes
 are routed through Polaris. Allocations outside that inclusive policy range

@@ -340,10 +340,15 @@ pub struct PolarisCompleteOperationArg {
     pub decision_id: u64,
     pub generation: u64,
     pub result: i32,
-    pub _reserved: u32,
+    /// Optional RM control fd for UVM-bridge-mapable block backing. Leave all
+    /// RM backing fields zero when the completed operation produced only a
+    /// legacy CUDA VMM handle.
+    pub rm_control_fd: i32,
     pub output_handle: u64,
     pub output_cpu_addr: u64,
-    pub _reserved2: [u64; 2],
+    pub rm_h_client: u32,
+    pub rm_h_memory: u32,
+    pub rm_backing_length: u64,
 }
 
 #[repr(C)]
