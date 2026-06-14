@@ -562,6 +562,17 @@ Still to do on the Polaris side for M1/M2:
   device↔host copy for `OFFLOAD` / `RELOAD` / `COW_BREAK` remains pending, and
   those operations return `EOPNOTSUPP` in the opt-in backend until the copy path
   is implemented.
+- CUDA-copy visibility probe wired: `tests/m2/m2_static_block_setup
+  --cuda-copy-probe` maps a harness-created RM vidmem allocation through the
+  public UVM external-allocation ioctl, creates a normal CUDA primary context
+  for the same device, and attempts `cuMemcpyHtoD_v2` / `cuMemcpyDtoH_v2`
+  against the external VA in an isolated child process. The probe is diagnostic:
+  success would make daemon-side CUDA copy worth integrating, while CUDA errors
+  or a child crash point the production RM-backed spill/reload path toward a
+  UVM/kernel copy helper. Local validation on 2026-06-14 reached
+  `cuMemcpyHtoD_v2` after successful RM allocation and public UVM mapping, then
+  the isolated child terminated with `SIGSEGV`, so the current implementation
+  should not rely on ordinary CUDA copy APIs for RM-backed external VA.
 - RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
   block before tearing down observed UVM mappings, and rejects RM-backed
   bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real

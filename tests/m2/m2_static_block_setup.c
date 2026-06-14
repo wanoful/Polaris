@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "nv-ioctl.h"
@@ -306,6 +307,11 @@ struct completion_executor_args {
     uint64_t completed_block_id;
     int result;
 };
+
+static void cleanup(struct m2_state *s,
+                    uint32_t gpu_id,
+                    uint64_t rm_client_token,
+                    uint64_t va_space_token);
 
 static int nv_ioctl_checked(int fd, unsigned int esc, void *arg, size_t size, const char *what)
 {
@@ -641,6 +647,168 @@ static int setup_uvm(struct m2_state *s, uint64_t base, uint64_t length, bool pr
            (unsigned long long)base,
            (unsigned long long)length,
            premap ? "yes" : "no");
+    return 0;
+}
+
+static void print_cuda_result(const char *what, CUresult res)
+{
+    const char *name = NULL;
+    const char *str = NULL;
+
+    (void)cuGetErrorName(res, &name);
+    (void)cuGetErrorString(res, &str);
+    fprintf(stderr,
+            "%s failed: %d%s%s%s%s%s\n",
+            what,
+            res,
+            name ? " (" : "",
+            name ? name : "",
+            name ? ")" : "",
+            str ? ": " : "",
+            str ? str : "");
+}
+
+static int run_cuda_copy_probe(struct m2_state *s, int ordinal, uint64_t base, size_t length)
+{
+    CUdevice dev;
+    CUcontext ctx = NULL;
+    CUresult res;
+    unsigned char *host_in = NULL;
+    unsigned char *host_out = NULL;
+    int ret = -1;
+
+    host_in = malloc(length);
+    host_out = malloc(length);
+    if (!host_in || !host_out) {
+        fprintf(stderr, "CUDA copy probe host allocation failed for %zu bytes\n", length);
+        goto out;
+    }
+
+    for (size_t i = 0; i < length; ++i) {
+        host_in[i] = (unsigned char)((i * 131U + 17U) & 0xffU);
+        host_out[i] = 0;
+    }
+
+    res = cuDeviceGet(&dev, ordinal);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuDeviceGet", res);
+        goto out;
+    }
+
+    res = cuDevicePrimaryCtxRetain(&ctx, dev);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuDevicePrimaryCtxRetain", res);
+        goto out;
+    }
+
+    res = cuCtxSetCurrent(ctx);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuCtxSetCurrent", res);
+        goto out_release;
+    }
+
+    printf("CUDA copy probe: copying %zu bytes through current CUDA primary context to external VA 0x%llx\n",
+           length,
+           (unsigned long long)base);
+
+    res = cuMemcpyHtoD_v2((CUdeviceptr)base, host_in, length);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuMemcpyHtoD_v2 external VA", res);
+        puts("CUDA copy probe result: current CUDA context cannot write the UVM external VA.");
+        ret = 0;
+        goto out_release;
+    }
+
+    res = cuMemcpyDtoH_v2(host_out, (CUdeviceptr)base, length);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuMemcpyDtoH_v2 external VA", res);
+        puts("CUDA copy probe result: HtoD succeeded, but current CUDA context cannot read the UVM external VA.");
+        ret = 0;
+        goto out_release;
+    }
+
+    if (memcmp(host_in, host_out, length) != 0) {
+        fprintf(stderr, "CUDA copy probe data mismatch after successful HtoD/DtoH round-trip\n");
+        goto out_release;
+    }
+
+    puts("CUDA copy probe result: CUDA copy APIs can round-trip the UVM external VA in this process.");
+    ret = 0;
+
+out_release:
+    (void)cuCtxSetCurrent(NULL);
+    if (ctx)
+        (void)cuDevicePrimaryCtxRelease(dev);
+out:
+    free(host_out);
+    free(host_in);
+    (void)s;
+    return ret;
+}
+
+static int run_cuda_copy_probe_child(int ordinal, uint64_t base)
+{
+    struct m2_state s = {
+        .ctl_fd = -1,
+        .gpu_fd = -1,
+        .uvm_fd = -1,
+        .uvm_mm_fd = -1,
+        .polaris_fd = -1,
+    };
+    int ret = 1;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (get_cuda_uuid(ordinal, &s.gpu_uuid) != 0)
+        goto out;
+    if (setup_rm(&s, ordinal) != 0)
+        goto out;
+    if (setup_uvm(&s, base, POLARIS_MANAGED_SIZE, true) != 0)
+        goto out;
+
+    ret = run_cuda_copy_probe(&s, ordinal, base, POLARIS_BLOCK_SIZE) == 0 ? 0 : 1;
+
+out:
+    cleanup(&s, 0, 0, 0);
+    return ret;
+}
+
+static int run_cuda_copy_probe_isolated(int ordinal, uint64_t base)
+{
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid < 0) {
+        fprintf(stderr, "fork for CUDA copy probe failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        int ret = run_cuda_copy_probe_child(ordinal, base);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(ret == 0 ? 0 : 1);
+    }
+
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "waitpid for CUDA copy probe failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        printf("CUDA copy probe result: child terminated by signal %d (%s) while running the isolated external-VA CUDA copy probe.\n",
+               sig,
+               strsignal(sig));
+        return 0;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "CUDA copy probe child exited inconclusively: status=0x%x\n", status);
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1136,6 +1304,7 @@ int main(int argc, char **argv)
     bool complete_backed_refault = false;
     bool deferred_complete_fault = false;
     bool spill_validation = false;
+    bool cuda_copy_probe = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -1187,6 +1356,10 @@ int main(int argc, char **argv)
             spill_validation = true;
             continue;
         }
+        if (strcmp(argv[i], "--cuda-copy-probe") == 0) {
+            cuda_copy_probe = true;
+            continue;
+        }
 
         switch (positional++) {
             case 0:
@@ -1200,10 +1373,15 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
+    }
+
+    if (cuda_copy_probe) {
+        rc = run_cuda_copy_probe_isolated(ordinal, base) == 0 ? 0 : 1;
+        goto out_no_cleanup;
     }
 
     if (get_cuda_uuid(ordinal, &s.gpu_uuid) != 0)
@@ -1361,5 +1539,6 @@ out:
     if (completion_executor_started)
         (void)pthread_join(completion_executor, NULL);
     cleanup(&s, polaris_gpu_id, polaris_rm_client_token, polaris_va_space_token);
+out_no_cleanup:
     return rc;
 }

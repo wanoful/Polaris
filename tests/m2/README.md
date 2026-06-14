@@ -71,6 +71,16 @@ daemon-owned live backing queues a `FREE` decision from `BLOCK_RELEASE` or
 `BLOCK_RELEASE` with `POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING` before session
 teardown.
 
+The CUDA copy probe is a narrow diagnostic for the remaining RM-backed
+spill/reload gap. It maps a harness-owned RM `NV01_MEMORY_LOCAL_USER` object
+through public UVM external-allocation ioctls, establishes a normal CUDA primary
+context for the same device, and tries `cuMemcpyHtoD_v2` / `cuMemcpyDtoH_v2`
+against the external VA. The probe runs in a child process so a libcuda crash is
+reported as evidence instead of terminating the parent test runner. A failed or
+crashing probe means ordinary daemon-side CUDA copy APIs should not be assumed
+safe for UVM external VAs; implement the production copy path through a
+kernel/UVM helper or another explicitly validated mechanism instead.
+
 The diagnostic creates real RM objects, registers a fault-capable GPU
 VA-space with UVM, creates a UVM external range, registers the same
 `(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
@@ -116,6 +126,31 @@ Optional positional arguments:
 ```text
 tests/m2/m2_static_block_setup [cuda_ordinal] [polaris_gpu_id] [base]
 ```
+
+## CUDA Copy Probe
+
+This validates only CUDA-copy visibility of a UVM-mapped RM external
+allocation. It does not register the range with polaris.ko and does not dispatch
+a Polaris fault:
+
+```sh
+sudo tests/m2/m2_static_block_setup --cuda-copy-probe
+```
+
+Expected outcomes are diagnostic rather than pass/fail for production:
+
+- `CUDA copy APIs can round-trip...`: daemon-side CUDA copy might be viable, but
+  still needs integration into `polarisd` and real spill/reload tests.
+- `current CUDA context cannot ...` or `child terminated by signal ...`:
+  ordinary CUDA copy APIs are not safe/visible for this external VA shape, so
+  the RM-backed spill/reload copy path should move into a UVM/kernel helper or
+  another lower-level path.
+
+Local result on 2026-06-14: the probe successfully created RM memory and mapped
+it through `UVM_MAP_EXTERNAL_ALLOCATION`, then reached `cuMemcpyHtoD_v2` with a
+current CUDA primary context and the child terminated with `SIGSEGV`. Treat that
+as evidence against using ordinary daemon-side CUDA copy APIs for the production
+RM-backed spill/reload path.
 
 ## Synthetic Fault Dispatch
 
