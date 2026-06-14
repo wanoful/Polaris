@@ -49,6 +49,11 @@ int polaris_shim_block_release(uint64_t session_id,
                                uint32_t token_start,
                                uint32_t token_count);
 
+int polaris_shim_block_release_with_flags(uint64_t session_id,
+                                          uint32_t token_start,
+                                          uint32_t token_count,
+                                          uint32_t flags);
+
 /*
  * Submit POLARIS_REGISTER_VASPACE. Returns 0 on success, -errno on failure.
  * Safe to call when /dev/polaris is unavailable: returns -ENODEV and the

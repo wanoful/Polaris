@@ -702,9 +702,13 @@ static void unregister_vaspace_at_exit(void)
         struct polaris_shim_allocation *next = list->next;
         int ret = polaris_shim_unmap_block_mappings(list->block_id, NULL);
         if (ret == 0) {
-            int release_ret = polaris_shim_block_release(g_session_id,
-                                                         list->token_start,
-                                                         list->token_count);
+            uint32_t release_flags = list->static_h_memory != 0
+                                         ? POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING
+                                         : 0;
+            int release_ret = polaris_shim_block_release_with_flags(g_session_id,
+                                                                    list->token_start,
+                                                                    list->token_count,
+                                                                    release_flags);
             if (release_ret != 0)
                 ret = release_ret;
         }
@@ -1273,7 +1277,11 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
         release_static_rm_backend(static_h_memory, static_size);
         if (g_create_external_ranges)
             (void)polaris_shim_uvm_free_external_range(gpu_vaddr);
-        (void)polaris_shim_block_release(g_session_id, token_start, token_count);
+        (void)polaris_shim_block_release_with_flags(
+            g_session_id,
+            token_start,
+            token_count,
+            static_h_memory != 0 ? POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING : 0);
         pthread_mutex_lock(&g_alloc_lock);
         return_token_span_locked(token_start, token_count);
         pthread_mutex_unlock(&g_alloc_lock);
@@ -1285,7 +1293,11 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
         release_static_rm_backend(static_h_memory, static_size);
         if (g_create_external_ranges)
             (void)polaris_shim_uvm_free_external_range(gpu_vaddr);
-        (void)polaris_shim_block_release(g_session_id, token_start, token_count);
+        (void)polaris_shim_block_release_with_flags(
+            g_session_id,
+            token_start,
+            token_count,
+            static_h_memory != 0 ? POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING : 0);
         pthread_mutex_lock(&g_alloc_lock);
         return_token_span_locked(token_start, token_count);
         pthread_mutex_unlock(&g_alloc_lock);
@@ -1355,9 +1367,13 @@ static int polaris_free_managed(CUdeviceptr ptr)
 
     ret = polaris_shim_unmap_block_mappings(block_id, NULL);
     if (ret == 0) {
-        int release_ret = polaris_shim_block_release(g_session_id,
-                                                     token_start,
-                                                     token_count);
+        uint32_t release_flags = static_h_memory != 0
+                                     ? POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING
+                                     : 0;
+        int release_ret = polaris_shim_block_release_with_flags(g_session_id,
+                                                                token_start,
+                                                                token_count,
+                                                                release_flags);
         if (release_ret != 0)
             ret = release_ret;
     }

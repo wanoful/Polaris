@@ -836,6 +836,30 @@ fn polaris_block_has_rm_backing(block: &PolarisBlock) -> bool {
     block.rm_h_client != 0 && block.rm_h_memory != 0 && block.rm_backing_length >= block.size_bytes
 }
 
+fn polaris_block_needs_free_decision(block: &PolarisBlock) -> bool {
+    match block.state {
+        PolarisBlockState::Resident => block.gpu_phys_handle != 0 || polaris_block_has_rm_backing(block),
+        PolarisBlockState::CpuOffloaded => block.cpu_buf_addr != 0,
+        _ => false,
+    }
+}
+
+fn polaris_account_direct_block_removal(
+    inner: &mut PolarisInner,
+    gpu_id: u32,
+    state: PolarisBlockState,
+    size_bytes: u64,
+    had_cpu_buf: bool,
+) {
+    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
+        if state == PolarisBlockState::Resident {
+            gpu.used_bytes = gpu.used_bytes.saturating_sub(size_bytes);
+        } else if had_cpu_buf {
+            gpu.cpu_pool_used_bytes = gpu.cpu_pool_used_bytes.saturating_sub(size_bytes);
+        }
+    }
+}
+
 fn polaris_unsupported() -> Error {
     Error::from_errno(-(bindings::EOPNOTSUPP as i32))
 }
@@ -993,6 +1017,52 @@ fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) ->
 
     let block = &mut inner.blocks[block_idx];
     block.state = PolarisBlockState::OffloadPending;
+    block.pending_decision_id = decision_id;
+    block.pending_fault_id = 0;
+    block.pending_generation = 0;
+
+    Ok(decision_id)
+}
+
+fn polaris_queue_free_decision(inner: &mut PolarisInner, block_idx: usize) -> Result<u64> {
+    if block_idx >= inner.blocks.len() {
+        return Err(ENOENT);
+    }
+    if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+        return Err(ENOMEM);
+    }
+
+    let block = &inner.blocks[block_idx];
+    if !polaris_block_needs_free_decision(block) {
+        return Err(ENOENT);
+    }
+
+    let decision_id = inner.next_decision_id;
+    inner.next_decision_id += 1;
+
+    let decision = PolarisDecision {
+        decision_id,
+        fault_id: 0,
+        generation: 0,
+        op: PolarisDecisionOp::Free as u32,
+        gpu_id: block.home_gpu,
+        block_id: block.block_id,
+        session_id: block.session_id,
+        src_handle: block.gpu_phys_handle,
+        dst_handle: 0,
+        src_vaddr: block.gpu_vaddr,
+        dst_vaddr: 0,
+        size_bytes: block.size_bytes,
+        cpu_addr: block.cpu_buf_addr,
+        access_flags: 0,
+        timeout_ms: 0,
+        _reserved: [0u64; 4],
+    };
+
+    inner.pending_decisions.push(decision, GFP_KERNEL)?;
+
+    let block = &mut inner.blocks[block_idx];
+    block.state = PolarisBlockState::FreePending;
     block.pending_decision_id = decision_id;
     block.pending_fault_id = 0;
     block.pending_generation = 0;
@@ -2233,11 +2303,12 @@ impl PolarisDevice {
         struct ToFree {
             idx: usize,
             block_id: u64,
-            phys_handle: u64,
+            home_gpu: u32,
             size_bytes: u64,
             state: PolarisBlockState,
             refcount: u64,
             had_cpu_buf: bool,
+            needs_free_decision: bool,
         }
         let mut to_free: KVec<ToFree> = KVec::new();
         for idx in 0..inner.blocks.len() {
@@ -2247,11 +2318,12 @@ impl PolarisDevice {
                     ToFree {
                         idx,
                         block_id: b.block_id,
-                        phys_handle: b.gpu_phys_handle,
+                        home_gpu: b.home_gpu,
                         size_bytes: b.size_bytes,
                         state: b.state,
                         refcount: b.refcount,
                         had_cpu_buf: b.cpu_buf_addr != 0,
+                        needs_free_decision: polaris_block_needs_free_decision(b),
                     },
                     GFP_KERNEL,
                 )?;
@@ -2276,11 +2348,12 @@ impl PolarisDevice {
                             ToFree {
                                 idx,
                                 block_id: b.block_id,
-                                phys_handle: b.gpu_phys_handle,
+                                home_gpu: b.home_gpu,
                                 size_bytes: b.size_bytes,
                                 state: b.state,
                                 refcount: b.refcount,
                                 had_cpu_buf: b.cpu_buf_addr != 0,
+                                needs_free_decision: polaris_block_needs_free_decision(b),
                             },
                             GFP_KERNEL,
                         )?;
@@ -2290,26 +2363,35 @@ impl PolarisDevice {
         }
 
         // Now mutate: queue FREE or clean up directly.
-        // G6: if the pending decision queue is full, handle FREE decisions
-        // directly (skip daemon FREE).  The blocks' phys handles will be
-        // orphaned, but this prevents kernel OOM.  The daemon's CUDA context
-        // cleanup on exit handles the orphaned handles.
-        let queue_full = inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS;
-        if queue_full {
-            dev_warn!(
-                self.dev,
-                "POLARIS: pending decision queue full ({}), cleaning up session {} blocks directly\n",
-                inner.pending_decisions.len(), sid
-            );
+        if inner.daemon_attached > 0 {
+            let needed_free_decisions = to_free
+                .iter()
+                .filter(|tf| {
+                    tf.refcount <= 1
+                        && tf.state != PolarisBlockState::FreePending
+                        && tf.needs_free_decision
+                })
+                .count();
+            if inner.pending_decisions.len().saturating_add(needed_free_decisions)
+                > POLARIS_MAX_PENDING_DECISIONS
+            {
+                dev_warn!(
+                    self.dev,
+                    "POLARIS: pending decision queue has {} free slot(s), refusing to drop {} live backing object(s) for session {}\n",
+                    POLARIS_MAX_PENDING_DECISIONS.saturating_sub(inner.pending_decisions.len()),
+                    needed_free_decisions,
+                    sid
+                );
+                return Err(ENOMEM);
+            }
         }
 
         for tf in &mut to_free {
-            let block = &mut inner.blocks[tf.idx];
-            let phys_handle = tf.phys_handle;
             let block_id = tf.block_id;
             let sz = tf.size_bytes;
 
             if tf.refcount > 1 {
+                let block = &mut inner.blocks[tf.idx];
                 block.refcount -= 1;
                 if block.refcount == 1 {
                     block.flags = block.flags & !PolarisBlockFlag::Shared;
@@ -2328,63 +2410,35 @@ impl PolarisDevice {
                 continue;
             }
 
-            if !queue_full && inner.daemon_attached > 0 && phys_handle != 0 {
-                let dec_id = inner.next_decision_id;
-                inner.next_decision_id += 1;
+            if tf.state == PolarisBlockState::FreePending {
+                dev_info!(
+                    self.dev,
+                    "POLARIS: session {} destroy: block {} already has FREE pending\n",
+                    sid, block_id
+                );
+                continue;
+            }
 
-                block.state = PolarisBlockState::FreePending;
-                block.pending_decision_id = dec_id;
-
-                inner.pending_decisions.push(
-                    PolarisDecision {
-                        decision_id: dec_id,
-                        fault_id: 0,
-                        generation: 0,
-                        op: PolarisDecisionOp::Free as u32,
-                        gpu_id,
-                        block_id,
-                        session_id: sid,
-                        src_handle: phys_handle,
-                        dst_handle: 0,
-                        src_vaddr: 0,
-                        dst_vaddr: 0,
-                        size_bytes: sz,
-                        cpu_addr: 0,
-                        access_flags: 0,
-                        timeout_ms: 0,
-                        _reserved: [0u64; 4],
-                    },
-                    GFP_KERNEL,
-                )?;
-
+            if inner.daemon_attached > 0 && tf.needs_free_decision {
+                let dec_id = polaris_queue_free_decision(inner, tf.idx)?;
+                polaris_forget_static_blocks_for_block(inner, block_id)?;
+                inner.block_mappings.retain(|m| m.block_id != block_id);
                 dev_info!(
                     self.dev,
                     "POLARIS: session {} destroy: block {} free queued (FREE {})\n",
                     sid, block_id, dec_id
                 );
             } else {
-                // No daemon or queue full or never mapped — remove directly.
-                if tf.state == PolarisBlockState::Resident {
-                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
-                        gpu.used_bytes = gpu.used_bytes.saturating_sub(sz);
-                    }
-                } else if tf.had_cpu_buf {
-                    if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
-                        gpu.cpu_pool_used_bytes = gpu.cpu_pool_used_bytes.saturating_sub(sz);
-                    }
-                }
-                block.refcount = 0;
+                // No daemon or never mapped — remove directly.
+                polaris_account_direct_block_removal(inner, tf.home_gpu, tf.state, sz, tf.had_cpu_buf);
+                inner.blocks[tf.idx].refcount = 0;
+                polaris_forget_static_blocks_for_block(inner, block_id)?;
+                inner.block_mappings.retain(|m| m.block_id != block_id);
                 dev_info!(
                     self.dev,
                     "POLARIS: session {} destroy: block {} freed directly\n",
                     sid, block_id
                 );
-            }
-        }
-
-        for tf in &to_free {
-            if tf.refcount <= 1 && (queue_full || tf.phys_handle == 0 || inner.daemon_attached == 0) {
-                polaris_forget_static_blocks_for_block(inner, tf.block_id)?;
             }
         }
 
@@ -2395,7 +2449,11 @@ impl PolarisDevice {
         // Only remove blocks whose refcount has dropped to 0.  COW-shared
         // blocks (refcount > 0 after decrement) must stay in the table for
         // child sessions that still reference them.
-        inner.blocks.retain(|b| !(b.session_id == sid && b.state != PolarisBlockState::FreePending && b.refcount == 0));
+        inner.blocks.retain(|b| {
+            b.state == PolarisBlockState::FreePending
+                || b.refcount != 0
+                || !to_free.iter().any(|tf| tf.block_id == b.block_id)
+        });
         inner.block_mappings.retain(|m| {
             inner.blocks.iter().any(|b| b.block_id == m.block_id)
         });
@@ -2798,6 +2856,11 @@ impl PolarisDevice {
                 && b.token_count == arg.token_count
         }).ok_or(ENOENT)?;
         let block_id = inner.blocks[idx].block_id;
+        let block_home_gpu = inner.blocks[idx].home_gpu;
+        let block_state = inner.blocks[idx].state;
+        let block_size = inner.blocks[idx].size_bytes;
+        let block_had_cpu_buf = inner.blocks[idx].cpu_buf_addr != 0;
+        let caller_owns_backing = arg.flags & POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING != 0;
         let release_end = release_start.saturating_add(inner.blocks[idx].size_bytes);
         if inner.blocks[idx].refcount > 1 {
             inner.blocks[idx].refcount -= 1;
@@ -2810,13 +2873,39 @@ impl PolarisDevice {
                     && m.base < release_end
                     && m.base.saturating_add(m.length) > release_start)
             });
+            if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+                session.block_ids.retain(|bid| *bid != block_id);
+            }
         } else {
-            polaris_forget_static_blocks_for_block(inner, block_id)?;
-            let _ = inner.blocks.remove(idx);
-            inner.block_mappings.retain(|m| m.block_id != block_id);
-        }
-        if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
-            session.block_ids.retain(|bid| *bid != block_id);
+            let needs_free_decision = polaris_block_needs_free_decision(&inner.blocks[idx]);
+            if block_state == PolarisBlockState::FreePending {
+                return Err(EBUSY);
+            }
+            if needs_free_decision
+                && !caller_owns_backing
+                && inner.daemon_attached > 0
+            {
+                let _ = polaris_queue_free_decision(inner, idx)?;
+                polaris_forget_static_blocks_for_block(inner, block_id)?;
+                inner.block_mappings.retain(|m| m.block_id != block_id);
+                if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+                    session.block_ids.retain(|bid| *bid != block_id);
+                }
+            } else {
+                polaris_account_direct_block_removal(
+                    inner,
+                    block_home_gpu,
+                    block_state,
+                    block_size,
+                    block_had_cpu_buf,
+                );
+                polaris_forget_static_blocks_for_block(inner, block_id)?;
+                let _ = inner.blocks.remove(idx);
+                inner.block_mappings.retain(|m| m.block_id != block_id);
+                if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == arg.session_id) {
+                    session.block_ids.retain(|bid| *bid != block_id);
+                }
+            }
         }
         Ok(0)
     }

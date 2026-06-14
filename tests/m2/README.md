@@ -65,6 +65,12 @@ POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
   -> unmap/refault still remaps through the completed backing
 ```
 
+Current release/destroy cleanup separates production and diagnostic ownership:
+daemon-owned live backing queues a `FREE` decision from `BLOCK_RELEASE` or
+`SESSION_DESTROY`, while this harness releases its own RM objects by issuing
+`BLOCK_RELEASE` with `POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING` before session
+teardown.
+
 The diagnostic creates real RM objects, registers a fault-capable GPU
 VA-space with UVM, creates a UVM external range, registers the same
 `(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
@@ -299,6 +305,14 @@ Two additional ignored tests cover logical block lifetime cleanup without CUDA:
 `SESSION_DESTROY` and `BLOCK_RELEASE` both remove stale block mappings for a
 deferred, unmapped logical block. Those tests require a freshly loaded
 `polaris.ko` built with the block-mapping cleanup fix.
+
+Three FREE-lifetime tests cover live backing release without CUDA:
+`block_release_queues_free_for_resident_block`,
+`block_release_queues_free_for_rm_backed_block_without_phys_handle`, and
+`session_destroy_queues_free_for_rm_backed_block_without_phys_handle` verify
+that legacy resident backing, RM-backed resident backing with no legacy
+`gpu_phys_handle`, and RM-backed session teardown all reach the daemon
+`FREE` path.
 
 `child_block_release_decrements_inherited_shared_block` covers the COW-shared
 release case: after `SESSION_BRANCH`, the child releases an inherited block

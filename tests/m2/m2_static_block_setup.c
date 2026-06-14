@@ -98,6 +98,15 @@ struct polaris_block_reserve_arg {
     uint64_t _reserved[3];
 };
 
+struct polaris_block_release_arg {
+    uint64_t session_id;
+    uint32_t token_start;
+    uint32_t token_count;
+    uint32_t flags;
+    uint32_t _reserved;
+    uint64_t _reserved2[4];
+};
+
 struct polaris_register_vaspace_arg {
     uint32_t gpu_id;
     uint32_t _reserved0;
@@ -230,6 +239,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_SESSION_CREATE _IOWR(POLARIS_IOCTL_MAGIC, 0x03, struct polaris_session_create_arg)
 #define POLARIS_SESSION_DESTROY _IOW(POLARIS_IOCTL_MAGIC, 0x04, struct polaris_session_destroy_arg)
 #define POLARIS_BLOCK_RESERVE _IOWR(POLARIS_IOCTL_MAGIC, 0x07, struct polaris_block_reserve_arg)
+#define POLARIS_BLOCK_RELEASE _IOW(POLARIS_IOCTL_MAGIC, 0x08, struct polaris_block_release_arg)
 #define POLARIS_GET_DECISION _IOWR(POLARIS_IOCTL_MAGIC, 0x0b, struct polaris_get_decision_arg)
 #define POLARIS_COMPLETE_OPERATION _IOWR(POLARIS_IOCTL_MAGIC, 0x0c, struct polaris_complete_operation_arg)
 #define POLARIS_REGISTER_VASPACE _IOW(POLARIS_IOCTL_MAGIC, 0x10, struct polaris_register_vaspace_arg)
@@ -242,6 +252,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
+#define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)
 
 #define NV_IOCTL(cmd, type) _IOWR(NV_IOCTL_MAGIC, (cmd), type)
 #define UVM_TEST_IOCTL_BASE(i) UVM_IOCTL_BASE(200 + (i))
@@ -283,6 +294,9 @@ struct m2_state {
     bool uvm_vaspace_registered;
     bool polaris_vaspace_registered;
     uint64_t polaris_session_id;
+    uint32_t polaris_block_token_start;
+    uint32_t polaris_block_token_count;
+    bool polaris_block_reserved;
 };
 
 struct completion_executor_args {
@@ -809,6 +823,9 @@ static int register_logical_block_mapping(struct m2_state *s,
         fprintf(stderr, "POLARIS_BLOCK_RESERVE returned block_id=0\n");
         return -1;
     }
+    s->polaris_block_token_start = reserve.token_start;
+    s->polaris_block_token_count = reserve.token_count;
+    s->polaris_block_reserved = true;
     if (reserve.gpu_vaddr != base) {
         fprintf(stderr,
                 "POLARIS_BLOCK_RESERVE returned gpu_vaddr=0x%llx, expected base=0x%llx\n",
@@ -1049,6 +1066,20 @@ static void cleanup(struct m2_state *s,
                     uint64_t rm_client_token,
                     uint64_t va_space_token)
 {
+    if (s->polaris_session_id != 0 && s->polaris_block_reserved) {
+        struct polaris_block_release_arg release = {
+            .session_id = s->polaris_session_id,
+            .token_start = s->polaris_block_token_start,
+            .token_count = s->polaris_block_token_count,
+            .flags = POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_BLOCK_RELEASE,
+                                    &release,
+                                    "POLARIS_BLOCK_RELEASE");
+        s->polaris_block_reserved = false;
+    }
+
     if (s->polaris_session_id != 0) {
         struct polaris_session_destroy_arg destroy = {
             .session_id = s->polaris_session_id,

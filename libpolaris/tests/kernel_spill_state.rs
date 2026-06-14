@@ -30,6 +30,14 @@ struct SeenOps {
     cow_break: u32,
     last_cow_src_handle: u64,
     last_cow_dst_vaddr: u64,
+    last_free_src_handle: u64,
+    last_free_cpu_addr: u64,
+    last_free_block_id: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FakeExecutorConfig {
+    complete_alloc_with_rm_backing: bool,
 }
 
 fn open_polaris() -> std::fs::File {
@@ -203,7 +211,11 @@ where
     }
 }
 
-fn start_fake_executor(stop: Arc<AtomicBool>, seen: Arc<Mutex<SeenOps>>) -> thread::JoinHandle<()> {
+fn start_fake_executor_with_config(
+    stop: Arc<AtomicBool>,
+    seen: Arc<Mutex<SeenOps>>,
+    config: FakeExecutorConfig,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let dev = open_polaris();
         let fd = dev.as_raw_fd();
@@ -221,16 +233,30 @@ fn start_fake_executor(stop: Arc<AtomicBool>, seen: Arc<Mutex<SeenOps>>) -> thre
             for decision in decisions.decisions.iter().take(count) {
                 let mut output_handle = 0;
                 let mut output_cpu_addr = 0;
+                let mut rm_control_fd = 0;
+                let mut rm_h_client = 0;
+                let mut rm_h_memory = 0;
+                let mut rm_backing_length = 0;
 
                 {
                     let mut seen = seen.lock().expect("seen mutex poisoned");
                     match decision.op {
                         x if x == PolarisDecisionOp::Alloc as u32 => {
                             seen.alloc += 1;
-                            output_handle = 0x1000_0000 + decision.block_id;
+                            if config.complete_alloc_with_rm_backing {
+                                rm_control_fd = fd;
+                                rm_h_client = 0xabc0_0000u32.wrapping_add(decision.block_id as u32);
+                                rm_h_memory = 0xdef0_0000u32.wrapping_add(decision.block_id as u32);
+                                rm_backing_length = decision.size_bytes;
+                            } else {
+                                output_handle = 0x1000_0000 + decision.block_id;
+                            }
                         }
                         x if x == PolarisDecisionOp::Free as u32 => {
                             seen.free += 1;
+                            seen.last_free_src_handle = decision.src_handle;
+                            seen.last_free_cpu_addr = decision.cpu_addr;
+                            seen.last_free_block_id = decision.block_id;
                         }
                         x if x == PolarisDecisionOp::Offload as u32 => {
                             seen.offload += 1;
@@ -254,8 +280,12 @@ fn start_fake_executor(stop: Arc<AtomicBool>, seen: Arc<Mutex<SeenOps>>) -> thre
                     decision_id: decision.decision_id,
                     generation: decision.generation,
                     result: 0,
+                    rm_control_fd,
                     output_handle,
                     output_cpu_addr,
+                    rm_h_client,
+                    rm_h_memory,
+                    rm_backing_length,
                     ..Default::default()
                 };
                 ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
@@ -263,6 +293,10 @@ fn start_fake_executor(stop: Arc<AtomicBool>, seen: Arc<Mutex<SeenOps>>) -> thre
             }
         }
     })
+}
+
+fn start_fake_executor(stop: Arc<AtomicBool>, seen: Arc<Mutex<SeenOps>>) -> thread::JoinHandle<()> {
+    start_fake_executor_with_config(stop, seen, FakeExecutorConfig::default())
 }
 
 #[test]
@@ -360,6 +394,205 @@ fn spill_block_queues_offload_and_reload_decisions() {
         |ops| ops.free >= 1,
         "FREE decision after spill test destroy",
     );
+
+    stop.store(true, Ordering::Release);
+    executor.join().expect("fake executor join");
+}
+
+#[test]
+#[ignore = "requires root and freshly loaded polaris.ko; exercises BLOCK_RELEASE FREE queueing without CUDA"]
+fn block_release_queues_free_for_resident_block() {
+    let dev = open_polaris();
+    let fd = dev.as_raw_fd();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(SeenOps::default()));
+    let executor = start_fake_executor(Arc::clone(&stop), Arc::clone(&seen));
+
+    register_transient_gpu_and_range(fd, 0x1200_0000_0000, 4 * BLOCK_SIZE);
+
+    let mut session = PolarisSessionCreateArg {
+        home_gpu: 0,
+        gpu_vas_bytes: BLOCK_SIZE,
+        bytes_per_token: BLOCK_SIZE,
+        priority: 5,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session)
+        .expect("POLARIS_SESSION_CREATE");
+
+    let mut reserve = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut reserve)
+        .expect("POLARIS_BLOCK_RESERVE alloc");
+    wait_for_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::Resident,
+    );
+
+    let release = PolarisBlockReleaseArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_BLOCK_RELEASE, &release)
+        .expect("POLARIS_BLOCK_RELEASE");
+
+    wait_for_seen(
+        &seen,
+        |ops| ops.free == 1 && ops.last_free_src_handle == 0x1000_0000 + reserve.block_id,
+        "FREE decision after resident BLOCK_RELEASE",
+    );
+    wait_for_stat("blocks", 0, "resident BLOCK_RELEASE FREE completion");
+
+    let destroy = PolarisSessionDestroyArg {
+        session_id: session.session_id,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SESSION_DESTROY, &destroy)
+        .expect("POLARIS_SESSION_DESTROY");
+
+    stop.store(true, Ordering::Release);
+    executor.join().expect("fake executor join");
+}
+
+#[test]
+#[ignore = "requires root and freshly loaded polaris.ko; exercises RM-backed BLOCK_RELEASE FREE queueing without CUDA"]
+fn block_release_queues_free_for_rm_backed_block_without_phys_handle() {
+    let dev = open_polaris();
+    let fd = dev.as_raw_fd();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(SeenOps::default()));
+    let executor = start_fake_executor_with_config(
+        Arc::clone(&stop),
+        Arc::clone(&seen),
+        FakeExecutorConfig {
+            complete_alloc_with_rm_backing: true,
+        },
+    );
+
+    register_transient_gpu_and_range(fd, 0x1300_0000_0000, 4 * BLOCK_SIZE);
+
+    let mut session = PolarisSessionCreateArg {
+        home_gpu: 0,
+        gpu_vas_bytes: BLOCK_SIZE,
+        bytes_per_token: BLOCK_SIZE,
+        priority: 5,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session)
+        .expect("POLARIS_SESSION_CREATE");
+
+    let mut reserve = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut reserve)
+        .expect("POLARIS_BLOCK_RESERVE RM-backed alloc");
+    wait_for_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::Resident,
+    );
+
+    let release = PolarisBlockReleaseArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_BLOCK_RELEASE, &release)
+        .expect("POLARIS_BLOCK_RELEASE RM-backed");
+
+    wait_for_seen(
+        &seen,
+        |ops| ops.free == 1 && ops.last_free_block_id == reserve.block_id,
+        "FREE decision after RM-backed BLOCK_RELEASE",
+    );
+    wait_for_stat("blocks", 0, "RM-backed BLOCK_RELEASE FREE completion");
+
+    let destroy = PolarisSessionDestroyArg {
+        session_id: session.session_id,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SESSION_DESTROY, &destroy)
+        .expect("POLARIS_SESSION_DESTROY");
+
+    stop.store(true, Ordering::Release);
+    executor.join().expect("fake executor join");
+}
+
+#[test]
+#[ignore = "requires root and freshly loaded polaris.ko; exercises RM-backed SESSION_DESTROY FREE queueing without CUDA"]
+fn session_destroy_queues_free_for_rm_backed_block_without_phys_handle() {
+    let dev = open_polaris();
+    let fd = dev.as_raw_fd();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(SeenOps::default()));
+    let executor = start_fake_executor_with_config(
+        Arc::clone(&stop),
+        Arc::clone(&seen),
+        FakeExecutorConfig {
+            complete_alloc_with_rm_backing: true,
+        },
+    );
+
+    register_transient_gpu_and_range(fd, 0x1400_0000_0000, 4 * BLOCK_SIZE);
+
+    let mut session = PolarisSessionCreateArg {
+        home_gpu: 0,
+        gpu_vas_bytes: BLOCK_SIZE,
+        bytes_per_token: BLOCK_SIZE,
+        priority: 5,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session)
+        .expect("POLARIS_SESSION_CREATE");
+
+    let mut reserve = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut reserve)
+        .expect("POLARIS_BLOCK_RESERVE RM-backed alloc");
+    wait_for_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::Resident,
+    );
+
+    let destroy = PolarisSessionDestroyArg {
+        session_id: session.session_id,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SESSION_DESTROY, &destroy)
+        .expect("POLARIS_SESSION_DESTROY");
+
+    wait_for_seen(
+        &seen,
+        |ops| ops.free == 1 && ops.last_free_block_id == reserve.block_id,
+        "FREE decision after RM-backed SESSION_DESTROY",
+    );
+    wait_for_stat("blocks", 0, "RM-backed SESSION_DESTROY FREE completion");
+    wait_for_stat("block_mappings", 0, "RM-backed SESSION_DESTROY mapping cleanup");
 
     stop.store(true, Ordering::Release);
     executor.join().expect("fake executor join");

@@ -557,6 +557,16 @@ Still to do on the Polaris side for M1/M2:
   RM-backed device→host copy and RM release path. The completion-backed M2
   diagnostic verifies this rejection leaves the observed mapping intact before
   the explicit block-unmap/refault step.
+- Live-backing FREE lifetime slice wired: `BLOCK_RELEASE` and
+  `SESSION_DESTROY` now queue daemon `FREE` decisions for resident legacy
+  physical handles, RM-backed bridge-resident logical blocks, and CPU-offloaded
+  backing instead of silently dropping kernel metadata. Static RM diagnostics
+  and the shim's integration-test backend opt into
+  `POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING` so harness-owned RM handles remain
+  caller-cleaned; production/default release keeps daemon-owned backing on the
+  explicit `FREE` path. `libpolaris/tests/kernel_spill_state.rs` covers legacy
+  resident release, RM-backed release without `gpu_phys_handle`, and RM-backed
+  session-destroy cleanup.
 - Deferred logical-block materialization wired: when the UVM hook sees a
   registered logical block mapping with no RM backing yet, it can enter the
   existing bounded `ALLOC`/`RELOAD` decision path, wait for userspace to

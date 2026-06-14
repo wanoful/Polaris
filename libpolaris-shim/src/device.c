@@ -192,6 +192,17 @@ int polaris_shim_block_release(uint64_t session_id,
                                uint32_t token_start,
                                uint32_t token_count)
 {
+    return polaris_shim_block_release_with_flags(session_id,
+                                                 token_start,
+                                                 token_count,
+                                                 0);
+}
+
+int polaris_shim_block_release_with_flags(uint64_t session_id,
+                                          uint32_t token_start,
+                                          uint32_t token_count,
+                                          uint32_t flags)
+{
     int fd = polaris_shim_device_fd();
     if (fd < 0)
         return -ENODEV;
@@ -200,6 +211,7 @@ int polaris_shim_block_release(uint64_t session_id,
         .session_id = session_id,
         .token_start = token_start,
         .token_count = token_count,
+        .flags = flags,
     };
 
     if (ioctl(fd, POLARIS_BLOCK_RELEASE, &arg) != 0) {

@@ -177,5 +177,6 @@ struct polaris_block_release_arg {
 #define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
 
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
+#define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)
 
 #endif /* POLARIS_SHIM_POLARIS_ABI_H */
