@@ -12,7 +12,8 @@ use libpolaris::types::{
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::process::Command;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -70,6 +71,17 @@ fn assert_stat(name: &str, expected: u64) {
     );
 }
 
+struct PolarisdChild {
+    child: Child,
+}
+
+impl Drop for PolarisdChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn wait_for_stat(name: &str, expected: u64, context: &str) {
     let started = Instant::now();
     loop {
@@ -83,6 +95,49 @@ fn wait_for_stat(name: &str, expected: u64, context: &str) {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_stat_at_least(name: &str, expected_min: u64, context: &str) {
+    let started = Instant::now();
+    loop {
+        let stats = sysfs_stats();
+        if stats.get(name).copied().unwrap_or(0) >= expected_min {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stat {name} did not reach at least {expected_min} while waiting for {context}; stats={stats:?}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn polarisd_bin() -> PathBuf {
+    if let Some(path) = std::env::var_os("POLARISD_BIN") {
+        return PathBuf::from(path);
+    }
+
+    let current = std::env::current_exe().expect("current test executable path");
+    let deps_dir = current
+        .parent()
+        .expect("test executable has parent directory");
+    let target_debug = deps_dir
+        .parent()
+        .expect("test executable is under target/debug/deps");
+    target_debug.join("polarisd")
+}
+
+fn start_polarisd_rm_backing() -> PolarisdChild {
+    let child = Command::new(polarisd_bin())
+        .env("POLARISD_RM_BACKING", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn polarisd with POLARISD_RM_BACKING=1");
+    wait_for_stat("daemon", 1, "polarisd attach");
+    wait_for_stat_at_least("gpus", 1, "polarisd GPU registration");
+    PolarisdChild { child }
 }
 
 fn env_u64(name: &str) -> u64 {
@@ -533,6 +588,67 @@ fn block_release_queues_free_for_rm_backed_block_without_phys_handle() {
 
     stop.store(true, Ordering::Release);
     executor.join().expect("fake executor join");
+}
+
+#[test]
+#[ignore = "requires root, freshly loaded polaris.ko, target/debug/polarisd, and a live NVIDIA RM stack"]
+fn polarisd_rm_backing_alloc_and_free_decision_flow() {
+    assert!(
+        polarisd_bin().exists(),
+        "build polarisd first: cargo build -p polarisd"
+    );
+
+    let _daemon = start_polarisd_rm_backing();
+
+    let dev = open_polaris();
+    let fd = dev.as_raw_fd();
+
+    let mut session = PolarisSessionCreateArg {
+        home_gpu: 0,
+        gpu_vas_bytes: BLOCK_SIZE,
+        bytes_per_token: BLOCK_SIZE,
+        priority: 5,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session)
+        .expect("POLARIS_SESSION_CREATE");
+
+    let mut reserve = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut reserve)
+        .expect("POLARIS_BLOCK_RESERVE through polarisd RM backing");
+    assert_ne!(reserve.block_id, 0);
+    assert_ne!(reserve.gpu_vaddr, 0);
+    wait_for_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::Resident,
+    );
+    wait_for_stat("blocks", 1, "polarisd RM-backed ALLOC completion");
+
+    let release = PolarisBlockReleaseArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_BLOCK_RELEASE, &release)
+        .expect("POLARIS_BLOCK_RELEASE through polarisd RM backing");
+    wait_for_stat("blocks", 0, "polarisd RM-backed FREE completion");
+    wait_for_stat("pending_decs", 0, "polarisd RM-backed FREE queue drain");
+
+    let destroy = PolarisSessionDestroyArg {
+        session_id: session.session_id,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SESSION_DESTROY, &destroy)
+        .expect("POLARIS_SESSION_DESTROY");
 }
 
 #[test]
