@@ -1103,6 +1103,7 @@ int main(int argc, char **argv)
     bool block_unmap_refault = false;
     bool logical_backed_refault = false;
     bool complete_backed_refault = false;
+    bool deferred_complete_fault = false;
     bool spill_validation = false;
     uint64_t block_id = 0;
     struct m2_state s = {
@@ -1112,6 +1113,9 @@ int main(int argc, char **argv)
         .uvm_mm_fd = -1,
         .polaris_fd = -1,
     };
+    pthread_t completion_executor = 0;
+    bool completion_executor_started = false;
+    struct completion_executor_args exec_args = {0};
     int rc = 1;
 
     int positional = 0;
@@ -1142,6 +1146,12 @@ int main(int argc, char **argv)
             complete_backed_refault = true;
             continue;
         }
+        if (strcmp(argv[i], "--deferred-complete-fault") == 0) {
+            dispatch_fault = true;
+            block_unmap_refault = true;
+            deferred_complete_fault = true;
+            continue;
+        }
         if (strcmp(argv[i], "--spill-validation") == 0) {
             spill_validation = true;
             continue;
@@ -1159,7 +1169,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -1184,16 +1194,13 @@ int main(int argc, char **argv)
                       polaris_va_space_token,
                       base,
                       POLARIS_MANAGED_SIZE,
-                      !logical_backed_refault && !complete_backed_refault) != 0)
+                      !logical_backed_refault && !complete_backed_refault && !deferred_complete_fault) != 0)
         goto out;
-    if (complete_backed_refault) {
-        pthread_t executor;
-        struct completion_executor_args exec_args = {
-            .state = &s,
-            .gpu_id = polaris_gpu_id,
-            .expected_base = base,
-        };
-        int thread_ret = pthread_create(&executor,
+    if (complete_backed_refault || deferred_complete_fault) {
+        exec_args.state = &s;
+        exec_args.gpu_id = polaris_gpu_id;
+        exec_args.expected_base = base;
+        int thread_ret = pthread_create(&completion_executor,
                                         NULL,
                                         complete_backing_executor,
                                         &exec_args);
@@ -1203,6 +1210,7 @@ int main(int argc, char **argv)
                     strerror(thread_ret));
             goto out;
         }
+        completion_executor_started = true;
 
         if (register_logical_block_mapping(&s,
                                            polaris_gpu_id,
@@ -1210,25 +1218,28 @@ int main(int argc, char **argv)
                                            polaris_va_space_token,
                                            base,
                                            POLARIS_BLOCK_SIZE,
-                                           false,
+                                           deferred_complete_fault,
                                            &block_id) != 0) {
-            (void)pthread_join(executor, NULL);
             goto out;
         }
-        if (pthread_join(executor, NULL) != 0) {
-            fprintf(stderr, "pthread_join completion executor failed\n");
-            goto out;
-        }
-        if (exec_args.result != 0 || exec_args.completed_block_id != block_id) {
-            fprintf(stderr,
-                    "completion executor result=%d completed_block=%llu expected_block=%llu\n",
-                    exec_args.result,
-                    (unsigned long long)exec_args.completed_block_id,
-                    (unsigned long long)block_id);
-            goto out;
+        if (complete_backed_refault) {
+            if (pthread_join(completion_executor, NULL) != 0) {
+                completion_executor_started = false;
+                fprintf(stderr, "pthread_join completion executor failed\n");
+                goto out;
+            }
+            completion_executor_started = false;
+            if (exec_args.result != 0 || exec_args.completed_block_id != block_id) {
+                fprintf(stderr,
+                        "completion executor result=%d completed_block=%llu expected_block=%llu\n",
+                        exec_args.result,
+                        (unsigned long long)exec_args.completed_block_id,
+                        (unsigned long long)block_id);
+                goto out;
+            }
         }
     }
-    if ((block_unmap_refault || spill_validation) && !complete_backed_refault) {
+    if ((block_unmap_refault || spill_validation) && !complete_backed_refault && !deferred_complete_fault) {
         if (register_logical_block_mapping(&s,
                                            polaris_gpu_id,
                                            polaris_rm_client_token,
@@ -1250,7 +1261,23 @@ int main(int argc, char **argv)
     if (dispatch_fault) {
         if (dispatch_test_fault(&s, base) != 0)
             goto out;
-        if (complete_backed_refault) {
+        if (deferred_complete_fault) {
+            if (pthread_join(completion_executor, NULL) != 0) {
+                completion_executor_started = false;
+                fprintf(stderr, "pthread_join completion executor failed\n");
+                goto out;
+            }
+            completion_executor_started = false;
+            if (exec_args.result != 0 || exec_args.completed_block_id != block_id) {
+                fprintf(stderr,
+                        "completion executor result=%d completed_block=%llu expected_block=%llu\n",
+                        exec_args.result,
+                        (unsigned long long)exec_args.completed_block_id,
+                        (unsigned long long)block_id);
+                goto out;
+            }
+        }
+        if (complete_backed_refault || deferred_complete_fault) {
             if (expect_rm_backed_spill_unsupported(&s, block_id) != 0)
                 goto out;
             if (dispatch_test_fault(&s, base) != 0)
@@ -1281,7 +1308,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (complete_backed_refault)
+    if (deferred_complete_fault)
+        puts("M3 Polaris deferred completion fault test passed.");
+    else if (complete_backed_refault)
         puts("M3 Polaris completion-backed block refault test passed.");
     else if (logical_backed_refault)
         puts("M3 Polaris logical-backed block refault test passed.");
@@ -1298,6 +1327,8 @@ int main(int argc, char **argv)
     rc = 0;
 
 out:
+    if (completion_executor_started)
+        (void)pthread_join(completion_executor, NULL);
     cleanup(&s, polaris_gpu_id, polaris_rm_client_token, polaris_va_space_token);
     return rc;
 }

@@ -557,6 +557,17 @@ Still to do on the Polaris side for M1/M2:
   RM-backed device→host copy and RM release path. The completion-backed M2
   diagnostic verifies this rejection leaves the observed mapping intact before
   the explicit block-unmap/refault step.
+- Deferred logical-block materialization wired: when the UVM hook sees a
+  registered logical block mapping with no RM backing yet, it can enter the
+  existing bounded `ALLOC`/`RELOAD` decision path, wait for userspace to
+  complete the operation with RM backing metadata, and bridge-map the same
+  fault before returning `HANDLED`. The M2
+  `--deferred-complete-fault` diagnostic reserves a block with
+  `DEFER_FAULT`, registers only the worker mapping, completes the first
+  synthetic fault through `POLARIS_COMPLETE_OPERATION`, and verifies
+  unmap/refault still uses the completed logical backing. This closes the
+  kernel-side gap between the shim's deferred allocation shape and the
+  completion-backed RM residency contract.
 - Real CUDA-kernel compatibility slice wired: exact UVM hook lookup remains
   keyed by `(gpu_id, rm_client_token, va_space_token)`, but when a real
   runtime CUDA kernel faults on a Polaris VA from CUDA's own registered

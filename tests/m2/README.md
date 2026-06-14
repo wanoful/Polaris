@@ -53,6 +53,18 @@ POLARIS_BLOCK_RESERVE(block_id) without DEFER_FAULT
   -> second synthetic fault remaps through the completed logical backing
 ```
 
+The deferred completion diagnostic matches the shim's normal allocator shape:
+
+```text
+POLARIS_BLOCK_RESERVE(block_id) with DEFER_FAULT
+POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
+  -> synthetic fault has no RM backing yet
+  -> polaris.ko queues ALLOC on the UVM hook slow path
+  -> executor replies through POLARIS_COMPLETE_OPERATION with RM backing
+  -> the same hook invocation bridge-maps the completed logical block
+  -> unmap/refault still remaps through the completed backing
+```
+
 The diagnostic creates real RM objects, registers a fault-capable GPU
 VA-space with UVM, creates a UVM external range, registers the same
 `(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
@@ -212,6 +224,31 @@ allocation or host/device copy for production spill/reload. Until that copy
 path is implemented, `POLARIS_SPILL_BLOCK` intentionally supports only legacy
 CUDA VMM resident blocks with `gpu_phys_handle`; RM-backed bridge-resident
 blocks are rejected before any PTE teardown.
+
+## Deferred Completion Fault Diagnostic
+
+This validates the shim-facing fault path for deferred logical blocks. Unlike
+`--complete-backed-refault`, the block is reserved with
+`POLARIS_RESERVE_FLAG_DEFER_FAULT`, so no `ALLOC` decision exists until the
+synthetic UVM fault reaches polaris.ko. The fault hook detects the registered
+logical mapping, queues the existing `ALLOC` decision path, waits for the
+executor to complete it with RM backing metadata, and then bridge-maps the
+same fault before returning `HANDLED`:
+
+```sh
+sudo tests/m2/m2_static_block_setup --deferred-complete-fault
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris deferred completion fault test passed.
+```
+
+This is the closest M2/M3 diagnostic to the production shim allocation path:
+the shim can reserve external-range VA without static backing, and the first
+GPU fault can materialize bridge-mapable RM residency through the daemon
+completion contract.
 
 ## Spill Ioctl Validation
 

@@ -431,6 +431,60 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             }
         }
 
+        if polaris_can_materialize_logical_fault_mapping(
+            gpu_id,
+            rm_client_token,
+            va_space_token,
+            fault_address,
+        ) {
+            match polaris_resolve_gpu_fault(
+                gpu_id,
+                rm_client_token,
+                va_space_token,
+                fault_address,
+                access_type,
+            ) {
+                Ok(PolarisUvmFaultResult::Handled) => {
+                    if let Some(mapping) = polaris_find_logical_fault_mapping(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                    ) {
+                        match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
+                            Ok(()) => {
+                                polaris_note_block_mapping_fault(
+                                    gpu_id,
+                                    fault_address,
+                                    gpu_va_space_ptr,
+                                );
+                                POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
+                                return UVM_POLARIS_FAULT_HANDLED;
+                            }
+                            Err(()) => {
+                                POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
+                                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
+                                return UVM_POLARIS_FAULT_ERROR;
+                            }
+                        }
+                    }
+                    POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
+                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
+                    return UVM_POLARIS_FAULT_NOT_MINE;
+                }
+                Ok(PolarisUvmFaultResult::NotMine) => {
+                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
+                    return UVM_POLARIS_FAULT_NOT_MINE;
+                }
+                Ok(PolarisUvmFaultResult::Error) | Err(_) => {
+                    POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
+                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
+                    return UVM_POLARIS_FAULT_ERROR;
+                }
+            }
+        }
+
         POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
         POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
         return UVM_POLARIS_FAULT_NOT_MINE;
@@ -651,6 +705,43 @@ fn polaris_find_logical_fault_mapping(
     }
 
     None
+}
+
+fn polaris_can_materialize_logical_fault_mapping(
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    fault_address: u64,
+) -> bool {
+    let guard = POLARIS_STATE.lock();
+    let Some(inner) = guard.as_ref() else {
+        return false;
+    };
+
+    if inner.daemon_attached == 0 {
+        return false;
+    }
+
+    inner.block_mappings.iter().any(|mapping| {
+        if mapping.gpu_id != gpu_id
+            || mapping.rm_client_token != rm_client_token
+            || mapping.va_space_token != va_space_token
+            || fault_address < mapping.base
+            || fault_address >= mapping.base.saturating_add(mapping.length)
+        {
+            return false;
+        }
+
+        inner.blocks.iter().any(|block| {
+            block.block_id == mapping.block_id
+                && matches!(
+                    block.state,
+                    PolarisBlockState::Unmapped
+                        | PolarisBlockState::CpuOffloaded
+                        | PolarisBlockState::CowPending
+                )
+        })
+    })
 }
 
 fn polaris_find_single_observed_fault_mapping(
