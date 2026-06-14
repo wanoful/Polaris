@@ -128,6 +128,7 @@ tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/polaris-llama-e2e.XXXXXX")"
 device_log="$tmpdir/list-devices.log"
 polaris_log="$tmpdir/llama-polaris-backend.log"
 shim_log="$tmpdir/llama-shim-probe.log"
+managed_shim_log="$tmpdir/llama-shim-managed-probe.log"
 stats_before="$tmpdir/stats.before"
 stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
@@ -178,100 +179,147 @@ if [[ "${POLARIS_LLAMA_RUN_SHIM_PROBE:-1}" == "0" ]]; then
     exit 0
 fi
 
+run_shim_probe() {
+    local unified_memory="$1"
+    local probe_env=(
+        GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
+        POLARIS_SHIM_BOOTSTRAP_RM_UVM=1
+        POLARIS_SHIM_STATIC_RM_BACKEND=1
+        POLARIS_SHIM_STRICT_MANAGED_ALLOC=1
+        POLARIS_SHIM_REPORT_STATS=1
+        POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}"
+        POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}"
+        POLARIS_SHIM_TRANSIENT_GPU=1
+        POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}"
+        POLARIS_SHIM_CUDA_ORDINAL="${POLARIS_SHIM_CUDA_ORDINAL:-0}"
+        POLARIS_SHIM_BLOCK_SIZE="${POLARIS_SHIM_BLOCK_SIZE:-0x200000}"
+        POLARIS_SHIM_MANAGED_LENGTH_CAP="${POLARIS_SHIM_MANAGED_LENGTH_CAP:-17179869184}"
+        POLARIS_SHIM_MIN_MANAGED_ALLOC="${POLARIS_SHIM_MIN_MANAGED_ALLOC:-1}"
+        POLARIS_SHIM_MAX_MANAGED_ALLOC="${POLARIS_SHIM_MAX_MANAGED_ALLOC:-0}"
+        LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}"
+    )
+
+    if [[ "$unified_memory" == "1" ]]; then
+        probe_env+=(GGML_CUDA_ENABLE_UNIFIED_MEMORY=1)
+    fi
+
+    env "${probe_env[@]}" \
+        "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+}
+
+verify_shim_probe() {
+    local label="$1"
+    local log="$2"
+    local before_hook="$3"
+    local before_handled="$4"
+    local before_no_pte="$5"
+    local before_errors="$6"
+    local expected_selected_key="$7"
+    local rc="$8"
+    local after_hook
+    local after_handled
+    local after_no_pte
+    local after_errors
+    local managed_success
+    local strict_failures
+    local expected_selected
+
+    grep -q '\[polaris-shim\] RM/UVM bootstrap ready' "$log" ||
+        die "$label shim did not bootstrap RM/UVM VA-space; see $log"
+    grep -q '\[polaris-shim\] registered VA-space' "$log" ||
+        die "$label shim did not register the VA-space with polaris.ko; see $log"
+    grep -q '\[polaris-shim\] static RM backend block' "$log" ||
+        die "$label no shim-managed allocation registered static RM backing; see $log"
+    grep -q '\[polaris-shim\] managed allocation' "$log" ||
+        die "$label no llama.cpp allocation was routed through Polaris; see $log"
+
+    after_hook="$(stat_value uvm_hook_calls)"
+    after_handled="$(stat_value uvm_handled)"
+    after_no_pte="$(stat_value uvm_no_pte)"
+    after_errors="$(stat_value uvm_errors)"
+
+    if [[ "$rc" -ne 0 ]]; then
+        if [[ "${POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS:-0}" == "1" ]]; then
+            tail -n 160 "$log" >&2 || true
+            die "$label strict shim fault-path run failed with exit code $rc; see $log"
+        fi
+
+        if grep -Eq '\[polaris-shim\] (cudaMemcpy|cuMemcpy).*Polaris pointer is not wired yet' "$log" &&
+           ! grep -Eq 'Segmentation fault|SIGSEGV' "$log"; then
+            tail -n 160 "$log" >&2 || true
+            note "PASS: $label shim selected a copied buffer and stopped at the guarded host-copy surface"
+            note "exit code: $rc"
+            note "uvm_hook_calls: $before_hook -> $after_hook"
+            note "uvm_handled:    $before_handled -> $after_handled"
+            note "logs kept in $tmpdir"
+            exit 0
+        fi
+
+        tail -n 160 "$log" >&2 || true
+        die "$label shim probe failed after bootstrap but before the strict fault-path gate (exit code $rc); see $log"
+    fi
+
+    managed_success="$(extract_last_metric managed_success_calls "$log")"
+    strict_failures="$(extract_last_metric strict_failure_calls "$log")"
+    expected_selected="$(extract_last_metric "$expected_selected_key" "$log")"
+    managed_success="${managed_success:-0}"
+    strict_failures="${strict_failures:-0}"
+    expected_selected="${expected_selected:-0}"
+    if [[ "$managed_success" -le 0 ]]; then
+        die "$label shim stats reported no successful managed allocations; see $log"
+    fi
+    if [[ "$strict_failures" -ne 0 ]]; then
+        die "$label shim stats reported strict allocation failures=$strict_failures; see $log"
+    fi
+    if [[ "$expected_selected" -le 0 ]]; then
+        die "$label shim stats reported ${expected_selected_key}=0; see $log"
+    fi
+
+    if [[ "$after_hook" -le "$before_hook" ]]; then
+        die "$label kernel UVM hook call counter did not increase ($before_hook -> $after_hook)"
+    fi
+    if [[ "$after_handled" -le "$before_handled" ]]; then
+        die "$label kernel UVM handled counter did not increase ($before_handled -> $after_handled)"
+    fi
+    if [[ "$after_no_pte" -gt "$before_no_pte" ]]; then
+        die "$label kernel reported unserviceable Polaris faults ($before_no_pte -> $after_no_pte)"
+    fi
+    if [[ "$after_errors" -gt "$before_errors" ]]; then
+        die "$label kernel reported Polaris UVM hook errors ($before_errors -> $after_errors)"
+    fi
+
+    note "PASS: $label llama.cpp shim allocation and GPU fault path reached Polaris"
+    note "managed_success_calls=$managed_success"
+    note "$expected_selected_key=$expected_selected"
+    note "uvm_hook_calls: $before_hook -> $after_hook"
+    note "uvm_handled:    $before_handled -> $after_handled"
+}
+
 before_hook_calls="$(stat_value uvm_hook_calls)"
 before_handled="$(stat_value uvm_handled)"
 before_no_pte="$(stat_value uvm_no_pte)"
 before_errors="$(stat_value uvm_errors)"
 
 note "running LD_PRELOAD shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
-run_shim_probe() {
-    env \
-        GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}" \
-        POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
-        POLARIS_SHIM_STATIC_RM_BACKEND=1 \
-        POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
-        POLARIS_SHIM_REPORT_STATS=1 \
-        POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}" \
-        POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}" \
-        POLARIS_SHIM_TRANSIENT_GPU=1 \
-        POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}" \
-        POLARIS_SHIM_CUDA_ORDINAL="${POLARIS_SHIM_CUDA_ORDINAL:-0}" \
-        POLARIS_SHIM_BLOCK_SIZE="${POLARIS_SHIM_BLOCK_SIZE:-0x200000}" \
-        POLARIS_SHIM_MANAGED_LENGTH_CAP="${POLARIS_SHIM_MANAGED_LENGTH_CAP:-17179869184}" \
-        POLARIS_SHIM_MIN_MANAGED_ALLOC="${POLARIS_SHIM_MIN_MANAGED_ALLOC:-1}" \
-        POLARIS_SHIM_MAX_MANAGED_ALLOC="${POLARIS_SHIM_MAX_MANAGED_ALLOC:-0}" \
-        LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}" \
-        "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
-}
-
 set +e
-run_shim_probe >"$shim_log" 2>&1
+run_shim_probe "" >"$shim_log" 2>&1
 rc=$?
 set -e
+verify_shim_probe "default" "$shim_log" "$before_hook_calls" "$before_handled" \
+    "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc"
+
+before_hook_calls="$(stat_value uvm_hook_calls)"
+before_handled="$(stat_value uvm_handled)"
+before_no_pte="$(stat_value uvm_no_pte)"
+before_errors="$(stat_value uvm_errors)"
+
+note "running LD_PRELOAD unified-memory shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+set +e
+run_shim_probe "1" >"$managed_shim_log" 2>&1
+rc=$?
+set -e
+verify_shim_probe "unified-memory" "$managed_shim_log" "$before_hook_calls" "$before_handled" \
+    "$before_no_pte" "$before_errors" api_runtime_managed_alloc_selected "$rc"
 
 cp "$STATS_PATH" "$stats_after"
-
-grep -q '\[polaris-shim\] RM/UVM bootstrap ready' "$shim_log" ||
-    die "shim did not bootstrap RM/UVM VA-space; see $shim_log"
-grep -q '\[polaris-shim\] registered VA-space' "$shim_log" ||
-    die "shim did not register the VA-space with polaris.ko; see $shim_log"
-grep -q '\[polaris-shim\] static RM backend block' "$shim_log" ||
-    die "no shim-managed allocation registered static RM backing; see $shim_log"
-grep -q '\[polaris-shim\] managed allocation' "$shim_log" ||
-    die "no llama.cpp allocation was routed through Polaris; see $shim_log"
-
-after_hook_calls="$(stat_value uvm_hook_calls)"
-after_handled="$(stat_value uvm_handled)"
-after_no_pte="$(stat_value uvm_no_pte)"
-after_errors="$(stat_value uvm_errors)"
-
-if [[ "$rc" -ne 0 ]]; then
-    if [[ "${POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS:-0}" == "1" ]]; then
-        tail -n 160 "$shim_log" >&2 || true
-        die "strict shim fault-path run failed with exit code $rc; see $shim_log"
-    fi
-
-    if grep -Eq '\[polaris-shim\] (cudaMemcpy|cuMemcpy).*Polaris pointer is not wired yet' "$shim_log" &&
-       ! grep -Eq 'Segmentation fault|SIGSEGV' "$shim_log"; then
-        tail -n 160 "$shim_log" >&2 || true
-        note "PASS: shim selected a copied buffer and stopped at the guarded host-copy surface"
-        note "exit code: $rc"
-        note "uvm_hook_calls: $before_hook_calls -> $after_hook_calls"
-        note "uvm_handled:    $before_handled -> $after_handled"
-        note "logs kept in $tmpdir"
-        exit 0
-    fi
-
-    tail -n 160 "$shim_log" >&2 || true
-    die "shim probe failed after bootstrap but before the strict fault-path gate (exit code $rc); see $shim_log"
-fi
-
-managed_success="$(extract_last_metric managed_success_calls "$shim_log")"
-strict_failures="$(extract_last_metric strict_failure_calls "$shim_log")"
-managed_success="${managed_success:-0}"
-strict_failures="${strict_failures:-0}"
-if [[ "$managed_success" -le 0 ]]; then
-    die "shim stats reported no successful managed allocations; see $shim_log"
-fi
-if [[ "$strict_failures" -ne 0 ]]; then
-    die "shim stats reported strict allocation failures=$strict_failures; see $shim_log"
-fi
-
-if [[ "$after_hook_calls" -le "$before_hook_calls" ]]; then
-    die "kernel UVM hook call counter did not increase ($before_hook_calls -> $after_hook_calls)"
-fi
-if [[ "$after_handled" -le "$before_handled" ]]; then
-    die "kernel UVM handled counter did not increase ($before_handled -> $after_handled)"
-fi
-if [[ "$after_no_pte" -gt "$before_no_pte" ]]; then
-    die "kernel reported unserviceable Polaris faults ($before_no_pte -> $after_no_pte)"
-fi
-if [[ "$after_errors" -gt "$before_errors" ]]; then
-    die "kernel reported Polaris UVM hook errors ($before_errors -> $after_errors)"
-fi
-
-note "PASS: llama.cpp shim allocation and GPU fault path reached Polaris"
-note "managed_success_calls=$managed_success"
-note "uvm_hook_calls: $before_hook_calls -> $after_hook_calls"
-note "uvm_handled:    $before_handled -> $after_handled"
 note "logs kept in $tmpdir"

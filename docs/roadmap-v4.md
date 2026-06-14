@@ -663,10 +663,11 @@ Still to do on the Polaris side for M1/M2:
 - Allocator observability wired:
   `POLARIS_SHIM_REPORT_STATS=1` prints an exit-time summary of intercepted
   allocation/free calls, size-policy pass-throughs, Polaris successes and
-  failures, real CUDA fallback calls/results, live managed bytes, and peak
-  live managed bytes. This gives llama.cpp/KV experiments a low-friction way
-  to confirm the size filter selected the intended allocations before running
-  the riskier kernel-deref fault path.
+  failures, real CUDA fallback calls/results, live managed bytes, peak live
+  managed bytes, and per-allocation-API selected counters. This gives
+  llama.cpp/KV experiments a low-friction way to confirm the size filter
+  selected the intended allocations before running the riskier kernel-deref
+  fault path.
 - Bootstrapped managed-window default improved: in
   `POLARIS_SHIM_BOOTSTRAP_RM_UVM=1` mode, the shim now derives the managed
   allocator window from the RM-reported fault-capable VA-space instead of the
@@ -758,11 +759,13 @@ Still to do on the Polaris side for M1/M2:
   `tests/llama_cpp/run_llama_shim_e2e.sh` / `make llama-e2e` defaults to
   `/home/wano/workspace/llama.cpp` and runs two checks. First, if the local
   llama.cpp binary exposes `POLARIS0`, it runs a real `llama-bench` workload
-  on that device. Second, it runs an unmodified CUDA `llama-bench` workload
-  under `LD_PRELOAD` and asserts that the shim bootstraps RM/UVM, registers a
-  Polaris VA-space, routes a real llama allocation through Polaris, creates a
-  UVM external range, registers static RM backing, and in strict mode increments
-  both `uvm_hook_calls` and `uvm_handled`.
+  on that device. Second, it runs unmodified CUDA `llama-bench` workloads under
+  `LD_PRELOAD` for both the ordinary `cudaMalloc` path and the
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` / `cudaMallocManaged` path, and asserts
+  that the shim bootstraps RM/UVM, registers a Polaris VA-space, routes real
+  llama allocations through Polaris, creates UVM external ranges, registers
+  static RM backing, records the expected per-API selected allocation counter,
+  and in strict mode increments both `uvm_hook_calls` and `uvm_handled`.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
@@ -782,22 +785,23 @@ Still to do on the Polaris side for M1/M2:
   returned `CUDA_ERROR_INVALID_CONTEXT` without a current context and segfaulted
   inside `libcuda` with a current runtime context.
 - Strict static-RM shim fault-path gate passes on the local SmolLM2
-  `llama-bench` run: the shim selected two KV allocations
-  (`5898240` bytes each), passed three copied model/init allocations through to
-  real CUDA, accepted KV zero-fill initialization, and completed with
-  `uvm_hook_calls` and `uvm_handled` increasing and no `uvm_no_pte` or
-  `uvm_errors` increments. This validates the no-source-change KV-only path
-  through the UVM bridge for the integration-test backend.
-- Run llama.cpp end-to-end against shim+polaris.ko+polarisd, with both the
-  ordinary `cudaMalloc` KV path and the `cudaMallocManaged` path selected by
-  `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. CUDA Graph mode may need to be disabled
+  `llama-bench` run for both llama.cpp allocator branches: the default probe
+  selects KV allocations through runtime `cudaMalloc`, and the
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` probe selects KV allocations through
+  runtime `cudaMallocManaged`. In both cases the shim passes copied model/init
+  allocations through to real CUDA, accepts KV zero-fill initialization, and
+  completes with `uvm_hook_calls` and `uvm_handled` increasing and no
+  `uvm_no_pte` or `uvm_errors` increments. This validates the
+  no-source-change KV-only path through the UVM bridge for the integration-test
+  backend.
+- Run llama.cpp end-to-end against shim+polaris.ko+polarisd using the
+  daemon-backed spill/reload path. CUDA Graph mode may need to be disabled
   (or KV ranges excluded from graph capture); document the decision per
   integration option.
 - Remaining production shim work: replace the static RM test backend with the
-  daemon-backed spill/reload path, cover the `cudaMallocManaged` branch selected
-  by `GGML_CUDA_ENABLE_UNIFIED_MEMORY`, replace the fixed managed-window
-  reservation model with workload-appropriate VA management, and document or
-  disable CUDA Graph interactions.
+  daemon-backed spill/reload path, replace the fixed managed-window reservation
+  model with workload-appropriate VA management, and document or disable CUDA
+  Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

@@ -126,11 +126,15 @@ fault-path gate:
 
 - if the local llama.cpp binary exposes `POLARIS0`, a real `llama-bench`
   workload runs on that backend and must complete;
-- the LD_PRELOAD shim probe runs an unmodified CUDA `llama-bench` workload,
-  bootstraps RM/UVM, registers a Polaris VA-space, routes real
-  llama allocation through Polaris, creates a UVM external range, allocates an
-  RM vidmem object, registers it with `POLARIS_REGISTER_STATIC_BLOCK`, and
-  requires `/sys/kernel/polaris/stats` to show increased `uvm_hook_calls` and
+- the LD_PRELOAD shim probes run unmodified CUDA `llama-bench` workloads for
+  both the default `cudaMalloc` path and the
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` / `cudaMallocManaged` path. Each probe
+  bootstraps RM/UVM, registers a Polaris VA-space, routes real llama allocation
+  through Polaris, creates a UVM external range, allocates an RM vidmem object,
+  registers it with `POLARIS_REGISTER_STATIC_BLOCK`, requires the matching shim
+  per-API counter (`api_runtime_alloc_selected` or
+  `api_runtime_managed_alloc_selected`) to increase, and requires
+  `/sys/kernel/polaris/stats` to show increased `uvm_hook_calls` and
   `uvm_handled`;
 - when the allocator policy selects a copied model/init buffer, the shim probe
   is expected to stop cleanly at the guarded CUDA host-copy surface rather than
@@ -161,10 +165,11 @@ host copies into Polaris external VA safe, and it still does not implement
 daemon-backed spill/reload.
 
 Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
-`llama-bench` command completes and `/sys/kernel/polaris/stats` shows both
-`uvm_hook_calls` and `uvm_handled` increasing. This strict static-RM gate passes
-for the local SmolLM2 CUDA run when KV-scope selection is enabled. It is still
-an integration-test backend: daemon-backed spill/reload remains separate
+`llama-bench` commands complete and `/sys/kernel/polaris/stats` shows both
+`uvm_hook_calls` and `uvm_handled` increasing for the default and
+unified-memory allocator branches. This strict static-RM gate passes for the
+local SmolLM2 CUDA runs when KV-scope selection is enabled. It is still an
+integration-test backend: daemon-backed spill/reload remains separate
 production work.
 
 ## Workload Run Shape
@@ -184,6 +189,8 @@ sudo env \
   /path/to/llama.cpp/build/bin/<llama-binary> <args>
 ```
 
-The next production milestone is validating this against llama.cpp's actual KV
-allocation path, then moving from the fixed managed-window allocator to
-workload-appropriate VA management.
+The current static-RM regression validates llama.cpp's actual KV allocation and
+kernel-deref path for both runtime `cudaMalloc` and runtime
+`cudaMallocManaged`. The next production milestone is replacing the static RM
+test backend with daemon-backed spill/reload, then moving from the fixed
+managed-window allocator to workload-appropriate VA management.

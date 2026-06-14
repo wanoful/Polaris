@@ -173,11 +173,14 @@ Set `POLARIS_SHIM_REPORT_STATS=1` to print an exit-time allocator summary.
 The report includes total intercepted allocation calls and bytes, selected
 managed calls, size-policy pass-through calls, Polaris allocation successes
 and failures, real CUDA fallback calls/results, managed/free counts, current
-live bytes, and peak live bytes. This is intended for tuning M5 workload runs:
-with `POLARIS_SHIM_MIN_MANAGED_ALLOC` / `POLARIS_SHIM_MAX_MANAGED_ALLOC`, the
-summary shows whether the intended KV-sized allocations were routed through
-Polaris while smaller CUDA runtime/control allocations stayed on the real CUDA
-allocator.
+live bytes, peak live bytes, and per-allocation-API selected counters such as
+`api_runtime_alloc_selected` and `api_runtime_managed_alloc_selected`. This is
+intended for tuning M5 workload runs: with `POLARIS_SHIM_MIN_MANAGED_ALLOC` /
+`POLARIS_SHIM_MAX_MANAGED_ALLOC`, the summary shows whether the intended
+KV-sized allocations were routed through Polaris while smaller CUDA
+runtime/control allocations stayed on the real CUDA allocator, and whether a
+run used the default `cudaMalloc` path or the
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY` / `cudaMallocManaged` path.
 The shim also interposes common runtime and driver memory operations
 (`cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemset`, `cudaMemsetAsync`,
 `cudaMemcpy2DAsync`, `cudaMemcpyPeerAsync`, `cudaMemcpy3DPeerAsync`,
@@ -243,8 +246,10 @@ mode implicitly; harness mode should set `POLARIS_SHIM_MANAGE_ALLOCATIONS=1`:
 
 This is not yet the full production shim for llama.cpp: it creates the
 fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
-still uses the fixed managed window allocator model and has not been validated
-against llama.cpp's actual KV allocation and kernel-deref path.
+still uses the fixed managed window allocator model and the static RM
+integration-test backend. The local M5 regression validates llama.cpp's actual
+KV allocation and kernel-deref path for both runtime `cudaMalloc` and runtime
+`cudaMallocManaged`; daemon-backed spill/reload remains pending.
 
 ## Why this is not a Cargo crate
 

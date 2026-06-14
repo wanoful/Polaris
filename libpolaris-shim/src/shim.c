@@ -126,6 +126,21 @@ static struct polaris_shim_allocation *g_allocations;
 static struct polaris_shim_free_span *g_free_spans;
 static size_t g_live_managed_allocations;
 
+enum polaris_shim_alloc_api {
+    POLARIS_SHIM_ALLOC_API_DRIVER,
+    POLARIS_SHIM_ALLOC_API_DRIVER_ASYNC,
+    POLARIS_SHIM_ALLOC_API_RUNTIME,
+    POLARIS_SHIM_ALLOC_API_RUNTIME_MANAGED,
+    POLARIS_SHIM_ALLOC_API_RUNTIME_ASYNC,
+};
+
+struct polaris_shim_api_alloc_stats {
+    uint64_t calls;
+    uint64_t bytes;
+    uint64_t selected_calls;
+    uint64_t selected_bytes;
+};
+
 struct polaris_shim_alloc_stats {
     uint64_t alloc_calls;
     uint64_t alloc_bytes;
@@ -154,6 +169,11 @@ struct polaris_shim_alloc_stats {
     uint64_t live_rounded_bytes;
     uint64_t peak_live_requested_bytes;
     uint64_t peak_live_rounded_bytes;
+    struct polaris_shim_api_alloc_stats driver_alloc;
+    struct polaris_shim_api_alloc_stats driver_async_alloc;
+    struct polaris_shim_api_alloc_stats runtime_alloc;
+    struct polaris_shim_api_alloc_stats runtime_managed_alloc;
+    struct polaris_shim_api_alloc_stats runtime_async_alloc;
 };
 
 static struct polaris_shim_alloc_stats g_alloc_stats;
@@ -370,14 +390,41 @@ static void choose_bootstrap_managed_window(uint64_t *base, uint64_t *length)
         *length = cap;
 }
 
-static void stats_note_alloc_call(size_t size, int selected)
+static struct polaris_shim_api_alloc_stats *
+stats_api_bucket_locked(enum polaris_shim_alloc_api api)
 {
+    switch (api) {
+    case POLARIS_SHIM_ALLOC_API_DRIVER:
+        return &g_alloc_stats.driver_alloc;
+    case POLARIS_SHIM_ALLOC_API_DRIVER_ASYNC:
+        return &g_alloc_stats.driver_async_alloc;
+    case POLARIS_SHIM_ALLOC_API_RUNTIME:
+        return &g_alloc_stats.runtime_alloc;
+    case POLARIS_SHIM_ALLOC_API_RUNTIME_MANAGED:
+        return &g_alloc_stats.runtime_managed_alloc;
+    case POLARIS_SHIM_ALLOC_API_RUNTIME_ASYNC:
+        return &g_alloc_stats.runtime_async_alloc;
+    }
+    return &g_alloc_stats.driver_alloc;
+}
+
+static void stats_note_alloc_call(enum polaris_shim_alloc_api api,
+                                  size_t size,
+                                  int selected)
+{
+    struct polaris_shim_api_alloc_stats *api_stats;
+
     pthread_mutex_lock(&g_alloc_lock);
     g_alloc_stats.alloc_calls++;
     g_alloc_stats.alloc_bytes += (uint64_t)size;
+    api_stats = stats_api_bucket_locked(api);
+    api_stats->calls++;
+    api_stats->bytes += (uint64_t)size;
     if (selected) {
         g_alloc_stats.selected_calls++;
         g_alloc_stats.selected_bytes += (uint64_t)size;
+        api_stats->selected_calls++;
+        api_stats->selected_bytes += (uint64_t)size;
     } else {
         g_alloc_stats.policy_passthrough_calls++;
         g_alloc_stats.policy_passthrough_bytes += (uint64_t)size;
@@ -573,6 +620,27 @@ static void report_stats_at_exit(void)
             stats.managed_failure_calls,
             stats.managed_failure_bytes,
             stats.strict_failure_calls);
+    fprintf(stderr,
+            "[polaris-shim] stats api_driver_alloc_calls=%" PRIu64
+            " api_driver_alloc_selected=%" PRIu64
+            " api_driver_async_alloc_calls=%" PRIu64
+            " api_driver_async_alloc_selected=%" PRIu64
+            " api_runtime_alloc_calls=%" PRIu64
+            " api_runtime_alloc_selected=%" PRIu64
+            " api_runtime_managed_alloc_calls=%" PRIu64
+            " api_runtime_managed_alloc_selected=%" PRIu64
+            " api_runtime_async_alloc_calls=%" PRIu64
+            " api_runtime_async_alloc_selected=%" PRIu64 "\n",
+            stats.driver_alloc.calls,
+            stats.driver_alloc.selected_calls,
+            stats.driver_async_alloc.calls,
+            stats.driver_async_alloc.selected_calls,
+            stats.runtime_alloc.calls,
+            stats.runtime_alloc.selected_calls,
+            stats.runtime_managed_alloc.calls,
+            stats.runtime_managed_alloc.selected_calls,
+            stats.runtime_async_alloc.calls,
+            stats.runtime_async_alloc.selected_calls);
     fprintf(stderr,
             "[polaris-shim] stats fallback_alloc_calls=%" PRIu64
             " fallback_alloc_bytes=%" PRIu64
@@ -1449,7 +1517,7 @@ static CUresult cu_mem_alloc_impl(const char *real_name,
 
     if (g_manage_allocations) {
         selected = dptr && should_manage_allocation(bytesize);
-        stats_note_alloc_call(bytesize, selected);
+        stats_note_alloc_call(POLARIS_SHIM_ALLOC_API_DRIVER, bytesize, selected);
     }
 
     if (selected) {
@@ -1497,7 +1565,7 @@ static CUresult cu_mem_alloc_async_impl(const char *real_name,
 
     if (g_manage_allocations) {
         selected = dptr && should_manage_allocation(bytesize);
-        stats_note_alloc_call(bytesize, selected);
+        stats_note_alloc_call(POLARIS_SHIM_ALLOC_API_DRIVER_ASYNC, bytesize, selected);
     }
 
     if (selected) {
@@ -2544,7 +2612,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size)
 
     if (g_manage_allocations) {
         selected = devPtr && should_manage_allocation(size);
-        stats_note_alloc_call(size, selected);
+        stats_note_alloc_call(POLARIS_SHIM_ALLOC_API_RUNTIME, size, selected);
     }
 
     if (selected) {
@@ -2590,7 +2658,7 @@ cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags)
 
     if (g_manage_allocations) {
         selected = devPtr && should_manage_allocation(size);
-        stats_note_alloc_call(size, selected);
+        stats_note_alloc_call(POLARIS_SHIM_ALLOC_API_RUNTIME_MANAGED, size, selected);
     }
 
     if (selected) {
@@ -2671,7 +2739,7 @@ cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
 
     if (g_manage_allocations) {
         selected = devPtr && should_manage_allocation(size);
-        stats_note_alloc_call(size, selected);
+        stats_note_alloc_call(POLARIS_SHIM_ALLOC_API_RUNTIME_ASYNC, size, selected);
     }
 
     if (selected) {
