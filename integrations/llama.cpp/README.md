@@ -121,19 +121,23 @@ without invoking CUDA launch entry points.
 ## M5 Integration Regression
 
 The repository includes a root/GPU integration test for the current llama.cpp
-state. It intentionally separates the part that passes today from the strict
-future fault-path gate:
+state. It separates the optional POLARIS backend check from the LD_PRELOAD shim
+fault-path gate:
 
 - if the local llama.cpp binary exposes `POLARIS0`, a real `llama-bench`
   workload runs on that backend and must complete;
 - the LD_PRELOAD shim probe runs an unmodified CUDA `llama-bench` workload,
-  bootstraps RM/UVM, registers a Polaris VA-space, routes at least one real
+  bootstraps RM/UVM, registers a Polaris VA-space, routes real
   llama allocation through Polaris, creates a UVM external range, allocates an
-  RM vidmem object, and registers it with `POLARIS_REGISTER_STATIC_BLOCK`;
-- today the shim probe is expected to stop cleanly at the guarded CUDA
-  host-copy surface, because llama.cpp immediately uploads model tensors with
-  `cudaMemcpyAsync` into the first intercepted allocation before any GPU
-  replayable fault reaches Polaris.
+  RM vidmem object, registers it with `POLARIS_REGISTER_STATIC_BLOCK`, and
+  requires `/sys/kernel/polaris/stats` to show increased `uvm_hook_calls` and
+  `uvm_handled`;
+- when the allocator policy selects a copied model/init buffer, the shim probe
+  is expected to stop cleanly at the guarded CUDA host-copy surface rather than
+  letting libcuda touch Polaris external VA from the wrong context. The current
+  passing no-source-change path selects KV allocations through the ggml KV
+  scope hook, accepts their zero-fill initialization, and lets their first real
+  kernel access fault through UVM.
 
 Run it from this repository after loading the patched NVIDIA UVM module and
 `polaris.ko`:
@@ -152,15 +156,16 @@ with `LLAMA_CPP_BIN=/path/to/binary`.
 
 `POLARIS_SHIM_STATIC_RM_BACKEND=1` is a test backend, not the final production
 spill/reload design. It proves the shim can allocate and register RM-backed
-external ranges for real llama.cpp allocations, but it does not make CUDA
-runtime host copies into Polaris external VA safe.
+external ranges for real llama.cpp allocations. It does not make CUDA runtime
+host copies into Polaris external VA safe, and it still does not implement
+daemon-backed spill/reload.
 
-Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require the future strict
-M5 behavior: the shimmed `llama-bench` command must complete and
-`/sys/kernel/polaris/stats` must show both `uvm_hook_calls` and `uvm_handled`
-increase. That mode is expected to fail until the host/device copy path is
-wired or the allocator policy selects only llama.cpp buffers that are not
-initialized through CUDA copy/fill APIs.
+Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
+`llama-bench` command completes and `/sys/kernel/polaris/stats` shows both
+`uvm_hook_calls` and `uvm_handled` increasing. This strict static-RM gate passes
+for the local SmolLM2 CUDA run when KV-scope selection is enabled. It is still
+an integration-test backend: daemon-backed spill/reload remains separate
+production work.
 
 ## Workload Run Shape
 

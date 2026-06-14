@@ -761,9 +761,8 @@ Still to do on the Polaris side for M1/M2:
   on that device. Second, it runs an unmodified CUDA `llama-bench` workload
   under `LD_PRELOAD` and asserts that the shim bootstraps RM/UVM, registers a
   Polaris VA-space, routes a real llama allocation through Polaris, creates a
-  UVM external range, and registers static RM backing. Today that shim probe
-  is expected to stop cleanly at the guarded host-copy surface instead of
-  segfaulting or silently falling back.
+  UVM external range, registers static RM backing, and in strict mode increments
+  both `uvm_hook_calls` and `uvm_handled`.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
@@ -772,21 +771,31 @@ Still to do on the Polaris side for M1/M2:
   fault reaches the UVM bridge. It is not the daemon-backed production
   spill/reload path, and it does not make CUDA runtime host copies into
   Polaris external VA safe.
-- Strict shim fault-path gate is still pending:
-  set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` for the future requirement
-  that the shimmed `llama-bench` command completes and increments both
-  `uvm_hook_calls` and `uvm_handled`. Current testing on the local SmolLM2
-  run shows the first intercepted llama allocation is a CUDA model-buffer
-  allocation; llama.cpp immediately uploads tensors with `cudaMemcpyAsync`
-  into the returned Polaris pointer, and the shim correctly rejects that path
-  with `cudaErrorNotSupported` before any real GPU dereference occurs.
+- KV-only selection slice wired and validated against the local llama.cpp
+  binary: `POLARIS_SHIM_REQUIRE_KV_SCOPE=1` uses the ggml allocation-scope hook
+  to leave the copied model-buffer allocation on real CUDA memory while routing
+  KV-cache allocations through Polaris. `POLARIS_SHIM_ALLOW_ZERO_MEMSET=1`
+  accepts base-address zero-fill initialization within a selected allocation as
+  a no-op declaration for these selected ranges; nonzero host copy/fill remains
+  guarded. A temporary
+  UVM-map-plus-CUDA-copy experiment was rejected after `cuMemcpyHtoD_v2`
+  returned `CUDA_ERROR_INVALID_CONTEXT` without a current context and segfaulted
+  inside `libcuda` with a current runtime context.
+- Strict static-RM shim fault-path gate passes on the local SmolLM2
+  `llama-bench` run: the shim selected two KV allocations
+  (`5898240` bytes each), passed three copied model/init allocations through to
+  real CUDA, accepted KV zero-fill initialization, and completed with
+  `uvm_hook_calls` and `uvm_handled` increasing and no `uvm_no_pte` or
+  `uvm_errors` increments. This validates the no-source-change KV-only path
+  through the UVM bridge for the integration-test backend.
 - Run llama.cpp end-to-end against shim+polaris.ko+polarisd, with both the
   ordinary `cudaMalloc` KV path and the `cudaMallocManaged` path selected by
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. CUDA Graph mode may need to be disabled
   (or KV ranges excluded from graph capture); document the decision per
   integration option.
-- Remaining production shim work: validate the bootstrapped path against
-  llama.cpp's actual KV allocation path, replace the fixed managed-window
+- Remaining production shim work: replace the static RM test backend with the
+  daemon-backed spill/reload path, cover the `cudaMallocManaged` branch selected
+  by `GGML_CUDA_ENABLE_UNIFIED_MEMORY`, replace the fixed managed-window
   reservation model with workload-appropriate VA management, and document or
   disable CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.

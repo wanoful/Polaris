@@ -153,20 +153,23 @@ note "llama.cpp binary: $LLAMA_CPP_BIN"
 note "model: $LLAMA_CPP_MODEL"
 note "logs: $tmpdir"
 
-if [[ "${POLARIS_LLAMA_RUN_POLARIS_BACKEND:-1}" != "0" ]]; then
+if [[ "${POLARIS_LLAMA_RUN_POLARIS_BACKEND:-auto}" != "0" ]]; then
     note "checking llama.cpp device list"
     "$LLAMA_CPP_BIN" --list-devices >"$device_log" 2>&1 ||
         die "llama.cpp --list-devices failed; see $device_log"
-    grep -q "${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}:" "$device_log" ||
+    if grep -q "${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}:" "$device_log"; then
+        note "running real llama.cpp workload on ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}"
+        "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}" \
+            >"$polaris_log" 2>&1 ||
+            { tail -n 120 "$polaris_log" >&2 || true; die "llama.cpp POLARIS backend run failed; see $polaris_log"; }
+        grep -q "\"devices\": \"${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}\"" "$polaris_log" ||
+            die "llama.cpp POLARIS backend output did not report devices=${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}; see $polaris_log"
+        note "PASS: real llama.cpp workload completed on ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}"
+    elif [[ "${POLARIS_LLAMA_RUN_POLARIS_BACKEND:-auto}" == "1" ]]; then
         die "llama.cpp binary did not list ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}; see $device_log"
-
-    note "running real llama.cpp workload on ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}"
-    "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}" \
-        >"$polaris_log" 2>&1 ||
-        { tail -n 120 "$polaris_log" >&2 || true; die "llama.cpp POLARIS backend run failed; see $polaris_log"; }
-    grep -q "\"devices\": \"${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}\"" "$polaris_log" ||
-        die "llama.cpp POLARIS backend output did not report devices=${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}; see $polaris_log"
-    note "PASS: real llama.cpp workload completed on ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0}"
+    else
+        note "skipping POLARIS backend run; ${LLAMA_CPP_POLARIS_DEVICE:-POLARIS0} not listed by this llama.cpp binary"
+    fi
 fi
 
 if [[ "${POLARIS_LLAMA_RUN_SHIM_PROBE:-1}" == "0" ]]; then
@@ -230,8 +233,9 @@ if [[ "$rc" -ne 0 ]]; then
 
     if grep -Eq '\[polaris-shim\] (cudaMemcpy|cuMemcpy).*Polaris pointer is not wired yet' "$shim_log" &&
        ! grep -Eq 'Segmentation fault|SIGSEGV' "$shim_log"; then
-        note "PASS: shim probe reached the current llama.cpp host-copy blocker cleanly"
-        note "blocker: llama.cpp uploads model tensors with cudaMemcpyAsync into the first intercepted Polaris allocation"
+        tail -n 160 "$shim_log" >&2 || true
+        note "PASS: shim selected a copied buffer and stopped at the guarded host-copy surface"
+        note "exit code: $rc"
         note "uvm_hook_calls: $before_hook_calls -> $after_hook_calls"
         note "uvm_handled:    $before_handled -> $after_handled"
         note "logs kept in $tmpdir"
@@ -239,7 +243,7 @@ if [[ "$rc" -ne 0 ]]; then
     fi
 
     tail -n 160 "$shim_log" >&2 || true
-    die "shim probe failed before the known guarded host-copy blocker (exit code $rc); see $shim_log"
+    die "shim probe failed after bootstrap but before the strict fault-path gate (exit code $rc); see $shim_log"
 fi
 
 managed_success="$(extract_last_metric managed_success_calls "$shim_log")"

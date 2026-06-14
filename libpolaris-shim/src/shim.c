@@ -1966,12 +1966,15 @@ static CUresult cu_memcpy_htod_impl(const char *real_name,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (find_allocation_range(dstDevice, NULL, NULL)) {
+        (void)srcHost;
+        (void)ByteCount;
+        (void)stream;
+        (void)is_async;
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
-                "(dst=0x%" PRIx64 " src=%p bytes=%zu)\n",
+                "(dst=0x%" PRIx64 " bytes=%zu)\n",
                 real_name,
                 (uint64_t)dstDevice,
-                srcHost,
                 ByteCount);
         return CUDA_ERROR_NOT_SUPPORTED;
     }
@@ -2008,11 +2011,14 @@ static CUresult cu_memcpy_dtoh_impl(const char *real_name,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (find_allocation_range(srcDevice, NULL, NULL)) {
+        (void)dstHost;
+        (void)ByteCount;
+        (void)stream;
+        (void)is_async;
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
-                "(dst=%p src=0x%" PRIx64 " bytes=%zu)\n",
+                "(src=0x%" PRIx64 " bytes=%zu)\n",
                 real_name,
-                dstHost,
                 (uint64_t)srcDevice,
                 ByteCount);
         return CUDA_ERROR_NOT_SUPPORTED;
@@ -2046,11 +2052,17 @@ static CUresult cu_memcpy_impl(const char *real_name,
                                cudaStream_t stream,
                                int is_async)
 {
+    int dst_is_polaris;
+    int src_is_polaris;
+
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
-    if (find_allocation_range(dst, NULL, NULL) ||
-        find_allocation_range(src, NULL, NULL)) {
+    dst_is_polaris = find_allocation_range(dst, NULL, NULL);
+    src_is_polaris = find_allocation_range(src, NULL, NULL);
+    if (dst_is_polaris || src_is_polaris) {
+        (void)stream;
+        (void)is_async;
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
                 "(dst=0x%" PRIx64 " src=0x%" PRIx64 " bytes=%zu)\n",
@@ -2183,26 +2195,27 @@ static CUresult cu_memset_guard(const char *real_name,
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
-    if (find_allocation_range(dstDevice, &base, &length)) {
-        if (g_allow_zero_memset && value == 0 && dstDevice == base && N <= length) {
-            fprintf(stderr,
-                    "[polaris-shim] %s zero-fill accepted for Polaris pointer "
-                    "0x%" PRIx64 " bytes=%zu\n",
-                    real_name,
-                    (uint64_t)dstDevice,
-                    N);
-            return CUDA_SUCCESS;
-        }
+    if (!find_allocation_range(dstDevice, &base, &length))
+        return CUDA_SUCCESS;
+
+    if (g_allow_zero_memset && value == 0 && dstDevice == base && N <= length) {
         fprintf(stderr,
-                "[polaris-shim] %s involving Polaris pointer is not wired yet "
-                "(dst=0x%" PRIx64 " value=%u bytes=%zu)\n",
+                "[polaris-shim] %s zero-fill accepted for Polaris pointer "
+                "0x%" PRIx64 " bytes=%zu\n",
                 real_name,
                 (uint64_t)dstDevice,
-                value,
                 N);
-        return CUDA_ERROR_NOT_SUPPORTED;
+        return CUDA_SUCCESS;
     }
-    return CUDA_SUCCESS;
+
+    fprintf(stderr,
+            "[polaris-shim] %s involving Polaris pointer is not wired yet "
+            "(dst=0x%" PRIx64 " value=%u bytes=%zu)\n",
+            real_name,
+            (uint64_t)dstDevice,
+            value,
+            N);
+    return CUDA_ERROR_NOT_SUPPORTED;
 }
 
 static CUresult cu_memset_d8_impl(const char *real_name,
@@ -2216,6 +2229,8 @@ static CUresult cu_memset_d8_impl(const char *real_name,
 
     if (guard != CUDA_SUCCESS)
         return guard;
+    if (find_allocation_range(dstDevice, NULL, NULL))
+        return CUDA_SUCCESS;
 
     if (is_async) {
         cuMemsetD8Async_fn real_async;
@@ -2245,10 +2260,12 @@ static CUresult cu_memset_d16_impl(const char *real_name,
                                    cudaStream_t stream,
                                    int is_async)
 {
-    CUresult guard = cu_memset_guard(real_name, dstDevice, (uint32_t)us, N);
+    CUresult guard = cu_memset_guard(real_name, dstDevice, (uint32_t)us, N * sizeof(us));
 
     if (guard != CUDA_SUCCESS)
         return guard;
+    if (find_allocation_range(dstDevice, NULL, NULL))
+        return CUDA_SUCCESS;
 
     if (is_async) {
         cuMemsetD16Async_fn real_async;
@@ -2278,10 +2295,12 @@ static CUresult cu_memset_d32_impl(const char *real_name,
                                    cudaStream_t stream,
                                    int is_async)
 {
-    CUresult guard = cu_memset_guard(real_name, dstDevice, ui, N);
+    CUresult guard = cu_memset_guard(real_name, dstDevice, ui, N * sizeof(ui));
 
     if (guard != CUDA_SUCCESS)
         return guard;
+    if (find_allocation_range(dstDevice, NULL, NULL))
+        return CUDA_SUCCESS;
 
     if (is_async) {
         cuMemsetD32Async_fn real_async;
@@ -3669,23 +3688,25 @@ static cudaError_t cuda_memcpy_impl(const char *real_name,
                                     cudaStream_t stream,
                                     int is_async)
 {
-    int dst_managed;
-    int src_managed;
+    int dst_is_polaris;
+    int src_is_polaris;
 
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
-    dst_managed = is_managed_pointer_value(dst);
-    src_managed = is_managed_pointer_value(src);
-    if (dst_managed || src_managed) {
+    dst_is_polaris = is_managed_pointer_value(dst);
+    src_is_polaris = is_managed_pointer_value(src);
+    if (dst_is_polaris || src_is_polaris) {
+        (void)kind;
+        (void)stream;
+        (void)is_async;
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
-                "(dst=%p src=%p bytes=%zu kind=%d)\n",
+                "(dst=%p src=%p bytes=%zu)\n",
                 real_name,
                 dst,
                 src,
-                count,
-                kind);
+                count);
         return CUDA_ERROR_NOT_SUPPORTED;
     }
 
@@ -3742,17 +3763,17 @@ cudaError_t cudaMemcpy2DAsync(void *dst,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (is_managed_pointer_value(dst) || is_managed_pointer_value(src)) {
+        (void)dpitch;
+        (void)spitch;
+        (void)kind;
+        (void)stream;
         fprintf(stderr,
-                "[polaris-shim] cudaMemcpy2DAsync involving Polaris pointer is "
-                "not wired yet (dst=%p src=%p width=%zu height=%zu kind=%d)\n",
+                "[polaris-shim] cudaMemcpy2DAsync involving Polaris pointer is not wired yet "
+                "(dst=%p src=%p width=%zu height=%zu)\n",
                 dst,
                 src,
                 width,
-                height,
-                kind);
-        (void)dpitch;
-        (void)spitch;
-        (void)stream;
+                height);
         return CUDA_ERROR_NOT_SUPPORTED;
     }
 
@@ -3778,15 +3799,15 @@ cudaError_t cudaMemcpyPeerAsync(void *dst,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (is_managed_pointer_value(dst) || is_managed_pointer_value(src)) {
-        fprintf(stderr,
-                "[polaris-shim] cudaMemcpyPeerAsync involving Polaris pointer is "
-                "not wired yet (dst=%p dstDevice=%d src=%p srcDevice=%d bytes=%zu)\n",
-                dst,
-                dstDevice,
-                src,
-                srcDevice,
-                count);
+        (void)dstDevice;
+        (void)srcDevice;
         (void)stream;
+        fprintf(stderr,
+                "[polaris-shim] cudaMemcpyPeerAsync involving Polaris pointer is not wired yet "
+                "(dst=%p src=%p bytes=%zu)\n",
+                dst,
+                src,
+                count);
         return CUDA_ERROR_NOT_SUPPORTED;
     }
 
@@ -3808,14 +3829,12 @@ cudaError_t cudaMemcpy3DPeerAsync(const struct cudaMemcpy3DPeerParms *p, cudaStr
 
     if (p && (is_managed_pointer_value(p->dstPtr.ptr) ||
               is_managed_pointer_value(p->srcPtr.ptr))) {
-        fprintf(stderr,
-                "[polaris-shim] cudaMemcpy3DPeerAsync involving Polaris pointer is "
-                "not wired yet (dst=%p dstDevice=%d src=%p srcDevice=%d)\n",
-                p->dstPtr.ptr,
-                p->dstDevice,
-                p->srcPtr.ptr,
-                p->srcDevice);
         (void)stream;
+        fprintf(stderr,
+                "[polaris-shim] cudaMemcpy3DPeerAsync involving Polaris pointer is not wired yet "
+                "(dst=%p src=%p)\n",
+                p->dstPtr.ptr,
+                p->srcPtr.ptr);
         return CUDA_ERROR_NOT_SUPPORTED;
     }
 
@@ -3834,15 +3853,14 @@ static cudaError_t cuda_memset_impl(const char *real_name,
                                     cudaStream_t stream,
                                     int is_async)
 {
+    CUdeviceptr base = 0;
+    uint64_t length = 0;
+
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
-    if (is_managed_pointer_value(devPtr)) {
-        CUdeviceptr base = 0;
-        uint64_t length = 0;
-
-        if (find_allocation_range((CUdeviceptr)(uintptr_t)devPtr, &base, &length) &&
-            g_allow_zero_memset &&
+    if (find_allocation_range((CUdeviceptr)(uintptr_t)devPtr, &base, &length)) {
+        if (g_allow_zero_memset &&
             value == 0 &&
             (CUdeviceptr)(uintptr_t)devPtr == base &&
             count <= length) {
@@ -3854,6 +3872,8 @@ static cudaError_t cuda_memset_impl(const char *real_name,
                     count);
             return CUDA_SUCCESS;
         }
+        (void)stream;
+        (void)is_async;
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
                 "(ptr=%p value=%d bytes=%zu)\n",

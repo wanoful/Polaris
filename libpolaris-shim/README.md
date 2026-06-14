@@ -182,13 +182,16 @@ The shim also interposes common runtime and driver memory operations
 (`cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemset`, `cudaMemsetAsync`,
 `cudaMemcpy2DAsync`, `cudaMemcpyPeerAsync`, `cudaMemcpy3DPeerAsync`,
 `cuMemcpyHtoD_v2`, `cuMemcpyDtoH_v2`, generic `cuMemcpy_v2`, their async
-variants, and `cuMemsetD8` / `cuMemsetD16` / `cuMemsetD32` variants) enough
-to classify Polaris pointers.
+variants, and `cuMemsetD8` / `cuMemsetD16` / `cuMemsetD32` variants).
 Operations that do not involve Polaris memory fall through to the real CUDA
-library. Operations involving a Polaris pointer currently return
-`cudaErrorNotSupported` instead of passing unmapped Polaris VA to CUDA; the
-real host/device data path still needs the reload/copy/fill machinery
-described in the roadmap.
+library. Operations involving a Polaris pointer return
+`cudaErrorNotSupported` instead of passing external VA to CUDA copy paths; local
+hardware testing showed that a temporarily UVM-mapped static RM allocation is
+still not safe to hand to ordinary CUDA copy APIs. For KV-only experiments,
+`POLARIS_SHIM_ALLOW_ZERO_MEMSET=1` accepts base-address zero-fill requests
+within a selected allocation as a no-op initialization declaration so the later
+kernel dereference can still reach the replayable-fault path. Nonzero copy/fill
+and daemon-backed production reload/copy/fill remain pending.
 CUDA IPC export is explicitly guarded as unsupported for Polaris pointers:
 `cuIpcGetMemHandle` and `cudaIpcGetMemHandle` return
 `cudaErrorNotSupported` / the matching driver error for shim-managed

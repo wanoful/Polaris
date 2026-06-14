@@ -512,6 +512,32 @@ static int free_test_pointer(int use_runtime,
     return 0;
 }
 
+static int check_cu_result(const char *label, CUresult got, CUresult expected)
+{
+    if (got != expected) {
+        fprintf(stderr,
+                "managed_alloc: %s returned %d, expected %d\n",
+                label,
+                got,
+                expected);
+        return 1;
+    }
+    return 0;
+}
+
+static int check_cuda_result(const char *label, cudaError_t got, cudaError_t expected)
+{
+    if (got != expected) {
+        fprintf(stderr,
+                "managed_alloc: %s returned %d, expected %d\n",
+                label,
+                got,
+                expected);
+        return 1;
+    }
+    return 0;
+}
+
 int main(void)
 {
     cuDeviceGet_fn driver_device_get_fn;
@@ -631,6 +657,7 @@ int main(void)
     int test_large_window = env_enabled("POLARIS_SHIM_TEST_LARGE_WINDOW");
     int test_runtime_setup = env_enabled("POLARIS_SHIM_TEST_RUNTIME_SETUP");
     int test_host_apis = env_enabled("POLARIS_SHIM_TEST_HOST_APIS");
+    int allow_zero_memset = env_enabled("POLARIS_SHIM_ALLOW_ZERO_MEMSET");
     uint64_t block_size = 2ULL * 1024ULL * 1024ULL;
     size_t primary_alloc_size = 1024 * 1024;
     size_t expected_range_size = 0;
@@ -1430,8 +1457,9 @@ int main(void)
     }
 
     if (env_enabled("POLARIS_SHIM_TEST_MEMCPY")) {
-        char host_buf[16] = {0};
+        char host_buf[128];
         cudaError_t cr;
+        size_t i;
 
         if (!driver_memcpy_htod_fn ||
             !driver_memcpy_dtoh_fn ||
@@ -1446,108 +1474,67 @@ int main(void)
             !memcpy_3d_peer_async_fn)
             return 1;
 
+        for (i = 0; i < sizeof(host_buf); i++)
+            host_buf[i] = (char)(0x30 + (i % 67));
+
         r = driver_memcpy_htod_fn(ptr, host_buf, sizeof(host_buf));
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpyHtoD_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpyHtoD_v2", r, cudaErrorNotSupported))
             return 1;
-        }
 
         r = driver_memcpy_dtoh_fn(host_buf, ptr, sizeof(host_buf));
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpyDtoH_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpyDtoH_v2", r, cudaErrorNotSupported))
             return 1;
-        }
 
+        for (i = 0; i < sizeof(host_buf); i++)
+            host_buf[i] = (char)(0x51 + (i % 41));
         r = driver_memcpy_htod_async_fn(ptr, host_buf, sizeof(host_buf), NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpyHtoDAsync_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpyHtoDAsync_v2", r, cudaErrorNotSupported))
             return 1;
-        }
 
         r = driver_memcpy_dtoh_async_fn(host_buf, ptr, sizeof(host_buf), NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpyDtoHAsync_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpyDtoHAsync_v2", r, cudaErrorNotSupported))
             return 1;
-        }
 
         r = driver_memcpy_fn(ptr, (CUdeviceptr)(uintptr_t)host_buf, sizeof(host_buf));
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpy_v2 dst returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpy_v2 dst", r, cudaErrorNotSupported))
             return 1;
-        }
 
         r = driver_memcpy_fn((CUdeviceptr)(uintptr_t)host_buf, ptr, sizeof(host_buf));
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpy_v2 src returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpy_v2 src", r, cudaErrorNotSupported))
             return 1;
-        }
 
         r = driver_memcpy_async_fn(ptr,
                                    (CUdeviceptr)(uintptr_t)host_buf,
                                    sizeof(host_buf),
                                    NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemcpyAsync_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemcpyAsync_v2", r, cudaErrorNotSupported))
             return 1;
-        }
 
+        for (i = 0; i < sizeof(host_buf); i++)
+            host_buf[i] = (char)(0x12 + (i % 101));
         cr = memcpy_fn((void *)(uintptr_t)ptr,
                        host_buf,
                        sizeof(host_buf),
                        cudaMemcpyHostToDevice);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpy H2D returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpy H2D", cr, cudaErrorNotSupported))
             return 1;
-        }
 
         cr = memcpy_fn(host_buf,
                        (const void *)(uintptr_t)ptr,
                        sizeof(host_buf),
                        cudaMemcpyDeviceToHost);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpy D2H returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpy D2H", cr, cudaErrorNotSupported))
             return 1;
-        }
 
+        for (i = 0; i < sizeof(host_buf); i++)
+            host_buf[i] = (char)(0x22 + (i % 53));
         cr = memcpy_async_fn((void *)(uintptr_t)ptr,
                              host_buf,
                              sizeof(host_buf),
                              cudaMemcpyHostToDevice,
                              NULL);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpyAsync H2D returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpyAsync H2D", cr, cudaErrorNotSupported))
             return 1;
-        }
 
         cr = memcpy_2d_async_fn((void *)(uintptr_t)ptr,
                                 8,
@@ -1557,13 +1544,8 @@ int main(void)
                                 2,
                                 cudaMemcpyHostToDevice,
                                 NULL);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpy2DAsync returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpy2DAsync", cr, cudaErrorNotSupported))
             return 1;
-        }
 
         cr = memcpy_peer_async_fn((void *)(uintptr_t)ptr,
                                   0,
@@ -1571,13 +1553,8 @@ int main(void)
                                   0,
                                   sizeof(host_buf),
                                   NULL);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpyPeerAsync returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpyPeerAsync", cr, cudaErrorNotSupported))
             return 1;
-        }
 
         struct cudaMemcpy3DPeerParms peer_params;
         memset(&peer_params, 0, sizeof(peer_params));
@@ -1587,17 +1564,14 @@ int main(void)
         peer_params.srcPtr = make_test_pitched_ptr(host_buf, 8, 8, 2);
         peer_params.extent = make_test_extent(8, 2, 1);
         cr = memcpy_3d_peer_async_fn(&peer_params, NULL);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemcpy3DPeerAsync returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemcpy3DPeerAsync", cr, cudaErrorNotSupported))
             return 1;
-        }
     }
 
     if (env_enabled("POLARIS_SHIM_TEST_MEMSET")) {
         cudaError_t cr;
+        CUresult zero_expected = allow_zero_memset ? 0 : cudaErrorNotSupported;
+        cudaError_t runtime_zero_expected = allow_zero_memset ? 0 : cudaErrorNotSupported;
 
         if (!driver_memset_d8_fn ||
             !driver_memset_d8_async_fn ||
@@ -1609,77 +1583,53 @@ int main(void)
             !memset_async_fn)
             return 1;
 
-        r = driver_memset_d8_fn(ptr, 0, 16);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD8_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        r = driver_memset_d8_fn(ptr, 0x5a, 16);
+        if (check_cu_result("cuMemsetD8_v2", r, cudaErrorNotSupported))
             return 1;
-        }
+
+        r = driver_memset_d8_async_fn(ptr, 0x6b, 16, NULL);
+        if (check_cu_result("cuMemsetD8Async_v2", r, cudaErrorNotSupported))
+            return 1;
+
+        r = driver_memset_d8_fn(ptr, 0, 16);
+        if (check_cu_result("cuMemsetD8_v2 zero", r, zero_expected))
+            return 1;
 
         r = driver_memset_d8_async_fn(ptr, 0, 16, NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD8Async_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemsetD8Async_v2 zero", r, zero_expected))
             return 1;
-        }
 
         r = driver_memset_d16_fn(ptr, 0, 8);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD16_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemsetD16_v2", r, zero_expected))
             return 1;
-        }
 
         r = driver_memset_d16_async_fn(ptr, 0, 8, NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD16Async_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemsetD16Async_v2", r, zero_expected))
             return 1;
-        }
 
         r = driver_memset_d32_fn(ptr, 0, 4);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD32_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemsetD32_v2", r, zero_expected))
             return 1;
-        }
 
         r = driver_memset_d32_async_fn(ptr, 0, 4, NULL);
-        if (r != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cuMemsetD32Async_v2 returned %d, expected %d\n",
-                    r,
-                    cudaErrorNotSupported);
+        if (check_cu_result("cuMemsetD32Async_v2", r, zero_expected))
             return 1;
-        }
+
+        cr = memset_fn((void *)(uintptr_t)ptr, 0x7c, 16);
+        if (check_cuda_result("cudaMemset", cr, cudaErrorNotSupported))
+            return 1;
+
+        cr = memset_async_fn((void *)(uintptr_t)ptr, 0x2d, 16, NULL);
+        if (check_cuda_result("cudaMemsetAsync", cr, cudaErrorNotSupported))
+            return 1;
 
         cr = memset_fn((void *)(uintptr_t)ptr, 0, 16);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemset returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemset zero", cr, runtime_zero_expected))
             return 1;
-        }
 
         cr = memset_async_fn((void *)(uintptr_t)ptr, 0, 16, NULL);
-        if (cr != cudaErrorNotSupported) {
-            fprintf(stderr,
-                    "managed_alloc: cudaMemsetAsync returned %d, expected %d\n",
-                    cr,
-                    cudaErrorNotSupported);
+        if (check_cuda_result("cudaMemsetAsync zero", cr, runtime_zero_expected))
             return 1;
-        }
     }
 
     if (env_enabled("POLARIS_SHIM_TEST_IPC")) {
