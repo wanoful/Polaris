@@ -921,6 +921,34 @@ static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_i
     return 0;
 }
 
+static int expect_rm_backed_spill_unsupported(struct m2_state *s, uint64_t block_id)
+{
+    struct polaris_spill_block_arg spill = {
+        .block_id = block_id,
+    };
+
+    if (ioctl(s->polaris_fd, POLARIS_SPILL_BLOCK, &spill) == 0) {
+        fprintf(stderr,
+                "POLARIS_SPILL_BLOCK unexpectedly succeeded for RM-backed block=%llu decision=%llu unmapped=%u\n",
+                (unsigned long long)block_id,
+                (unsigned long long)spill.decision_id,
+                spill.unmapped_count);
+        return -1;
+    }
+    if (errno != EOPNOTSUPP) {
+        fprintf(stderr,
+                "POLARIS_SPILL_BLOCK errno=%d (%s), expected EOPNOTSUPP for RM-backed block=%llu\n",
+                errno,
+                strerror(errno),
+                (unsigned long long)block_id);
+        return -1;
+    }
+
+    printf("POLARIS spill validation rejected RM-backed block=%llu with EOPNOTSUPP\n",
+           (unsigned long long)block_id);
+    return 0;
+}
+
 static int setup_polaris(struct m2_state *s,
                          uint32_t gpu_id,
                          uint64_t rm_client_token,
@@ -1222,6 +1250,12 @@ int main(int argc, char **argv)
     if (dispatch_fault) {
         if (dispatch_test_fault(&s, base) != 0)
             goto out;
+        if (complete_backed_refault) {
+            if (expect_rm_backed_spill_unsupported(&s, block_id) != 0)
+                goto out;
+            if (dispatch_test_fault(&s, base) != 0)
+                goto out;
+        }
         if (block_unmap_refault) {
             uint32_t unmapped_count = 0;
             if (unmap_block_mappings(&s, block_id, &unmapped_count) != 0)

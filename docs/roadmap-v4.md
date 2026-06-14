@@ -551,6 +551,12 @@ Still to do on the Polaris side for M1/M2:
   refaults successfully. This closes the kernel ABI gap for daemon/runtime
   executors to publish UVM-bridge-mapable residency, but the executor still
   needs real daemon-owned RM allocation and host/device copy wiring.
+- RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
+  block before tearing down observed UVM mappings, and rejects RM-backed
+  bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real
+  RM-backed device→host copy and RM release path. The completion-backed M2
+  diagnostic verifies this rejection leaves the observed mapping intact before
+  the explicit block-unmap/refault step.
 - Real CUDA-kernel compatibility slice wired: exact UVM hook lookup remains
   keyed by `(gpu_id, rm_client_token, va_space_token)`, but when a real
   runtime CUDA kernel faults on a Polaris VA from CUDA's own registered

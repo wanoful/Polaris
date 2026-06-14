@@ -741,6 +741,14 @@ fn polaris_clear_block_rm_backing(block: &mut PolarisBlock) {
     block.rm_backing_offset = 0;
 }
 
+fn polaris_block_has_rm_backing(block: &PolarisBlock) -> bool {
+    block.rm_h_client != 0 && block.rm_h_memory != 0 && block.rm_backing_length >= block.size_bytes
+}
+
+fn polaris_unsupported() -> Error {
+    Error::from_errno(-(bindings::EOPNOTSUPP as i32))
+}
+
 fn polaris_complete_rm_backing(
     arg: &PolarisCompleteOperationArg,
 ) -> Result<Option<PolarisCompletedRmBacking>> {
@@ -861,7 +869,13 @@ fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) ->
     inner.next_decision_id += 1;
 
     let block = &inner.blocks[block_idx];
-    if block.state != PolarisBlockState::Resident || block.gpu_phys_handle == 0 {
+    if block.state != PolarisBlockState::Resident {
+        return Err(ENOENT);
+    }
+    if polaris_block_has_rm_backing(block) && block.gpu_phys_handle == 0 {
+        return Err(polaris_unsupported());
+    }
+    if block.gpu_phys_handle == 0 {
         return Err(ENOENT);
     }
 
@@ -3738,8 +3752,6 @@ impl PolarisDevice {
             return Err(EINVAL);
         }
 
-        let unmapped_count = polaris_unmap_observed_block_mappings(arg.block_id)?;
-
         let decision_id = {
             let mut guard = POLARIS_STATE.lock();
             let inner = guard.as_mut().ok_or(ENODEV)?;
@@ -3769,6 +3781,8 @@ impl PolarisDevice {
                 }
             }
         };
+
+        let unmapped_count = polaris_unmap_observed_block_mappings(arg.block_id)?;
 
         arg.unmapped_count = unmapped_count;
         arg.decision_id = decision_id;

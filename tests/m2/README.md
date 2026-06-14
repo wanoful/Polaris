@@ -48,6 +48,7 @@ POLARIS_BLOCK_RESERVE(block_id) without DEFER_FAULT
   -> POLARIS_COMPLETE_OPERATION carries RM hClient/hMemory/length metadata
   -> POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
   -> synthetic fault maps the completed logical block through the UVM bridge
+  -> POLARIS_SPILL_BLOCK rejects the RM-backed block with EOPNOTSUPP
   -> POLARIS_UNMAP_BLOCK_MAPPINGS(block_id)
   -> second synthetic fault remaps through the completed logical backing
 ```
@@ -190,8 +191,9 @@ blocks. Unlike `--logical-backed-refault`, it does not call
 without `POLARIS_RESERVE_FLAG_DEFER_FAULT`, runs a small executor thread that
 polls `POLARIS_GET_DECISION`, completes the queued `ALLOC` decision with the
 diagnostic RM backing metadata in `POLARIS_COMPLETE_OPERATION`, registers the
-worker mapping, fault-maps through the completed logical backing, unmaps by
-`block_id`, then refaults:
+worker mapping, fault-maps through the completed logical backing, verifies that
+`POLARIS_SPILL_BLOCK` rejects this RM-backed resident block with `EOPNOTSUPP`
+without tearing down the observed mapping, unmaps by `block_id`, then refaults:
 
 ```sh
 sudo tests/m2/m2_static_block_setup --complete-backed-refault
@@ -206,7 +208,10 @@ M3 Polaris completion-backed block refault test passed.
 This closes the kernel ABI gap for daemon/runtime executors to publish
 UVM-bridge-mapable RM backing as part of normal decision completion. It still
 uses a harness-created RM object and does not yet implement daemon-owned RM
-allocation or host/device copy for production spill/reload.
+allocation or host/device copy for production spill/reload. Until that copy
+path is implemented, `POLARIS_SPILL_BLOCK` intentionally supports only legacy
+CUDA VMM resident blocks with `gpu_phys_handle`; RM-backed bridge-resident
+blocks are rejected before any PTE teardown.
 
 ## Spill Ioctl Validation
 
