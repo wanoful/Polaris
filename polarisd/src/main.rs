@@ -74,12 +74,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-allocate CPU pinned memory pool for block offloads.
     let (cpu_pool_bytes, cpu_pool_base) = match cuda_vmm::allocate_host(cpu_pool_bytes) {
         Ok(ptr) => {
-            let cpb = info.total_memory * 2;
             eprintln!(
                 "polarisd: allocated CPU pinned memory pool: {} MiB at {ptr:#x}",
-                cpb / (1024 * 1024)
+                cpu_pool_bytes / (1024 * 1024)
             );
-            (cpb, ptr)
+            (cpu_pool_bytes, ptr)
         }
         Err(e) => {
             eprintln!(

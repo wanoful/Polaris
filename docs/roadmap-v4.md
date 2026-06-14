@@ -533,10 +533,14 @@ Still to do on the Polaris side for M1/M2:
   block rejection (`--spill-validation`), but the static RM harness cannot
   positively execute copy/release because it does not create a daemon-owned
   CUDA VMM resident block.
-- Remaining production spill test: create a resident logical block through
-  the daemon/runtime path, call `POLARIS_SPILL_BLOCK`, verify polarisd copies
-  device → host, releases the physical handle, completes the decision, and
-  updates kernel residency state to `CpuOffloaded`.
+- Positive daemon/runtime spill test wired: the ignored root/GPU
+  `polaris-runtime` fault-smoke creates a resident logical block through the
+  runtime decision worker, writes a CUDA-visible pattern, calls
+  `POLARIS_SPILL_BLOCK`, verifies the OFFLOAD completion moves the block to
+  `CpuOffloaded`, reloads the same VA through overwrite reserve, and checks
+  the bytes survive the device → host → device cycle. A separate long-running
+  `polarisd` process soak remains useful, but the production decision path is
+  no longer covered only by fake executor state-machine tests.
 - Kernel state-machine coverage added: `libpolaris` has an ignored
   root-only `kernel_spill_state` test that drives
   `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through

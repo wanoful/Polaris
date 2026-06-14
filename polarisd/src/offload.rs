@@ -323,3 +323,26 @@ fn snap_up(val: u64, align: u64) -> u64 {
     }
     (val + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CpuPool;
+
+    #[test]
+    fn cpu_pool_reports_and_enforces_actual_allocated_size() {
+        let mut pool = CpuPool::new(0x1000_0000, 8192);
+
+        let first = pool.allocate(4096).expect("first page");
+        let second = pool.allocate(4096).expect("second page");
+        assert_eq!(first, 0x1000_0000);
+        assert_eq!(second, 0x1000_1000);
+        assert_eq!(pool.used_bytes(), 8192);
+        assert_eq!(pool.free_bytes(), 0);
+        assert_eq!(pool.allocate(4096), None);
+
+        pool.free(first, 4096);
+        assert_eq!(pool.used_bytes(), 4096);
+        assert_eq!(pool.free_bytes(), 4096);
+        assert_eq!(pool.allocate(4096), Some(first));
+    }
+}

@@ -4,7 +4,9 @@ use std::os::fd::AsRawFd;
 use cudarc::driver::sys::{self, CUresult};
 use libpolaris::ioctl;
 use libpolaris::types::{
-    PolarisBlockReserveArg, PolarisPhase, PolarisSessionCreateArg, PolarisSessionDestroyArg,
+    PolarisBlockGetStateArg, PolarisBlockReserveArg, PolarisBlockState, PolarisPhase,
+    PolarisSessionCreateArg, PolarisSessionDestroyArg, PolarisSpillBlockArg,
+    POLARIS_RESERVE_FLAG_OVERWRITE,
 };
 use polaris_runtime::{Runtime, RuntimeConfig};
 
@@ -52,9 +54,74 @@ fn fill_pattern(buf: &mut [u8], seed: u8) {
     }
 }
 
+fn kernel_stat(name: &str) -> u64 {
+    let stats = std::fs::read_to_string("/sys/kernel/polaris/stats")
+        .expect("read /sys/kernel/polaris/stats");
+    stats
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if key.trim() != name {
+                return None;
+            }
+            value.split_whitespace().next()?.parse::<u64>().ok()
+        })
+        .unwrap_or_else(|| panic!("stat {name} not present in /sys/kernel/polaris/stats"))
+}
+
+fn block_state(fd: i32, session_id: u64, block_id: u64) -> PolarisBlockGetStateArg {
+    let mut state = PolarisBlockGetStateArg {
+        session_id,
+        block_id,
+        ..Default::default()
+    };
+    ioctl::block_get_state(fd, &mut state).expect("POLARIS_BLOCK_GET_STATE");
+    state
+}
+
+fn wait_for_block_state(
+    fd: i32,
+    session_id: u64,
+    block_id: u64,
+    expected: PolarisBlockState,
+) -> PolarisBlockGetStateArg {
+    let started = std::time::Instant::now();
+    loop {
+        let state = block_state(fd, session_id, block_id);
+        if state.state == expected as u32 {
+            return state;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "block {block_id} state={} did not become {:?}",
+            state.state,
+            expected
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn copy_to_device(va: u64, src: &[u8]) {
+    unsafe {
+        cuda_check(
+            sys::cuMemcpyHtoD_v2(va, src.as_ptr() as *const std::ffi::c_void, src.len()),
+            "cuMemcpyHtoD",
+        );
+    }
+}
+
+fn copy_from_device(va: u64, dst: &mut [u8]) {
+    unsafe {
+        cuda_check(
+            sys::cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut std::ffi::c_void, va, dst.len()),
+            "cuMemcpyDtoH",
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires loaded polaris.ko, patched nvidia-uvm.ko, and an NVIDIA GPU"]
-fn block_reserve_maps_fault_decision_via_runtime_worker() {
+fn block_reserve_spill_and_reload_via_runtime_worker() {
     let device_ordinal = 0;
     let mut runtime = Runtime::create(RuntimeConfig {
         gpu_id: 0,
@@ -104,24 +171,53 @@ fn block_reserve_maps_fault_decision_via_runtime_worker() {
     let mut dst = vec![0u8; BLOCK_SIZE as usize];
     fill_pattern(&mut src, 0x41);
 
-    unsafe {
-        cuda_check(
-            sys::cuMemcpyHtoD_v2(
-                reserve.gpu_vaddr,
-                src.as_ptr() as *const std::ffi::c_void,
-                src.len(),
-            ),
-            "cuMemcpyHtoD",
-        );
-        cuda_check(
-            sys::cuMemcpyDtoH_v2(
-                dst.as_mut_ptr() as *mut std::ffi::c_void,
-                reserve.gpu_vaddr,
-                dst.len(),
-            ),
-            "cuMemcpyDtoH",
-        );
-    }
+    copy_to_device(reserve.gpu_vaddr, &src);
+    copy_from_device(reserve.gpu_vaddr, &mut dst);
+    assert_eq!(src, dst);
+
+    let offloads_before = kernel_stat("offloads");
+    let reloads_before = kernel_stat("reloads");
+    let cpu_used_before = kernel_stat("cpu_used_mib");
+
+    let mut spill = PolarisSpillBlockArg {
+        block_id: reserve.block_id,
+        ..Default::default()
+    };
+    ioctl::spill_block(fd, &mut spill).expect("POLARIS_SPILL_BLOCK");
+    assert_ne!(spill.decision_id, 0);
+    assert_eq!(spill.unmapped_count, 0);
+    wait_for_block_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::CpuOffloaded,
+    );
+    assert_eq!(kernel_stat("offloads"), offloads_before + 1);
+    assert!(kernel_stat("cpu_used_mib") >= cpu_used_before + 1);
+
+    let mut reload = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        flags: POLARIS_RESERVE_FLAG_OVERWRITE,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut reload)
+        .expect("POLARIS_BLOCK_RESERVE reload");
+    assert_eq!(reload.block_id, reserve.block_id);
+    assert_eq!(reload.gpu_vaddr, reserve.gpu_vaddr);
+    wait_for_block_state(
+        fd,
+        session.session_id,
+        reserve.block_id,
+        PolarisBlockState::Resident,
+    );
+    assert_eq!(kernel_stat("reloads"), reloads_before + 1);
+    assert_eq!(kernel_stat("cpu_used_mib"), cpu_used_before);
+
+    dst.fill(0);
+    copy_from_device(reload.gpu_vaddr, &mut dst);
     assert_eq!(src, dst);
     pop_primary_context(device_ordinal);
 
