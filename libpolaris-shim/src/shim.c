@@ -46,6 +46,21 @@
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE 12
 #define CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE 17
 
+struct ggml_context;
+struct ggml_tensor;
+struct ggml_backend_buffer;
+struct ggml_backend_buffer_type;
+
+typedef struct ggml_backend_buffer *ggml_backend_buffer_t;
+typedef struct ggml_backend_buffer_type *ggml_backend_buffer_type_t;
+typedef struct ggml_tensor *(*ggml_get_first_tensor_fn)(const struct ggml_context *ctx);
+typedef struct ggml_tensor *(*ggml_get_next_tensor_fn)(const struct ggml_context *ctx,
+                                                       struct ggml_tensor *tensor);
+typedef const char *(*ggml_get_name_fn)(const struct ggml_tensor *tensor);
+typedef ggml_backend_buffer_t (*ggml_backend_alloc_ctx_tensors_from_buft_fn)(
+    struct ggml_context *ctx,
+    ggml_backend_buffer_type_t buft);
+
 static pthread_once_t g_announce_once = PTHREAD_ONCE_INIT;
 static pthread_once_t g_bootstrap_once = PTHREAD_ONCE_INIT;
 static uint32_t g_registered_gpu_id;
@@ -269,6 +284,67 @@ static int should_manage_allocation(size_t size)
     }
 
     return selected;
+}
+
+static void *resolve_next_or_default_symbol(const char *name)
+{
+    void *symbol = dlsym(RTLD_NEXT, name);
+
+    if (!symbol)
+        symbol = dlsym(RTLD_DEFAULT, name);
+    return symbol;
+}
+
+static int string_starts_with(const char *value, const char *prefix)
+{
+    size_t prefix_len;
+
+    if (!value || !prefix)
+        return 0;
+
+    prefix_len = strlen(prefix);
+    return strncmp(value, prefix, prefix_len) == 0;
+}
+
+static int ggml_context_has_kv_cache_tensors(const struct ggml_context *ctx)
+{
+    ggml_get_first_tensor_fn get_first;
+    ggml_get_next_tensor_fn get_next;
+    ggml_get_name_fn get_name;
+    struct ggml_tensor *tensor;
+
+    if (!ctx)
+        return 0;
+
+    *(void **)(&get_first) = resolve_next_or_default_symbol("ggml_get_first_tensor");
+    *(void **)(&get_next) = resolve_next_or_default_symbol("ggml_get_next_tensor");
+    *(void **)(&get_name) = resolve_next_or_default_symbol("ggml_get_name");
+    if (!get_first || !get_next || !get_name) {
+        if (g_trace_scope) {
+            fprintf(stderr,
+                    "[polaris-shim] ggml KV scope detection unavailable "
+                    "first=%d next=%d name=%d\n",
+                    get_first != NULL,
+                    get_next != NULL,
+                    get_name != NULL);
+        }
+        return 0;
+    }
+
+    for (tensor = get_first(ctx); tensor; tensor = get_next(ctx, tensor)) {
+        const char *name = get_name(tensor);
+        if (string_starts_with(name, "cache_k_l") ||
+            string_starts_with(name, "cache_v_l")) {
+            if (g_trace_scope) {
+                fprintf(stderr,
+                        "[polaris-shim] ggml KV scope detected tensor=%s\n",
+                        name);
+            }
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static uint64_t default_bootstrap_window_cap(void)
@@ -1808,6 +1884,35 @@ void polaris_shim_set_allocation_scope(const char *scope)
                 scope ? scope : "none",
                 g_allocation_scope_is_kv);
     }
+}
+
+POLARIS_SHIM_INTERPOSER
+ggml_backend_buffer_t
+ggml_backend_alloc_ctx_tensors_from_buft(struct ggml_context *ctx,
+                                         ggml_backend_buffer_type_t buft)
+{
+    ggml_backend_alloc_ctx_tensors_from_buft_fn real;
+    int previous_scope;
+    int kv_scope;
+    ggml_backend_buffer_t result;
+
+    *(void **)(&real) = dlsym(RTLD_NEXT, "ggml_backend_alloc_ctx_tensors_from_buft");
+    if (!real) {
+        fprintf(stderr,
+                "[polaris-shim] ggml_backend_alloc_ctx_tensors_from_buft: "
+                "real symbol unavailable\n");
+        return NULL;
+    }
+
+    previous_scope = g_allocation_scope_is_kv;
+    kv_scope = ggml_context_has_kv_cache_tensors(ctx);
+    if (kv_scope)
+        g_allocation_scope_is_kv = 1;
+
+    result = real(ctx, buft);
+
+    g_allocation_scope_is_kv = previous_scope;
+    return result;
 }
 
 POLARIS_SHIM_INTERPOSER
