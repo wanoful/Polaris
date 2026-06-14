@@ -95,6 +95,9 @@ pub const POLARIS_PROBE_RM_PHYS: u32 =
 pub const POLARIS_PROBE_RM_COPY: u32 =
     kernel::ioctl::_IOWR::<PolarisProbeRmCopyArg>(POLARIS_IOCTL_MAGIC, 0x19);
 
+pub const POLARIS_RM_COPY: u32 =
+    kernel::ioctl::_IOWR::<PolarisRmCopyArg>(POLARIS_IOCTL_MAGIC, 0x1A);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -362,3 +365,6 @@ unsafe impl kernel::transmute::AsBytes for PolarisProbeRmPhysArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisProbeRmCopyArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisProbeRmCopyArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisRmCopyArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRmCopyArg {}

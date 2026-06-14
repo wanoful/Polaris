@@ -218,6 +218,30 @@ validated GPU) can move bytes through UVM's CE copy path. It is still a
 diagnostic: production RM-backed `OFFLOAD`, `RELOAD`, and `COW_BREAK` remain
 guarded until polarisd/runtime spill and reload are wired to this copy path.
 
+## RM User-Buffer Copy Roundtrip
+
+This validates the production-shaped copy ABI that `polarisd` needs for
+RM-backed spill/reload. It follows the same completion-backed resident path as
+the CE probe, then uses `POLARIS_RM_COPY` to copy a deterministic userspace
+buffer into the RM allocation and copy it back into a second userspace buffer:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-copy-roundtrip
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris completion-backed block refault test passed.
+```
+
+The helper still supports only the narrow local shape proven by the probe:
+contiguous vidmem reachable through UVM's CE path. Passing this mode proves the
+kernel/UVM helper can move bytes between an RM-backed block and an ordinary
+userspace CPU pointer, which is the primitive needed by daemon-backed
+`OFFLOAD` and `RELOAD`. `COW_BREAK` remains guarded until an RM-to-RM or
+staged copy path is integrated.
+
 ## Synthetic Fault Dispatch
 
 This leaves the external range unmapped, probes UVM for the exact dispatch key,

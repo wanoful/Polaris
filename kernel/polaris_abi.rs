@@ -74,7 +74,13 @@ pub const POLARIS_RELEASE_FLAG_STREAM_QUIESCED: u32 = 1 << 0;
 pub const POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING: u32 = 1 << 1;
 pub const POLARIS_REGISTER_GPU_FLAG_TRANSIENT: u32 = 1 << 0;
 
+pub const POLARIS_RM_PHYS_FLAG_CONTIGUOUS: u64 = 1 << 0;
+pub const POLARIS_RM_PHYS_FLAG_SYSMEM: u64 = 1 << 1;
+pub const POLARIS_RM_PHYS_FLAG_EGM: u64 = 1 << 2;
+pub const POLARIS_RM_PHYS_FLAG_FABRICMEM: u64 = 1 << 3;
 pub const POLARIS_RM_COPY_NO_MISMATCH: u64 = u64::MAX;
+pub const POLARIS_RM_COPY_TO_CPU: u32 = 0;
+pub const POLARIS_RM_COPY_FROM_CPU: u32 = 1;
 
 pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 
@@ -252,6 +258,24 @@ pub struct PolarisProbeRmCopyArg {
     pub first_mismatch_offset: u64,
     pub expected_byte: u64,
     pub actual_byte: u64,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisRmCopyArg {
+    pub block_id: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub user_cpu_addr: u64,
+    pub direction: u32,
+    pub _pad: u32,
+    pub page_size: u64,
+    pub phys_addr_count: u64,
+    pub first_phys_addr: u64,
+    pub last_phys_addr: u64,
+    pub flags: u64,
+    pub bytes_copied: u64,
     pub _reserved: [u64; 4],
 }
 

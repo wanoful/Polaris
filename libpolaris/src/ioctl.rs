@@ -120,6 +120,9 @@ pub const POLARIS_PROBE_RM_PHYS: u32 =
 pub const POLARIS_PROBE_RM_COPY: u32 =
     iowr!(MAGIC, 0x19, PolarisProbeRmCopyArg);
 
+pub const POLARIS_RM_COPY: u32 =
+    iowr!(MAGIC, 0x1A, PolarisRmCopyArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.
@@ -213,4 +216,9 @@ pub fn probe_rm_phys(fd: i32, arg: &mut PolarisProbeRmPhysArg) -> Result<(), i32
 /// Probe whether UVM CE can copy bytes to and from an RM-backed logical block.
 pub fn probe_rm_copy(fd: i32, arg: &mut PolarisProbeRmCopyArg) -> Result<(), i32> {
     ioctl_read(fd, POLARIS_PROBE_RM_COPY, arg)
+}
+
+/// Copy between an RM-backed logical block and a userspace CPU buffer.
+pub fn rm_copy(fd: i32, arg: &mut PolarisRmCopyArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_RM_COPY, arg)
 }

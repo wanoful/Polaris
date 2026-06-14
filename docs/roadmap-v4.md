@@ -599,6 +599,14 @@ Still to do on the Polaris side for M1/M2:
   mismatch=0xffffffffffffffff`) and then unmap/refaulted the block through the
   bridge. This proves the narrow local RM-backed shape can move bytes through
   UVM's CE path; it is still diagnostic, not production spill/reload wiring.
+- RM user-buffer copy primitive wired: UVM now exports
+  `uvm_polaris_copy_external_allocation`, polaris.ko exposes `POLARIS_RM_COPY`,
+  and the M2 harness's `--rm-copy-roundtrip` mode copies a deterministic
+  userspace CPU buffer into completion-backed RM backing, copies it back into a
+  second userspace buffer, and verifies byte integrity in userspace. This keeps
+  the same narrow bring-up limit as the probe (contiguous vidmem reached through
+  UVM CE staging), but changes the endpoint from an internal diagnostic pattern
+  to the user CPU pointer shape needed by daemon-backed `OFFLOAD` and `RELOAD`.
 - RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
   block before tearing down observed UVM mappings, and rejects RM-backed
   bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real

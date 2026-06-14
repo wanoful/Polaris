@@ -350,6 +350,22 @@ unsafe extern "C" {
         expected_byte_out: *mut u64,
         actual_byte_out: *mut u64,
     ) -> c_int;
+    fn uvm_polaris_copy_external_allocation(
+        gpu_va_space_ptr: u64,
+        offset: u64,
+        length: u64,
+        rm_control_fd: i32,
+        h_client: u32,
+        h_memory: u32,
+        user_cpu_addr: u64,
+        direction: u32,
+        page_size_out: *mut u64,
+        phys_addr_count_out: *mut u64,
+        first_phys_addr_out: *mut u64,
+        last_phys_addr_out: *mut u64,
+        flags_out: *mut u64,
+        bytes_copied_out: *mut u64,
+    ) -> c_int;
 }
 
 unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
@@ -2078,6 +2094,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_REGISTER_BLOCK_BACKING => me.handle_register_block_backing(user_ptr, size),
             POLARIS_PROBE_RM_PHYS => me.handle_probe_rm_phys(user_ptr, size),
             POLARIS_PROBE_RM_COPY => me.handle_probe_rm_copy(user_ptr, size),
+            POLARIS_RM_COPY => me.handle_rm_copy(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -4153,6 +4170,86 @@ impl PolarisDevice {
             arg.first_phys_addr,
             arg.last_phys_addr,
             arg.first_mismatch_offset
+        );
+        Ok(0)
+    }
+
+    fn handle_rm_copy(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let mut arg: PolarisRmCopyArg = reader.read()?;
+
+        if arg.block_id == 0 || arg.user_cpu_addr == 0 {
+            return Err(EINVAL);
+        }
+        if arg.direction != POLARIS_RM_COPY_TO_CPU && arg.direction != POLARIS_RM_COPY_FROM_CPU {
+            return Err(EINVAL);
+        }
+
+        let target = {
+            let guard = POLARIS_STATE.lock();
+            let inner = guard.as_ref().ok_or(ENODEV)?;
+            polaris_snapshot_rm_phys_probe_target(inner, arg.block_id)?
+        };
+
+        let query_length = if arg.length == 0 {
+            target.length
+        } else {
+            arg.length
+        };
+        if query_length == 0 || arg.offset >= target.length || query_length > target.length.saturating_sub(arg.offset) {
+            return Err(EINVAL);
+        }
+
+        let mut page_size = 0u64;
+        let mut phys_addr_count = 0u64;
+        let mut first_phys_addr = 0u64;
+        let mut last_phys_addr = 0u64;
+        let mut flags = 0u64;
+        let mut bytes_copied = 0u64;
+
+        let ret = unsafe {
+            uvm_polaris_copy_external_allocation(
+                target.gpu_va_space_ptr,
+                arg.offset,
+                query_length,
+                target.rm_control_fd,
+                target.h_client,
+                target.h_memory,
+                arg.user_cpu_addr,
+                arg.direction,
+                &mut page_size,
+                &mut phys_addr_count,
+                &mut first_phys_addr,
+                &mut last_phys_addr,
+                &mut flags,
+                &mut bytes_copied,
+            )
+        };
+        if ret != 0 {
+            return Err(Error::from_errno(-ret));
+        }
+
+        arg.length = query_length;
+        arg.page_size = page_size;
+        arg.phys_addr_count = phys_addr_count;
+        arg.first_phys_addr = first_phys_addr;
+        arg.last_phys_addr = last_phys_addr;
+        arg.flags = flags;
+        arg.bytes_copied = bytes_copied;
+
+        let mut writer = UserSlice::new(user_ptr, size).writer();
+        writer.write(&arg)?;
+
+        dev_info!(
+            self.dev,
+            "POLARIS: RM copy block={} gpu={} dir={} bytes=0x{:x} page=0x{:x} count={} flags=0x{:x}\n",
+            target.block_id,
+            target.gpu_id,
+            arg.direction,
+            arg.bytes_copied,
+            arg.page_size,
+            arg.phys_addr_count,
+            arg.flags
         );
         Ok(0)
     }

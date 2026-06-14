@@ -125,4 +125,27 @@ int uvm_polaris_probe_external_copy(u64 gpu_va_space_ptr,
 				    u64 *expected_byte_out,
 				    u64 *actual_byte_out);
 
+#define UVM_POLARIS_RM_COPY_TO_CPU   0
+#define UVM_POLARIS_RM_COPY_FROM_CPU 1
+
+/*
+ * Exported by UVM (EXPORT_SYMBOL_GPL). Production-shaped helper for copying
+ * between a Polaris RM-backed allocation and a userspace CPU buffer through
+ * UVM-owned DMA staging memory plus CE. Currently supports contiguous vidmem.
+ */
+int uvm_polaris_copy_external_allocation(u64 gpu_va_space_ptr,
+					 u64 offset,
+					 u64 length,
+					 s32 rm_control_fd,
+					 u32 h_client,
+					 u32 h_memory,
+					 u64 user_cpu_addr,
+					 u32 direction,
+					 u64 *page_size_out,
+					 u64 *phys_addr_count_out,
+					 u64 *first_phys_addr_out,
+					 u64 *last_phys_addr_out,
+					 u64 *flags_out,
+					 u64 *bytes_copied_out);
+
 #endif /* POLARIS_UVM_V4_H */
