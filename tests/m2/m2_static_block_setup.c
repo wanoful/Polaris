@@ -149,6 +149,17 @@ struct polaris_register_block_mapping_arg {
     uint64_t _reserved[4];
 };
 
+struct polaris_register_block_backing_arg {
+    uint64_t block_id;
+    uint32_t gpu_id;
+    int32_t rm_control_fd;
+    uint32_t h_client;
+    uint32_t h_memory;
+    uint64_t length;
+    uint64_t offset;
+    uint64_t _reserved[3];
+};
+
 struct polaris_unmap_block_mappings_arg {
     uint64_t block_id;
     uint32_t flags;
@@ -176,6 +187,7 @@ struct polaris_spill_block_arg {
 #define POLARIS_REGISTER_BLOCK_MAPPING _IOW(POLARIS_IOCTL_MAGIC, 0x14, struct polaris_register_block_mapping_arg)
 #define POLARIS_UNMAP_BLOCK_MAPPINGS _IOWR(POLARIS_IOCTL_MAGIC, 0x15, struct polaris_unmap_block_mappings_arg)
 #define POLARIS_SPILL_BLOCK _IOWR(POLARIS_IOCTL_MAGIC, 0x16, struct polaris_spill_block_arg)
+#define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
 
@@ -704,6 +716,35 @@ static int register_logical_block_mapping(struct m2_state *s,
     return 0;
 }
 
+static int register_logical_block_backing(struct m2_state *s,
+                                          uint32_t gpu_id,
+                                          uint64_t block_id)
+{
+    struct polaris_register_block_backing_arg backing = {
+        .block_id = block_id,
+        .gpu_id = gpu_id,
+        .rm_control_fd = s->ctl_fd,
+        .h_client = s->h_client,
+        .h_memory = s->h_memory,
+        .length = POLARIS_BLOCK_SIZE,
+        .offset = 0,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_BLOCK_BACKING,
+                              &backing,
+                              "POLARIS_REGISTER_BLOCK_BACKING") != 0)
+        return -1;
+
+    printf("POLARIS registered logical block backing: block=%llu gpu=%u hClient=0x%x hMemory=0x%x len=0x%llx\n",
+           (unsigned long long)block_id,
+           gpu_id,
+           s->h_client,
+           s->h_memory,
+           (unsigned long long)POLARIS_BLOCK_SIZE);
+    return 0;
+}
+
 static int unmap_block_mappings(struct m2_state *s,
                                 uint64_t block_id,
                                 uint32_t *unmapped_count)
@@ -757,7 +798,8 @@ static int setup_polaris(struct m2_state *s,
                          uint64_t rm_client_token,
                          uint64_t va_space_token,
                          uint64_t base,
-                         uint64_t length)
+                         uint64_t length,
+                         bool register_static_block)
 {
     struct polaris_register_gpu_arg gpu = {
         .gpu_id = gpu_id,
@@ -796,17 +838,20 @@ static int setup_polaris(struct m2_state *s,
     if (polaris_ioctl_checked(s->polaris_fd, POLARIS_REGISTER_VASPACE, &va, "POLARIS_REGISTER_VASPACE") != 0)
         return -1;
     s->polaris_vaspace_registered = true;
-    if (polaris_ioctl_checked(s->polaris_fd,
-                              POLARIS_REGISTER_STATIC_BLOCK,
-                              &block,
-                              "POLARIS_REGISTER_STATIC_BLOCK") != 0)
-        return -1;
+    if (register_static_block) {
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_REGISTER_STATIC_BLOCK,
+                                  &block,
+                                  "POLARIS_REGISTER_STATIC_BLOCK") != 0)
+            return -1;
+    }
 
-    printf("POLARIS setup complete: client=0x%llx token=0x%llx hClient=0x%x hMemory=0x%x\n",
+    printf("POLARIS setup complete: client=0x%llx token=0x%llx hClient=0x%x hMemory=0x%x static=%s\n",
            (unsigned long long)rm_client_token,
            (unsigned long long)va_space_token,
            s->h_client,
-           s->h_memory);
+           s->h_memory,
+           register_static_block ? "yes" : "no");
     return 0;
 }
 
@@ -900,6 +945,7 @@ int main(int argc, char **argv)
     bool dispatch_fault = false;
     bool unmap_refault = false;
     bool block_unmap_refault = false;
+    bool logical_backed_refault = false;
     bool spill_validation = false;
     uint64_t block_id = 0;
     struct m2_state s = {
@@ -927,6 +973,12 @@ int main(int argc, char **argv)
             block_unmap_refault = true;
             continue;
         }
+        if (strcmp(argv[i], "--logical-backed-refault") == 0) {
+            dispatch_fault = true;
+            block_unmap_refault = true;
+            logical_backed_refault = true;
+            continue;
+        }
         if (strcmp(argv[i], "--spill-validation") == 0) {
             spill_validation = true;
             continue;
@@ -944,7 +996,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--spill-validation] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -968,7 +1020,8 @@ int main(int argc, char **argv)
                       polaris_rm_client_token,
                       polaris_va_space_token,
                       base,
-                      POLARIS_MANAGED_SIZE) != 0)
+                      POLARIS_MANAGED_SIZE,
+                      !logical_backed_refault) != 0)
         goto out;
     if (block_unmap_refault || spill_validation) {
         if (register_logical_block_mapping(&s,
@@ -978,6 +1031,10 @@ int main(int argc, char **argv)
                                            base,
                                            POLARIS_BLOCK_SIZE,
                                            &block_id) != 0)
+            goto out;
+    }
+    if (logical_backed_refault) {
+        if (register_logical_block_backing(&s, polaris_gpu_id, block_id) != 0)
             goto out;
     }
     if (spill_validation) {
@@ -1012,7 +1069,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (block_unmap_refault)
+    if (logical_backed_refault)
+        puts("M3 Polaris logical-backed block refault test passed.");
+    else if (block_unmap_refault)
         puts("M3 Polaris block unmap/refault test passed.");
     else if (spill_validation)
         puts("M3 Polaris spill ioctl validation passed.");

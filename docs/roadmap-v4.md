@@ -505,7 +505,8 @@ Still to do on the Polaris side for M1/M2:
 - Hardware validation passed on an RTX 5070 Ti / driver 610.43.02 with
   patched `nvidia-uvm.ko` loaded and builtin UVM tests enabled:
   `tests/m2/m2_static_block_setup`, `--dispatch-fault`, and the M3
-  `--unmap-refault` and `--block-unmap-refault` diagnostics all pass.
+  `--unmap-refault`, `--block-unmap-refault`, and
+  `--logical-backed-refault` diagnostics all pass.
 - Production shim still needs in-shim RM/UVM VA-space creation and external-
   range registration; current shim only bootstraps a harness-created
   VA-space through environment variables.
@@ -525,6 +526,26 @@ Still to do on the Polaris side for M1/M2:
   block. The M2 harness's `--block-unmap-refault` mode creates a real
   session/block, registers its mapping, fault-maps it, unmaps by `block_id`,
   verifies `unmapped_count == 1`, and refaults successfully.
+- Logical-backed bridge slice complete: `POLARIS_REGISTER_BLOCK_BACKING`
+  attaches an RM allocation tuple
+  `(rm_control_fd, h_client, h_memory, length, offset)` to an existing
+  logical block. The UVM hook now first tries the static diagnostic fast path,
+  then resolves a registered logical block mapping with attached RM backing
+  and maps it through `uvm_polaris_map_external_allocation`. The M2 harness's
+  `--logical-backed-refault` mode skips `POLARIS_REGISTER_STATIC_BLOCK`,
+  registers only the logical mapping plus block backing, fault-maps it, unmaps
+  by `block_id`, verifies `unmapped_count == 1`, and refaults successfully.
+  This removes the static-block table as a requirement for the live UVM bridge
+  diagnostic, but it still uses harness/shim-created RM backing rather than
+  daemon-created spill/reload backing.
+- Real CUDA-kernel compatibility slice wired: exact UVM hook lookup remains
+  keyed by `(gpu_id, rm_client_token, va_space_token)`, but when a real
+  runtime CUDA kernel faults on a Polaris VA from CUDA's own registered
+  VA-space, polaris.ko can service it only if exactly one logical block mapping
+  with registered RM backing covers that `(gpu_id, fault_address)`. The hook
+  creates the missing external range in the observed faulting UVM VA-space,
+  retries the bridge internally, records the observed `gpu_va_space_ptr`, and
+  returns `HANDLED`. Ambiguous address matches still return `NOT_MINE`.
 - Third slice complete: `POLARIS_SPILL_BLOCK` is in the ABI. It first tears
   down observed UVM mappings with the same block-level unmap helper, then
   queues the existing `OFFLOAD` decision for resident logical blocks so
@@ -773,11 +794,13 @@ Still to do on the Polaris side for M1/M2:
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
-  allocation, and registers them with `POLARIS_REGISTER_STATIC_BLOCK` so the
-  current polaris.ko hook has resident backing available once a replayable GPU
-  fault reaches the UVM bridge. It is not the daemon-backed production
-  spill/reload path, and it does not make CUDA runtime host copies into
-  Polaris external VA safe.
+  allocation, registers them with `POLARIS_REGISTER_STATIC_BLOCK`, and also
+  attaches the same RM tuple to the logical block with
+  `POLARIS_REGISTER_BLOCK_BACKING`. The static registration preserves the
+  existing strict llama gate, while the logical backing registration exercises
+  the newer block-mapping bridge path. This is not the daemon-backed
+  production spill/reload path, and it does not make CUDA runtime host copies
+  into Polaris external VA safe.
 - KV-only selection slice wired and validated against the local llama.cpp
   binary: `POLARIS_SHIM_REQUIRE_KV_SCOPE=1` uses the ggml allocation-scope hook
   to leave the copied model-buffer allocation on real CUDA memory while routing
@@ -793,8 +816,9 @@ Still to do on the Polaris side for M1/M2:
   selects KV allocations through runtime `cudaMalloc`, and the
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` probe selects KV allocations through
   runtime `cudaMallocManaged`. In both cases the shim passes copied model/init
-  allocations through to real CUDA, accepts KV zero-fill initialization, and
-  completes with `uvm_hook_calls` and `uvm_handled` increasing and no
+  allocations through to real CUDA, accepts KV zero-fill initialization,
+  disables CUDA Graph capture and CUDA PDL launch selection for the shim probe,
+  and completes with `uvm_hook_calls` and `uvm_handled` increasing and no
   `uvm_no_pte` or `uvm_errors` increments. This validates the
   no-source-change KV-only path through the UVM bridge for the integration-test
   backend.

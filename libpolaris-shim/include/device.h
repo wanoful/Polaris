@@ -101,6 +101,14 @@ int polaris_shim_register_block_mapping(uint64_t block_id,
                                         uint64_t base,
                                         uint64_t length);
 
+int polaris_shim_register_block_backing(uint64_t block_id,
+                                        uint32_t gpu_id,
+                                        int32_t rm_control_fd,
+                                        uint32_t h_client,
+                                        uint32_t h_memory,
+                                        uint64_t length,
+                                        uint64_t offset);
+
 int polaris_shim_unmap_block_mappings(uint64_t block_id,
                                       uint32_t *unmapped_count_out);
 

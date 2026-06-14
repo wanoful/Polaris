@@ -86,6 +86,9 @@ pub const POLARIS_UNMAP_BLOCK_MAPPINGS: u32 =
 pub const POLARIS_SPILL_BLOCK: u32 =
     kernel::ioctl::_IOWR::<PolarisSpillBlockArg>(POLARIS_IOCTL_MAGIC, 0x16);
 
+pub const POLARIS_REGISTER_BLOCK_BACKING: u32 =
+    kernel::ioctl::_IOW::<PolarisRegisterBlockBackingArg>(POLARIS_IOCTL_MAGIC, 0x17);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -126,6 +129,11 @@ pub struct PolarisBlock {
     pub home_gpu: u32,
     pub gpu_vaddr: u64,
     pub gpu_phys_handle: u64,
+    pub rm_control_fd: i32,
+    pub rm_h_client: u32,
+    pub rm_h_memory: u32,
+    pub rm_backing_length: u64,
+    pub rm_backing_offset: u64,
     pub cpu_buf_addr: u64,
     pub size_bytes: u64,
     pub refcount: u64,
@@ -333,6 +341,9 @@ unsafe impl kernel::transmute::AsBytes for PolarisUnmapStaticBlockArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisRegisterBlockMappingArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisRegisterBlockMappingArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisRegisterBlockBackingArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisRegisterBlockBackingArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisUnmapBlockMappingsArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisUnmapBlockMappingsArg {}

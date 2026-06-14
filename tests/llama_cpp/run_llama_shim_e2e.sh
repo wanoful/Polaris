@@ -183,6 +183,7 @@ run_shim_probe() {
     local unified_memory="$1"
     local probe_env=(
         GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
+        GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}"
         POLARIS_SHIM_BOOTSTRAP_RM_UVM=1
         POLARIS_SHIM_STATIC_RM_BACKEND=1
         POLARIS_SHIM_STRICT_MANAGED_ALLOC=1

@@ -189,6 +189,19 @@ pub struct PolarisRegisterBlockMappingArg {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct PolarisRegisterBlockBackingArg {
+    pub block_id: u64,
+    pub gpu_id: u32,
+    pub rm_control_fd: i32,
+    pub h_client: u32,
+    pub h_memory: u32,
+    pub length: u64,
+    pub offset: u64,
+    pub _reserved: [u64; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct PolarisUnmapBlockMappingsArg {
     pub block_id: u64,
     pub flags: u32,

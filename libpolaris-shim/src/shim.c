@@ -504,6 +504,7 @@ static void release_static_rm_backend(uint32_t h_memory, uint64_t size)
 
 static int allocate_static_rm_backend(uint64_t gpu_vaddr,
                                       uint64_t rounded,
+                                      uint64_t block_id,
                                       uint32_t *h_memory_out,
                                       uint64_t *rm_size_out)
 {
@@ -544,6 +545,20 @@ static int allocate_static_rm_backend(uint64_t gpu_vaddr,
     if (ret != 0) {
         polaris_shim_rm_free_device_memory(&g_bootstrap_state, &allocation);
         return ret;
+    }
+
+    if (block_id != 0) {
+        ret = polaris_shim_register_block_backing(block_id,
+                                                  g_registered_gpu_id,
+                                                  g_bootstrap_state.rm_control_fd,
+                                                  g_bootstrap_state.h_client,
+                                                  allocation.h_memory,
+                                                  rounded,
+                                                  0);
+        if (ret != 0) {
+            polaris_shim_rm_free_device_memory(&g_bootstrap_state, &allocation);
+            return ret;
+        }
     }
 
     *h_memory_out = allocation.h_memory;
@@ -1235,6 +1250,7 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
 
     ret = allocate_static_rm_backend(gpu_vaddr,
                                      rounded,
+                                     block_id,
                                      &static_h_memory,
                                      &static_size);
     if (ret != 0) {

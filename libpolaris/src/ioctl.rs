@@ -111,6 +111,9 @@ pub const POLARIS_UNMAP_BLOCK_MAPPINGS: u32 =
 pub const POLARIS_SPILL_BLOCK: u32 =
     iowr!(MAGIC, 0x16, PolarisSpillBlockArg);
 
+pub const POLARIS_REGISTER_BLOCK_BACKING: u32 =
+    iow!(MAGIC, 0x17, PolarisRegisterBlockBackingArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.
@@ -179,6 +182,11 @@ pub fn unmap_static_block(fd: i32, arg: &PolarisUnmapStaticBlockArg) -> Result<(
 /// Register a v4 logical block mapping for spill teardown.
 pub fn register_block_mapping(fd: i32, arg: &PolarisRegisterBlockMappingArg) -> Result<(), i32> {
     ioctl_write(fd, POLARIS_REGISTER_BLOCK_MAPPING, arg)
+}
+
+/// Attach RM allocation backing to an existing v4 logical block.
+pub fn register_block_backing(fd: i32, arg: &PolarisRegisterBlockBackingArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_REGISTER_BLOCK_BACKING, arg)
 }
 
 /// Unmap all UVM-observed v4 mappings for a logical block.

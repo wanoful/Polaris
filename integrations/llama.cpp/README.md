@@ -131,8 +131,9 @@ fault-path gate:
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` / `cudaMallocManaged` path. Each probe
   bootstraps RM/UVM, registers a Polaris VA-space, routes real llama allocation
   through Polaris, creates a UVM external range, allocates an RM vidmem object,
-  registers it with `POLARIS_REGISTER_STATIC_BLOCK`, requires the matching shim
-  per-API counter (`api_runtime_alloc_selected` or
+  registers it with `POLARIS_REGISTER_STATIC_BLOCK` and
+  `POLARIS_REGISTER_BLOCK_BACKING`, requires the matching shim per-API counter
+  (`api_runtime_alloc_selected` or
   `api_runtime_managed_alloc_selected`) to increase, and requires
   `/sys/kernel/polaris/stats` to show increased `uvm_hook_calls` and
   `uvm_handled`;
@@ -160,17 +161,21 @@ with `LLAMA_CPP_BIN=/path/to/binary`.
 
 `POLARIS_SHIM_STATIC_RM_BACKEND=1` is a test backend, not the final production
 spill/reload design. It proves the shim can allocate and register RM-backed
-external ranges for real llama.cpp allocations. It does not make CUDA runtime
-host copies into Polaris external VA safe, and it still does not implement
-daemon-backed spill/reload.
+external ranges for real llama.cpp allocations. The backend registers both the
+legacy static-block entry and the logical block's RM backing tuple, so the
+kernel can validate logical-block UVM bridge mapping without a separate static
+table entry. It does not make CUDA runtime host copies into Polaris external
+VA safe, and it still does not implement daemon-backed spill/reload.
 
 Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
 `llama-bench` commands complete and `/sys/kernel/polaris/stats` shows both
 `uvm_hook_calls` and `uvm_handled` increasing for the default and
 unified-memory allocator branches. This strict static-RM gate passes for the
-local SmolLM2 CUDA runs when KV-scope selection is enabled. It is still an
-integration-test backend: daemon-backed spill/reload remains separate
-production work.
+local SmolLM2 CUDA runs when KV-scope selection is enabled. The gate sets
+`GGML_CUDA_DISABLE_GRAPHS=1` and `GGML_CUDA_PDL=0` by default because CUDA
+Graph capture/replay and programmatic dependent launch are not part of the
+current shim contract. It is still an integration-test backend:
+daemon-backed spill/reload remains separate production work.
 
 ## Workload Run Shape
 

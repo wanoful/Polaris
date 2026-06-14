@@ -99,6 +99,17 @@ struct polaris_register_block_mapping_arg {
     uint64_t _reserved[4];
 };
 
+struct polaris_register_block_backing_arg {
+    uint64_t block_id;
+    uint32_t gpu_id;
+    int32_t rm_control_fd;
+    uint32_t h_client;
+    uint32_t h_memory;
+    uint64_t length;
+    uint64_t offset;
+    uint64_t _reserved[3];
+};
+
 struct polaris_unmap_block_mappings_arg {
     uint64_t block_id;
     uint32_t flags;
@@ -163,6 +174,7 @@ struct polaris_block_release_arg {
 #define POLARIS_REGISTER_BLOCK_MAPPING _IOW(POLARIS_IOCTL_MAGIC, 0x14, struct polaris_register_block_mapping_arg)
 #define POLARIS_UNMAP_BLOCK_MAPPINGS _IOWR(POLARIS_IOCTL_MAGIC, 0x15, struct polaris_unmap_block_mappings_arg)
 #define POLARIS_SPILL_BLOCK _IOWR(POLARIS_IOCTL_MAGIC, 0x16, struct polaris_spill_block_arg)
+#define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
 
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 

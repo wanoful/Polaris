@@ -27,6 +27,17 @@ POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
   -> second synthetic fault remaps the same external range
 ```
 
+The logical-backed M3 diagnostic removes the static-block table from that
+fault-map path:
+
+```text
+POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
+POLARIS_REGISTER_BLOCK_BACKING(block_id, RM allocation tuple)
+  -> synthetic fault maps the logical block through the UVM bridge
+  -> POLARIS_UNMAP_BLOCK_MAPPINGS(block_id)
+  -> second synthetic fault remaps through the logical mapping again
+```
+
 The diagnostic creates real RM objects, registers a fault-capable GPU
 VA-space with UVM, creates a UVM external range, registers the same
 `(rm_client_token, user_rm_va_space)` handle pair with polaris.ko, and
@@ -133,6 +144,29 @@ M3 Polaris block unmap/refault test passed.
 This still does not perform device-to-host copy or RM allocation release. It
 only proves the block-to-worker mapping registry and UVM unmap/refault
 teardown path that production spill will build on.
+
+## Logical-Backed Block Refault Diagnostic
+
+This validates that the live UVM bridge no longer requires a static-block fast
+entry. It creates the same real Polaris session and logical block as
+`--block-unmap-refault`, skips `POLARIS_REGISTER_STATIC_BLOCK`, attaches the
+diagnostic RM allocation to the logical block with
+`POLARIS_REGISTER_BLOCK_BACKING`, fault-maps through the logical block mapping,
+unmaps by `block_id`, then refaults through the logical path again:
+
+```sh
+sudo tests/m2/m2_static_block_setup --logical-backed-refault
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris logical-backed block refault test passed.
+```
+
+This is still a bridge diagnostic. The RM object is created by the harness, not
+by polarisd, and no host/device copy or daemon-backed spill/reload decision is
+executed.
 
 ## Spill Ioctl Validation
 
@@ -291,9 +325,9 @@ shim's process-exit cleanup for outstanding managed allocations.
   the production workload path is complete.
 - The harness registers its GPU entry as transient. After the fd closes,
   `/sys/kernel/polaris/stats` should show `gpus: 0`, `v4_va_spaces: 0`, and
-  `static_blocks: 0`; after `--block-unmap-refault` or `--spill-validation`,
-  it should also show `block_mappings: 0`. Hook counters remain cumulative
-  for the loaded module.
+  `static_blocks: 0`; after `--block-unmap-refault`,
+  `--logical-backed-refault`, or `--spill-validation`, it should also show
+  `block_mappings: 0`. Hook counters remain cumulative for the loaded module.
 - UVM dispatch and Polaris registration use
   `(gpu_id, rm_client_token, va_space_token)`. RM object handles are only
   unique within an RM client, so the client token is required when concurrent

@@ -58,8 +58,11 @@ token and managed window through environment variables:
 When all four variables are present, the shim submits
 `POLARIS_REGISTER_VASPACE` on first `cuInit` and unregisters it at process
 exit. `POLARIS_SHIM_RM_CLIENT_TOKEN` is optional for legacy M2 harnesses; if
-omitted, the shim passes `rm_client_token=0` as a wildcard. Missing variables
-leave `cuInit` as a pass-through.
+omitted, the shim passes `rm_client_token=0` for non-fault control-plane
+probes. The v4 UVM fault path needs the real RM client token because UVM
+dispatch and RM memory handles are keyed by the full
+`(gpu_id, rm_client_token, va_space_token)` tuple. Missing variables leave
+`cuInit` as a pass-through.
 
 An allocator slice is wired for shim-created and harness-created VA-spaces.
 With `POLARIS_SHIM_MANAGE_ALLOCATIONS=1`, the shim interposes `cuMemAlloc`,
@@ -116,6 +119,16 @@ Each allocation reserves a deferred logical Polaris block, registers a
 `block_id -> worker VA` mapping, and returns the Polaris VA to the worker.
 Pages are still unmapped; the next GPU dereference must fault through UVM and
 be serviced by polaris.ko.
+When `POLARIS_SHIM_STATIC_RM_BACKEND=1` is enabled for the integration-test
+backend, each selected allocation also receives a shim-created RM vidmem
+object. The shim registers that object with both `POLARIS_REGISTER_STATIC_BLOCK`
+and `POLARIS_REGISTER_BLOCK_BACKING`: the static entry preserves the current
+strict llama regression, while the logical backing entry lets the kernel fault
+hook map the registered logical block without relying on the static-block
+table. Real CUDA kernels may fault through CUDA's own UVM-registered VA-space
+rather than the shim-created RM/UVM VA-space; for that case polaris.ko services
+the fault only when a single unambiguous logical block mapping covers the
+faulting GPU/address. This remains test backing, not daemon-backed spill/reload.
 Set `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and/or
 `POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` to restrict which allocation sizes
 are routed through Polaris. Allocations outside that inclusive policy range
@@ -206,6 +219,9 @@ boundaries: `cudaStreamBeginCapture`, `cudaStreamEndCapture`,
 return the stream-capture unsupported error while the process has live
 shim-managed Polaris allocations. This keeps graph capture or replay from
 recording or launching work that may dereference unmapped Polaris VA.
+The llama.cpp shim regression also sets `GGML_CUDA_PDL=0` by default to keep
+programmatic dependent launch on the documented unsupported side of the M5
+contract until the launch path is audited with live Polaris allocations.
 Set `POLARIS_SHIM_TEST_GRAPH=1` in the `managed_alloc` harness to validate
 the runtime and driver guards.
 Set `POLARIS_SHIM_TEST_VMM=1` to validate VMM symbol coverage and driver
@@ -247,9 +263,12 @@ mode implicitly; harness mode should set `POLARIS_SHIM_MANAGE_ALLOCATIONS=1`:
 This is not yet the full production shim for llama.cpp: it creates the
 fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
 still uses the fixed managed window allocator model and the static RM
-integration-test backend. The local M5 regression validates llama.cpp's actual
-KV allocation and kernel-deref path for both runtime `cudaMalloc` and runtime
-`cudaMallocManaged`; daemon-backed spill/reload remains pending.
+integration-test backend. That backend now also registers logical-block RM
+backing, so the kernel can validate the non-static logical mapping path, but
+the RM object is still allocated by the shim. The local M5 regression validates
+llama.cpp's actual KV allocation and kernel-deref path for both runtime
+`cudaMalloc` and runtime `cudaMallocManaged`; daemon-backed spill/reload
+remains pending.
 
 ## Why this is not a Cargo crate
 
