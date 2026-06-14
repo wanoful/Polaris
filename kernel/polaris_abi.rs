@@ -74,6 +74,8 @@ pub const POLARIS_RELEASE_FLAG_STREAM_QUIESCED: u32 = 1 << 0;
 pub const POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING: u32 = 1 << 1;
 pub const POLARIS_REGISTER_GPU_FLAG_TRANSIENT: u32 = 1 << 0;
 
+pub const POLARIS_RM_COPY_NO_MISMATCH: u64 = u64::MAX;
+
 pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -231,6 +233,25 @@ pub struct PolarisProbeRmPhysArg {
     pub first_phys_addr: u64,
     pub last_phys_addr: u64,
     pub flags: u64,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisProbeRmCopyArg {
+    pub block_id: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub pattern_seed: u64,
+    pub page_size: u64,
+    pub phys_addr_count: u64,
+    pub first_phys_addr: u64,
+    pub last_phys_addr: u64,
+    pub flags: u64,
+    pub bytes_checked: u64,
+    pub first_mismatch_offset: u64,
+    pub expected_byte: u64,
+    pub actual_byte: u64,
     pub _reserved: [u64; 4],
 }
 

@@ -189,6 +189,35 @@ programming, and does not make RM-backed `POLARIS_SPILL_BLOCK` production-ready;
 the `EOPNOTSUPP` guards remain correct until a real RM-backed spill/reload
 round-trip validates byte integrity.
 
+## RM CE Copy Probe
+
+This diagnostic builds on the physical-address probe. It follows the
+completion-backed resident path, fault-maps a harness-owned RM vidmem
+allocation, confirms `POLARIS_SPILL_BLOCK` still rejects RM-backed spill with
+`EOPNOTSUPP`, then calls `POLARIS_PROBE_RM_COPY`. The kernel asks UVM to
+duplicate/query the RM allocation, stage a deterministic CPU pattern in
+UVM-owned sysmem DMA memory, CE-copy the pattern into the RM allocation's
+GPU-visible physical address, CE-copy it back to another sysmem staging buffer,
+and verify the bytes on CPU:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-copy-probe
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris completion-backed block refault test passed.
+```
+
+The probe prints the copied byte count, page size, physical-address geometry,
+flags, and first mismatch. A successful run reports
+`mismatch=0xffffffffffffffff`. Passing this test proves the narrow local
+backing shape used by the harness (contiguous vidmem, one 2 MiB page on the
+validated GPU) can move bytes through UVM's CE copy path. It is still a
+diagnostic: production RM-backed `OFFLOAD`, `RELOAD`, and `COW_BREAK` remain
+guarded until polarisd/runtime spill and reload are wired to this copy path.
+
 ## Synthetic Fault Dispatch
 
 This leaves the external range unmapped, probes UVM for the exact dispatch key,

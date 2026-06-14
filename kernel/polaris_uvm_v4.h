@@ -103,4 +103,26 @@ int uvm_polaris_probe_external_allocation(u64 gpu_va_space_ptr,
 					  u64 *egm_out,
 					  u64 *fabricmem_out);
 
+/*
+ * Exported by UVM (EXPORT_SYMBOL_GPL). Diagnostic helper for proving a narrow
+ * RM-backed byte-copy path: write a deterministic pattern into the RM external
+ * allocation through CE, read it back through CE, and report the first mismatch.
+ */
+int uvm_polaris_probe_external_copy(u64 gpu_va_space_ptr,
+				    u64 offset,
+				    u64 length,
+				    s32 rm_control_fd,
+				    u32 h_client,
+				    u32 h_memory,
+				    u64 pattern_seed,
+				    u64 *page_size_out,
+				    u64 *phys_addr_count_out,
+				    u64 *first_phys_addr_out,
+				    u64 *last_phys_addr_out,
+				    u64 *flags_out,
+				    u64 *bytes_checked_out,
+				    u64 *first_mismatch_offset_out,
+				    u64 *expected_byte_out,
+				    u64 *actual_byte_out);
+
 #endif /* POLARIS_UVM_V4_H */

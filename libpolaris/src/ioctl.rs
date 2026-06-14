@@ -117,6 +117,9 @@ pub const POLARIS_REGISTER_BLOCK_BACKING: u32 =
 pub const POLARIS_PROBE_RM_PHYS: u32 =
     iowr!(MAGIC, 0x18, PolarisProbeRmPhysArg);
 
+pub const POLARIS_PROBE_RM_COPY: u32 =
+    iowr!(MAGIC, 0x19, PolarisProbeRmCopyArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.
@@ -205,4 +208,9 @@ pub fn spill_block(fd: i32, arg: &mut PolarisSpillBlockArg) -> Result<(), i32> {
 /// Probe whether UVM/RM can expose GPU physical addresses for an RM-backed logical block.
 pub fn probe_rm_phys(fd: i32, arg: &mut PolarisProbeRmPhysArg) -> Result<(), i32> {
     ioctl_read(fd, POLARIS_PROBE_RM_PHYS, arg)
+}
+
+/// Probe whether UVM CE can copy bytes to and from an RM-backed logical block.
+pub fn probe_rm_copy(fd: i32, arg: &mut PolarisProbeRmCopyArg) -> Result<(), i32> {
+    ioctl_read(fd, POLARIS_PROBE_RM_COPY, arg)
 }

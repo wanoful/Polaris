@@ -332,6 +332,24 @@ unsafe extern "C" {
         egm_out: *mut u64,
         fabricmem_out: *mut u64,
     ) -> c_int;
+    fn uvm_polaris_probe_external_copy(
+        gpu_va_space_ptr: u64,
+        offset: u64,
+        length: u64,
+        rm_control_fd: i32,
+        h_client: u32,
+        h_memory: u32,
+        pattern_seed: u64,
+        page_size_out: *mut u64,
+        phys_addr_count_out: *mut u64,
+        first_phys_addr_out: *mut u64,
+        last_phys_addr_out: *mut u64,
+        flags_out: *mut u64,
+        bytes_checked_out: *mut u64,
+        first_mismatch_offset_out: *mut u64,
+        expected_byte_out: *mut u64,
+        actual_byte_out: *mut u64,
+    ) -> c_int;
 }
 
 unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
@@ -2059,6 +2077,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_SPILL_BLOCK => me.handle_spill_block(user_ptr, size),
             POLARIS_REGISTER_BLOCK_BACKING => me.handle_register_block_backing(user_ptr, size),
             POLARIS_PROBE_RM_PHYS => me.handle_probe_rm_phys(user_ptr, size),
+            POLARIS_PROBE_RM_COPY => me.handle_probe_rm_copy(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -4048,6 +4067,92 @@ impl PolarisDevice {
             arg.first_phys_addr,
             arg.last_phys_addr,
             arg.flags
+        );
+        Ok(0)
+    }
+
+    fn handle_probe_rm_copy(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let mut arg: PolarisProbeRmCopyArg = reader.read()?;
+
+        if arg.block_id == 0 {
+            return Err(EINVAL);
+        }
+
+        let target = {
+            let guard = POLARIS_STATE.lock();
+            let inner = guard.as_ref().ok_or(ENODEV)?;
+            polaris_snapshot_rm_phys_probe_target(inner, arg.block_id)?
+        };
+
+        let query_length = if arg.length == 0 {
+            target.length
+        } else {
+            arg.length
+        };
+        if query_length == 0 || arg.offset >= target.length || query_length > target.length.saturating_sub(arg.offset) {
+            return Err(EINVAL);
+        }
+
+        let mut page_size = 0u64;
+        let mut phys_addr_count = 0u64;
+        let mut first_phys_addr = 0u64;
+        let mut last_phys_addr = 0u64;
+        let mut flags = 0u64;
+        let mut bytes_checked = 0u64;
+        let mut first_mismatch_offset = POLARIS_RM_COPY_NO_MISMATCH;
+        let mut expected_byte = 0u64;
+        let mut actual_byte = 0u64;
+
+        let ret = unsafe {
+            uvm_polaris_probe_external_copy(
+                target.gpu_va_space_ptr,
+                arg.offset,
+                query_length,
+                target.rm_control_fd,
+                target.h_client,
+                target.h_memory,
+                arg.pattern_seed,
+                &mut page_size,
+                &mut phys_addr_count,
+                &mut first_phys_addr,
+                &mut last_phys_addr,
+                &mut flags,
+                &mut bytes_checked,
+                &mut first_mismatch_offset,
+                &mut expected_byte,
+                &mut actual_byte,
+            )
+        };
+        if ret != 0 {
+            return Err(Error::from_errno(-ret));
+        }
+
+        arg.length = query_length;
+        arg.page_size = page_size;
+        arg.phys_addr_count = phys_addr_count;
+        arg.first_phys_addr = first_phys_addr;
+        arg.last_phys_addr = last_phys_addr;
+        arg.flags = flags;
+        arg.bytes_checked = bytes_checked;
+        arg.first_mismatch_offset = first_mismatch_offset;
+        arg.expected_byte = expected_byte;
+        arg.actual_byte = actual_byte;
+
+        let mut writer = UserSlice::new(user_ptr, size).writer();
+        writer.write(&arg)?;
+
+        dev_info!(
+            self.dev,
+            "POLARIS: probed RM copy block={} gpu={} len=0x{:x} page=0x{:x} count={} first=0x{:x} last=0x{:x} mismatch=0x{:x}\n",
+            target.block_id,
+            target.gpu_id,
+            arg.length,
+            arg.page_size,
+            arg.phys_addr_count,
+            arg.first_phys_addr,
+            arg.last_phys_addr,
+            arg.first_mismatch_offset
         );
         Ok(0)
     }

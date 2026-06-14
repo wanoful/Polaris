@@ -198,6 +198,23 @@ struct polaris_probe_rm_phys_arg {
     uint64_t _reserved[4];
 };
 
+struct polaris_probe_rm_copy_arg {
+    uint64_t block_id;
+    uint64_t offset;
+    uint64_t length;
+    uint64_t pattern_seed;
+    uint64_t page_size;
+    uint64_t phys_addr_count;
+    uint64_t first_phys_addr;
+    uint64_t last_phys_addr;
+    uint64_t flags;
+    uint64_t bytes_checked;
+    uint64_t first_mismatch_offset;
+    uint64_t expected_byte;
+    uint64_t actual_byte;
+    uint64_t _reserved[4];
+};
+
 enum {
     POLARIS_DECISION_OP_ALLOC = 0,
     POLARIS_DECISION_OP_FREE = 1,
@@ -264,6 +281,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_SPILL_BLOCK _IOWR(POLARIS_IOCTL_MAGIC, 0x16, struct polaris_spill_block_arg)
 #define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
 #define POLARIS_PROBE_RM_PHYS _IOWR(POLARIS_IOCTL_MAGIC, 0x18, struct polaris_probe_rm_phys_arg)
+#define POLARIS_PROBE_RM_COPY _IOWR(POLARIS_IOCTL_MAGIC, 0x19, struct polaris_probe_rm_copy_arg)
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
 #define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)
@@ -272,6 +290,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_RM_PHYS_FLAG_SYSMEM (1ULL << 1)
 #define POLARIS_RM_PHYS_FLAG_EGM (1ULL << 2)
 #define POLARIS_RM_PHYS_FLAG_FABRICMEM (1ULL << 3)
+#define POLARIS_RM_COPY_NO_MISMATCH UINT64_MAX
 
 #define NV_IOCTL(cmd, type) _IOWR(NV_IOCTL_MAGIC, (cmd), type)
 #define UVM_TEST_IOCTL_BASE(i) UVM_IOCTL_BASE(200 + (i))
@@ -1343,6 +1362,70 @@ static int probe_rm_phys(struct m2_state *s, uint64_t block_id)
     return 0;
 }
 
+static int probe_rm_copy(struct m2_state *s, uint64_t block_id)
+{
+    struct polaris_probe_rm_copy_arg probe = {
+        .block_id = block_id,
+        .offset = 0,
+        .length = POLARIS_BLOCK_SIZE,
+        .pattern_seed = 0x504f4c4152495343ULL,
+        .first_mismatch_offset = POLARIS_RM_COPY_NO_MISMATCH,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_PROBE_RM_COPY,
+                              &probe,
+                              "POLARIS_PROBE_RM_COPY") != 0)
+        return -1;
+
+    printf("POLARIS RM copy probe: block=%llu offset=0x%llx len=0x%llx bytes=0x%llx page=0x%llx count=%llu first=0x%llx last=0x%llx flags=0x%llx mismatch=0x%llx expected=0x%llx actual=0x%llx\n",
+           (unsigned long long)probe.block_id,
+           (unsigned long long)probe.offset,
+           (unsigned long long)probe.length,
+           (unsigned long long)probe.bytes_checked,
+           (unsigned long long)probe.page_size,
+           (unsigned long long)probe.phys_addr_count,
+           (unsigned long long)probe.first_phys_addr,
+           (unsigned long long)probe.last_phys_addr,
+           (unsigned long long)probe.flags,
+           (unsigned long long)probe.first_mismatch_offset,
+           (unsigned long long)probe.expected_byte,
+           (unsigned long long)probe.actual_byte);
+
+    if (probe.length != POLARIS_BLOCK_SIZE || probe.bytes_checked != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_COPY returned len=0x%llx bytes=0x%llx, expected 0x%llx\n",
+                (unsigned long long)probe.length,
+                (unsigned long long)probe.bytes_checked,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        return -1;
+    }
+    if (probe.page_size == 0 || probe.phys_addr_count == 0) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_COPY returned empty geometry: page=0x%llx count=%llu\n",
+                (unsigned long long)probe.page_size,
+                (unsigned long long)probe.phys_addr_count);
+        return -1;
+    }
+    if ((probe.flags & POLARIS_RM_PHYS_FLAG_CONTIGUOUS) == 0 ||
+        (probe.flags & POLARIS_RM_PHYS_FLAG_SYSMEM) != 0) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_COPY expected contiguous vidmem flags, got 0x%llx\n",
+                (unsigned long long)probe.flags);
+        return -1;
+    }
+    if (probe.first_mismatch_offset != POLARIS_RM_COPY_NO_MISMATCH) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_COPY mismatch at 0x%llx: expected=0x%llx actual=0x%llx\n",
+                (unsigned long long)probe.first_mismatch_offset,
+                (unsigned long long)probe.expected_byte,
+                (unsigned long long)probe.actual_byte);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_id)
 {
     struct polaris_spill_block_arg spill = {
@@ -1571,6 +1654,7 @@ int main(int argc, char **argv)
     bool cuda_copy_probe = false;
     bool rm_cpu_map_probe = false;
     bool rm_phys_probe = false;
+    bool rm_copy_probe = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -1613,6 +1697,13 @@ int main(int argc, char **argv)
             rm_phys_probe = true;
             continue;
         }
+        if (strcmp(argv[i], "--rm-copy-probe") == 0) {
+            dispatch_fault = true;
+            block_unmap_refault = true;
+            complete_backed_refault = true;
+            rm_copy_probe = true;
+            continue;
+        }
         if (strcmp(argv[i], "--complete-backed-refault") == 0) {
             dispatch_fault = true;
             block_unmap_refault = true;
@@ -1650,7 +1741,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -1776,6 +1867,10 @@ int main(int argc, char **argv)
         }
         if (rm_phys_probe) {
             if (probe_rm_phys(&s, block_id) != 0)
+                goto out;
+        }
+        if (rm_copy_probe) {
+            if (probe_rm_copy(&s, block_id) != 0)
                 goto out;
         }
         if (block_unmap_refault) {
