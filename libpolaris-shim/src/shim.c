@@ -57,6 +57,8 @@ static uint64_t g_managed_length;
 static uint64_t g_block_size;
 static uint64_t g_min_managed_alloc;
 static uint64_t g_max_managed_alloc;
+static uint64_t g_selected_alloc_skip;
+static uint64_t g_scope_selected_seen;
 static uint64_t g_session_id;
 static uint64_t g_next_token;
 static int g_registered_vaspace;
@@ -65,9 +67,13 @@ static int g_allocator_ready;
 static int g_create_external_ranges;
 static int g_bootstrap_rm_uvm;
 static int g_static_rm_backend;
+static int g_require_kv_scope;
+static int g_allow_zero_memset;
+static int g_trace_scope;
 static int g_strict_managed_alloc;
 static int g_report_stats;
 static int g_runtime_selected_device = -1;
+static __thread int g_allocation_scope_is_kv;
 static struct polaris_shim_bootstrap g_bootstrap_state = {
     .rm_control_fd = -1,
     .uvm_fd = -1,
@@ -212,6 +218,57 @@ static int should_manage_allocation_size(size_t size)
     if (g_max_managed_alloc != 0 && request > g_max_managed_alloc)
         return 0;
     return 1;
+}
+
+static int should_manage_allocation(size_t size)
+{
+    int selected;
+
+    if (!should_manage_allocation_size(size)) {
+        if (g_trace_scope) {
+            fprintf(stderr,
+                    "[polaris-shim] allocation policy size=%zu selected=0 "
+                    "reason=size scope_kv=%d require_kv_scope=%d\n",
+                    size,
+                    g_allocation_scope_is_kv,
+                    g_require_kv_scope);
+        }
+        return 0;
+    }
+    if (g_require_kv_scope && !g_allocation_scope_is_kv) {
+        if (g_trace_scope) {
+            fprintf(stderr,
+                    "[polaris-shim] allocation policy size=%zu selected=0 "
+                    "reason=scope scope_kv=%d require_kv_scope=%d\n",
+                    size,
+                    g_allocation_scope_is_kv,
+                    g_require_kv_scope);
+        }
+        return 0;
+    }
+
+    selected = 1;
+    if (g_selected_alloc_skip != 0) {
+        pthread_mutex_lock(&g_alloc_lock);
+        if (g_scope_selected_seen < g_selected_alloc_skip) {
+            g_scope_selected_seen++;
+            selected = 0;
+        }
+        pthread_mutex_unlock(&g_alloc_lock);
+    }
+
+    if (g_trace_scope) {
+        fprintf(stderr,
+                "[polaris-shim] allocation policy size=%zu selected=%d "
+                "reason=%s scope_kv=%d require_kv_scope=%d\n",
+                size,
+                selected,
+                selected ? "match" : "skip",
+                g_allocation_scope_is_kv,
+                g_require_kv_scope);
+    }
+
+    return selected;
 }
 
 static uint64_t default_bootstrap_window_cap(void)
@@ -484,15 +541,19 @@ static void unregister_vaspace_at_exit(void)
 
     while (list) {
         struct polaris_shim_allocation *next = list->next;
-        int ret = polaris_shim_block_release(g_session_id,
-                                             list->token_start,
-                                             list->token_count);
-        if (list->external_base != 0) {
-            int uvm_ret = polaris_shim_uvm_free_external_range(list->external_base);
-            if (ret == 0 && uvm_ret != 0)
-                ret = uvm_ret;
+        int ret = polaris_shim_unmap_block_mappings(list->block_id, NULL);
+        if (ret == 0) {
+            int release_ret = polaris_shim_block_release(g_session_id,
+                                                         list->token_start,
+                                                         list->token_count);
+            if (release_ret != 0)
+                ret = release_ret;
         }
-        release_static_rm_backend(list->static_h_memory, list->static_size);
+        if (ret == 0 && list->external_base != 0) {
+            ret = polaris_shim_uvm_free_external_range(list->external_base);
+        }
+        if (ret == 0)
+            release_static_rm_backend(list->static_h_memory, list->static_size);
         fprintf(stderr,
                 "[polaris-shim] exit cleanup ptr=0x%" PRIx64
                 " block=%" PRIu64 " ret=%d\n",
@@ -567,11 +628,15 @@ static int bootstrap_allocator_control_plane(uint32_t gpu_id,
             "[polaris-shim] allocator ready session=%" PRIu64
             " block_size=0x%" PRIx64
             " min_alloc=0x%" PRIx64
-            " max_alloc=0x%" PRIx64 "\n",
+            " max_alloc=0x%" PRIx64
+            " require_kv_scope=%d"
+            " selected_skip=%" PRIu64 "\n",
             g_session_id,
             g_block_size,
             g_min_managed_alloc,
-            g_max_managed_alloc);
+            g_max_managed_alloc,
+            g_require_kv_scope,
+            g_selected_alloc_skip);
     return 0;
 }
 
@@ -616,6 +681,11 @@ static void bootstrap_vaspace(void)
         }
         rm_client_token = g_bootstrap_state.h_client;
         token = g_bootstrap_state.h_vaspace;
+        if (g_bootstrap_state.observed_va_space_token != 0) {
+            gpu_id = g_bootstrap_state.observed_gpu_id;
+            rm_client_token = g_bootstrap_state.observed_rm_client_token;
+            token = g_bootstrap_state.observed_va_space_token;
+        }
         choose_bootstrap_managed_window(&base, &length);
         g_create_external_ranges = 1;
         ret = polaris_shim_uvm_adopt_fd(g_bootstrap_state.uvm_fd);
@@ -650,6 +720,9 @@ static void bootstrap_vaspace(void)
     g_strict_managed_alloc = env_enabled("POLARIS_SHIM_STRICT_MANAGED_ALLOC");
     g_report_stats = env_enabled("POLARIS_SHIM_REPORT_STATS");
     g_static_rm_backend = env_enabled("POLARIS_SHIM_STATIC_RM_BACKEND");
+    g_require_kv_scope = env_enabled("POLARIS_SHIM_REQUIRE_KV_SCOPE");
+    g_allow_zero_memset = env_enabled("POLARIS_SHIM_ALLOW_ZERO_MEMSET");
+    g_trace_scope = env_enabled("POLARIS_SHIM_TRACE_SCOPE");
     if (g_static_rm_backend) {
         if (!g_bootstrap_rm_uvm) {
             fprintf(stderr,
@@ -665,6 +738,7 @@ static void bootstrap_vaspace(void)
         (void)parse_u64_env("POLARIS_SHIM_BLOCK_SIZE", &block_size);
         (void)parse_u64_env("POLARIS_SHIM_MIN_MANAGED_ALLOC", &g_min_managed_alloc);
         (void)parse_u64_env("POLARIS_SHIM_MAX_MANAGED_ALLOC", &g_max_managed_alloc);
+        (void)parse_u64_env("POLARIS_SHIM_SELECTED_ALLOC_SKIP", &g_selected_alloc_skip);
         if (block_size == 0) {
             fprintf(stderr, "[polaris-shim] invalid POLARIS_SHIM_BLOCK_SIZE=0\n");
             g_manage_allocations = 0;
@@ -1119,14 +1193,16 @@ static int polaris_free_managed(CUdeviceptr ptr)
     rounded_size = (uint64_t)token_count * g_block_size;
     pthread_mutex_unlock(&g_alloc_lock);
 
-    ret = polaris_shim_block_release(g_session_id,
-                                     token_start,
-                                     token_count);
-    if (external_base != 0) {
-        int uvm_ret = polaris_shim_uvm_free_external_range(external_base);
-        if (ret == 0 && uvm_ret != 0)
-            ret = uvm_ret;
+    ret = polaris_shim_unmap_block_mappings(block_id, NULL);
+    if (ret == 0) {
+        int release_ret = polaris_shim_block_release(g_session_id,
+                                                     token_start,
+                                                     token_count);
+        if (release_ret != 0)
+            ret = release_ret;
     }
+    if (ret == 0 && external_base != 0)
+        ret = polaris_shim_uvm_free_external_range(external_base);
     if (ret == 0)
         release_static_rm_backend(static_h_memory, static_size);
     if (ret == 0) {
@@ -1296,7 +1372,7 @@ static CUresult cu_mem_alloc_impl(const char *real_name,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (g_manage_allocations) {
-        selected = dptr && should_manage_allocation_size(bytesize);
+        selected = dptr && should_manage_allocation(bytesize);
         stats_note_alloc_call(bytesize, selected);
     }
 
@@ -1344,7 +1420,7 @@ static CUresult cu_mem_alloc_async_impl(const char *real_name,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (g_manage_allocations) {
-        selected = dptr && should_manage_allocation_size(bytesize);
+        selected = dptr && should_manage_allocation(bytesize);
         stats_note_alloc_call(bytesize, selected);
     }
 
@@ -1720,6 +1796,21 @@ static CUresult cu_mem_get_address_range_impl(const char *real_name,
 }
 
 POLARIS_SHIM_INTERPOSER
+void polaris_shim_set_allocation_scope(const char *scope)
+{
+    if (scope && strcmp(scope, "kv") == 0)
+        g_allocation_scope_is_kv = 1;
+    else
+        g_allocation_scope_is_kv = 0;
+    if (g_trace_scope) {
+        fprintf(stderr,
+                "[polaris-shim] allocation scope=%s scope_kv=%d\n",
+                scope ? scope : "none",
+                g_allocation_scope_is_kv);
+    }
+}
+
+POLARIS_SHIM_INTERPOSER
 CUresult cuMemGetAddressRange(CUdeviceptr *pbase,
                               size_t *psize,
                               CUdeviceptr dptr)
@@ -1981,10 +2072,22 @@ static CUresult cu_memset_guard(const char *real_name,
                                 uint32_t value,
                                 size_t N)
 {
+    CUdeviceptr base = 0;
+    uint64_t length = 0;
+
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
-    if (find_allocation_range(dstDevice, NULL, NULL)) {
+    if (find_allocation_range(dstDevice, &base, &length)) {
+        if (g_allow_zero_memset && value == 0 && dstDevice == base && N <= length) {
+            fprintf(stderr,
+                    "[polaris-shim] %s zero-fill accepted for Polaris pointer "
+                    "0x%" PRIx64 " bytes=%zu\n",
+                    real_name,
+                    (uint64_t)dstDevice,
+                    N);
+            return CUDA_SUCCESS;
+        }
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
                 "(dst=0x%" PRIx64 " value=%u bytes=%zu)\n",
@@ -2316,7 +2419,7 @@ cudaError_t cudaMalloc(void **devPtr, size_t size)
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (g_manage_allocations) {
-        selected = devPtr && should_manage_allocation_size(size);
+        selected = devPtr && should_manage_allocation(size);
         stats_note_alloc_call(size, selected);
     }
 
@@ -2362,7 +2465,7 @@ cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags)
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (g_manage_allocations) {
-        selected = devPtr && should_manage_allocation_size(size);
+        selected = devPtr && should_manage_allocation(size);
         stats_note_alloc_call(size, selected);
     }
 
@@ -2443,7 +2546,7 @@ cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (g_manage_allocations) {
-        selected = devPtr && should_manage_allocation_size(size);
+        selected = devPtr && should_manage_allocation(size);
         stats_note_alloc_call(size, selected);
     }
 
@@ -3630,6 +3733,22 @@ static cudaError_t cuda_memset_impl(const char *real_name,
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
     if (is_managed_pointer_value(devPtr)) {
+        CUdeviceptr base = 0;
+        uint64_t length = 0;
+
+        if (find_allocation_range((CUdeviceptr)(uintptr_t)devPtr, &base, &length) &&
+            g_allow_zero_memset &&
+            value == 0 &&
+            (CUdeviceptr)(uintptr_t)devPtr == base &&
+            count <= length) {
+            fprintf(stderr,
+                    "[polaris-shim] %s zero-fill accepted for Polaris pointer "
+                    "%p bytes=%zu\n",
+                    real_name,
+                    devPtr,
+                    count);
+            return CUDA_SUCCESS;
+        }
         fprintf(stderr,
                 "[polaris-shim] %s involving Polaris pointer is not wired yet "
                 "(ptr=%p value=%d bytes=%zu)\n",

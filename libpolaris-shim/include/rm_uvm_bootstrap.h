@@ -18,6 +18,9 @@ struct polaris_shim_bootstrap {
     uint32_t h_device;
     uint32_t h_subdevice;
     uint32_t h_vaspace;
+    uint32_t observed_gpu_id;
+    uint64_t observed_rm_client_token;
+    uint64_t observed_va_space_token;
     uint64_t vaspace_base;
     uint64_t vaspace_size;
 };

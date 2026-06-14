@@ -8,12 +8,11 @@
 # 1. A real llama.cpp workload can run on the local POLARIS backend when the
 #    available llama.cpp binary exposes POLARIS0.
 # 2. The LD_PRELOAD shim can bootstrap RM/UVM, register a Polaris VA-space,
-#    route a real llama.cpp CUDA allocation through Polaris static RM backing,
-#    and then stop cleanly at the current unsupported host-copy surface.
+#    route real llama.cpp CUDA KV-cache allocations through Polaris static RM
+#    backing, service GPU replayable faults, and clean up before exit.
 #
-# Set POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1 to turn the shim probe into the
-# future M5 gate: the llama.cpp command must complete and uvm_hook_calls plus
-# uvm_handled must increase.
+# Set POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1 to require the shim probe to
+# complete and increase both uvm_hook_calls and uvm_handled.
 
 set -euo pipefail
 
@@ -139,7 +138,7 @@ base_args=(
     -n "${LLAMA_CPP_GEN_TOKENS:-4}"
     -r "${LLAMA_CPP_REPETITIONS:-1}"
     --no-warmup
-    -ngl "${LLAMA_CPP_GPU_LAYERS:-1}"
+    -ngl "${LLAMA_CPP_GPU_LAYERS:-999}"
     -fa 0
     -o json
 )
@@ -184,16 +183,19 @@ before_errors="$(stat_value uvm_errors)"
 note "running LD_PRELOAD shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 run_shim_probe() {
     env \
+        GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}" \
         POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
         POLARIS_SHIM_STATIC_RM_BACKEND=1 \
         POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
         POLARIS_SHIM_REPORT_STATS=1 \
+        POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}" \
+        POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}" \
         POLARIS_SHIM_TRANSIENT_GPU=1 \
         POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}" \
         POLARIS_SHIM_CUDA_ORDINAL="${POLARIS_SHIM_CUDA_ORDINAL:-0}" \
         POLARIS_SHIM_BLOCK_SIZE="${POLARIS_SHIM_BLOCK_SIZE:-0x200000}" \
         POLARIS_SHIM_MANAGED_LENGTH_CAP="${POLARIS_SHIM_MANAGED_LENGTH_CAP:-17179869184}" \
-        POLARIS_SHIM_MIN_MANAGED_ALLOC="${POLARIS_SHIM_MIN_MANAGED_ALLOC:-1048576}" \
+        POLARIS_SHIM_MIN_MANAGED_ALLOC="${POLARIS_SHIM_MIN_MANAGED_ALLOC:-1}" \
         POLARIS_SHIM_MAX_MANAGED_ALLOC="${POLARIS_SHIM_MAX_MANAGED_ALLOC:-0}" \
         LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}" \
         "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"

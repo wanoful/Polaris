@@ -49,6 +49,7 @@ struct UvmPolarisOps {
 
 const UVM_POLARIS_FAULT_NOT_MINE: c_int = 0;
 const UVM_POLARIS_FAULT_HANDLED: c_int = 1;
+const UVM_POLARIS_FAULT_RETRY: c_int = 2;
 const UVM_POLARIS_FAULT_ERROR: c_int = -1;
 const POLARIS_MAX_FAST_VASPACES: usize = 16;
 const POLARIS_MAX_FAST_STATIC_BLOCKS: usize = 16;
@@ -96,6 +97,15 @@ static POLARIS_UVM_FAULT_FAST_MISSES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_HANDLED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_ERRORS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
+static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_LAST_VA_SPACE_TOKEN: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_LAST_GPU_VA_SPACE_PTR: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_LAST_FAULT_ADDRESS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_LAST_ACCESS_TYPE: Atomic<u32> = Atomic::new(0);
+static POLARIS_UVM_LAST_MAP_RET: Atomic<i32> = Atomic::new(0);
+static POLARIS_UVM_LAST_ENSURE_RET: Atomic<i32> = Atomic::new(0);
+static POLARIS_UVM_LAST_RESULT: Atomic<i32> = Atomic::new(0);
 
 struct PolarisFastStaticBlockSlot {
     gpu_id: Atomic<u32>,
@@ -254,6 +264,28 @@ fn polaris_fast_static_blocks_unregister_va_space(
     }
 }
 
+fn polaris_fast_static_block_unregister(
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    base: u64,
+) {
+    if va_space_token == 0 {
+        return;
+    }
+
+    for slot in &POLARIS_FAST_STATIC_BLOCKS {
+        if slot.va_space_token.load(Acquire) == va_space_token
+            && slot.gpu_id.load(Relaxed) == gpu_id
+            && slot.rm_client_token.load(Relaxed) == rm_client_token
+            && slot.base.load(Relaxed) == base
+        {
+            slot.clear();
+            return;
+        }
+    }
+}
+
 fn polaris_fast_vaspace_clear_all() {
     for slot in &POLARIS_FAST_VASPACES {
         slot.clear();
@@ -275,6 +307,11 @@ unsafe extern "C" {
         h_client: u32,
         h_memory: u32,
     ) -> c_int;
+    fn uvm_polaris_ensure_external_range(
+        gpu_va_space_ptr: u64,
+        base: u64,
+        length: u64,
+    ) -> c_int;
     fn uvm_polaris_unmap_external_allocation(
         gpu_va_space_ptr: u64,
         base: u64,
@@ -288,23 +325,24 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
     va_space_token: u64,
     gpu_va_space_ptr: u64,
     fault_address: u64,
-    _access_type: u32,
+    access_type: u32,
 ) -> c_int {
     POLARIS_UVM_FAULT_HOOK_CALLS.fetch_add(1, Relaxed);
+    POLARIS_UVM_LAST_GPU_ID.store(gpu_id, Relaxed);
+    POLARIS_UVM_LAST_RM_CLIENT_TOKEN.store(rm_client_token, Relaxed);
+    POLARIS_UVM_LAST_VA_SPACE_TOKEN.store(va_space_token, Relaxed);
+    POLARIS_UVM_LAST_GPU_VA_SPACE_PTR.store(gpu_va_space_ptr, Relaxed);
+    POLARIS_UVM_LAST_FAULT_ADDRESS.store(fault_address, Relaxed);
+    POLARIS_UVM_LAST_ACCESS_TYPE.store(access_type, Relaxed);
 
     for slot in &POLARIS_FAST_VASPACES {
         let token = slot.va_space_token.load(Acquire);
-        if token == 0 || token != va_space_token {
+        if token == 0 {
             continue;
         }
         if slot.gpu_id.load(Relaxed) != gpu_id {
             continue;
         }
-        let slot_client = slot.rm_client_token.load(Relaxed);
-        if slot_client != 0 && slot_client != rm_client_token {
-            continue;
-        }
-
         let base = slot.managed_base.load(Relaxed);
         let length = slot.managed_length.load(Relaxed);
         let end = base.saturating_add(length);
@@ -316,17 +354,12 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
 
         for block in &POLARIS_FAST_STATIC_BLOCKS {
             let block_token = block.va_space_token.load(Acquire);
-            if block_token == 0 || block_token != va_space_token {
+            if block_token == 0 {
                 continue;
             }
             if block.gpu_id.load(Relaxed) != gpu_id {
                 continue;
             }
-            let block_client = block.rm_client_token.load(Relaxed);
-            if block_client != 0 && block_client != rm_client_token {
-                continue;
-            }
-
             let block_base = block.base.load(Relaxed);
             let block_length = block.length.load(Relaxed);
             let block_end = block_base.saturating_add(block_length);
@@ -345,28 +378,46 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                     block.h_memory.load(Relaxed),
                 )
             };
+            POLARIS_UVM_LAST_MAP_RET.store(ret, Relaxed);
             if ret == 0 {
                 block.last_gpu_va_space_ptr.store(gpu_va_space_ptr, Release);
                 polaris_note_block_mapping_fault(
                     gpu_id,
-                    rm_client_token,
-                    va_space_token,
                     fault_address,
                     gpu_va_space_ptr,
                 );
                 POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
                 return UVM_POLARIS_FAULT_HANDLED;
             }
 
+            if ret == bindings::EFAULT as c_int {
+                let range_ret = unsafe {
+                    uvm_polaris_ensure_external_range(
+                        gpu_va_space_ptr,
+                        block_base,
+                        block_length,
+                    )
+                };
+                POLARIS_UVM_LAST_ENSURE_RET.store(range_ret, Relaxed);
+                if range_ret == 0 {
+                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_RETRY, Relaxed);
+                    return UVM_POLARIS_FAULT_RETRY;
+                }
+            }
+
             POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
+            POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
             return UVM_POLARIS_FAULT_ERROR;
         }
 
         POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
+        POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
         return UVM_POLARIS_FAULT_NOT_MINE;
     }
 
     POLARIS_UVM_FAULT_FAST_MISSES.fetch_add(1, Relaxed);
+    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
     UVM_POLARIS_FAULT_NOT_MINE
 }
 
@@ -413,12 +464,10 @@ fn polaris_uvm_unmap_external_allocation(
 
 fn polaris_note_block_mapping_fault(
     gpu_id: u32,
-    rm_client_token: u64,
-    va_space_token: u64,
     fault_address: u64,
     gpu_va_space_ptr: u64,
 ) {
-    if va_space_token == 0 || gpu_va_space_ptr == 0 {
+    if gpu_va_space_ptr == 0 {
         return;
     }
 
@@ -429,8 +478,6 @@ fn polaris_note_block_mapping_fault(
 
     for mapping in inner.block_mappings.iter_mut() {
         if mapping.gpu_id == gpu_id
-            && mapping.va_space_token == va_space_token
-            && mapping.rm_client_token == rm_client_token
             && fault_address >= mapping.base
             && fault_address < mapping.base.saturating_add(mapping.length)
         {
@@ -447,6 +494,48 @@ struct PolarisMappingUnmap {
     gpu_va_space_ptr: u64,
     base: u64,
     length: u64,
+}
+
+struct PolarisStaticBlockKey {
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    base: u64,
+}
+
+fn polaris_forget_static_blocks_for_block(inner: &mut PolarisInner, block_id: u64) -> Result<()> {
+    let mut to_forget: KVec<PolarisStaticBlockKey> = KVec::new();
+
+    for mapping in &inner.block_mappings {
+        if mapping.block_id == block_id {
+            to_forget.push(
+                PolarisStaticBlockKey {
+                    gpu_id: mapping.gpu_id,
+                    rm_client_token: mapping.rm_client_token,
+                    va_space_token: mapping.va_space_token,
+                    base: mapping.base,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+    }
+
+    for key in &to_forget {
+        inner.static_blocks.retain(|b| {
+            !(b.gpu_id == key.gpu_id
+                && b.rm_client_token == key.rm_client_token
+                && b.va_space_token == key.va_space_token
+                && b.base == key.base)
+        });
+        polaris_fast_static_block_unregister(
+            key.gpu_id,
+            key.rm_client_token,
+            key.va_space_token,
+            key.base,
+        );
+    }
+
+    Ok(())
 }
 
 fn polaris_snapshot_block_mappings(inner: &PolarisInner, block_id: u64) -> Result<KVec<PolarisMappingUnmap>> {
@@ -1119,6 +1208,15 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_unserviceable = POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.load(Relaxed);
     let uvm_handled = POLARIS_UVM_FAULT_HANDLED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
+    let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
+    let uvm_last_client = POLARIS_UVM_LAST_RM_CLIENT_TOKEN.load(Relaxed);
+    let uvm_last_token = POLARIS_UVM_LAST_VA_SPACE_TOKEN.load(Relaxed);
+    let uvm_last_gpu_va_space = POLARIS_UVM_LAST_GPU_VA_SPACE_PTR.load(Relaxed);
+    let uvm_last_fault = POLARIS_UVM_LAST_FAULT_ADDRESS.load(Relaxed);
+    let uvm_last_access = POLARIS_UVM_LAST_ACCESS_TYPE.load(Relaxed);
+    let uvm_last_map_ret = POLARIS_UVM_LAST_MAP_RET.load(Relaxed);
+    let uvm_last_ensure_ret = POLARIS_UVM_LAST_ENSURE_RET.load(Relaxed);
+    let uvm_last_result = POLARIS_UVM_LAST_RESULT.load(Relaxed);
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -1163,6 +1261,15 @@ uvm_fast_miss:  {uvm_fast_misses}
 uvm_no_pte:     {uvm_unserviceable}
 uvm_handled:    {uvm_handled}
 uvm_errors:     {uvm_errors}
+uvm_last_gpu:   {uvm_last_gpu}
+uvm_last_client:0x{uvm_last_client:x}
+uvm_last_token: 0x{uvm_last_token:x}
+uvm_last_va:    0x{uvm_last_gpu_va_space:x}
+uvm_last_fault: 0x{uvm_last_fault:x}
+uvm_last_access:{uvm_last_access}
+uvm_last_map_ret:{uvm_last_map_ret}
+uvm_last_ensure_ret:{uvm_last_ensure_ret}
+uvm_last_result:{uvm_last_result}
 ",
                 sessions = sessions,
                 blocks = blocks,
@@ -1197,6 +1304,15 @@ uvm_errors:     {uvm_errors}
                 uvm_unserviceable = uvm_unserviceable,
                 uvm_handled = uvm_handled,
                 uvm_errors = uvm_errors,
+                uvm_last_gpu = uvm_last_gpu,
+                uvm_last_client = uvm_last_client,
+                uvm_last_token = uvm_last_token,
+                uvm_last_gpu_va_space = uvm_last_gpu_va_space,
+                uvm_last_fault = uvm_last_fault,
+                uvm_last_access = uvm_last_access,
+                uvm_last_map_ret = uvm_last_map_ret,
+                uvm_last_ensure_ret = uvm_last_ensure_ret,
+                uvm_last_result = uvm_last_result,
             ),
         );
         w.pos
@@ -1913,6 +2029,12 @@ impl PolarisDevice {
             }
         }
 
+        for tf in &to_free {
+            if tf.refcount <= 1 && (queue_full || tf.phys_handle == 0 || inner.daemon_attached == 0) {
+                polaris_forget_static_blocks_for_block(inner, tf.block_id)?;
+            }
+        }
+
         // Remove session entry. FreePending blocks stay in the table for
         // the daemon to complete; non-FreePending blocks for this session
         // are removed.
@@ -2325,6 +2447,7 @@ impl PolarisDevice {
                     && m.base.saturating_add(m.length) > release_start)
             });
         } else {
+            polaris_forget_static_blocks_for_block(inner, block_id)?;
             let _ = inner.blocks.remove(idx);
             inner.block_mappings.retain(|m| m.block_id != block_id);
         }
@@ -2623,6 +2746,7 @@ impl PolarisDevice {
             }
 
             if should_remove {
+                polaris_forget_static_blocks_for_block(inner, bid_to_clean)?;
                 let _ = inner.blocks.remove(block_idx);
                 inner.block_mappings.retain(|m| m.block_id != bid_to_clean);
                 if let Some(session) = inner.sessions.iter_mut().find(|s| s.session_id == sid_to_clean) {

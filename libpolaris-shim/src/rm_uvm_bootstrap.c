@@ -28,6 +28,11 @@
 #include "class/cl2080.h"
 #include "class/cl90f1.h"
 #include "uvm_linux_ioctl.h"
+#include "uvm_test_ioctl.h"
+
+#ifndef UVM_FAULT_ACCESS_TYPE_WRITE
+#define UVM_FAULT_ACCESS_TYPE_WRITE 2
+#endif
 
 static int nv_status_ok(NV_STATUS status)
 {
@@ -245,6 +250,7 @@ static int setup_uvm(NvProcessorUuid *gpu_uuid,
     UVM_MM_INITIALIZE_PARAMS mm_init = {0};
     UVM_REGISTER_GPU_PARAMS reg_gpu = {0};
     UVM_REGISTER_GPU_VASPACE_PARAMS reg_va = {0};
+    UVM_TEST_POLARIS_DISPATCH_FAULT_PARAMS fault = {0};
 
     state->uvm_fd = open("/dev/nvidia-uvm", O_RDWR | O_CLOEXEC);
     if (state->uvm_fd < 0) {
@@ -322,6 +328,30 @@ static int setup_uvm(NvProcessorUuid *gpu_uuid,
                 "[polaris-shim] UVM_REGISTER_GPU_VASPACE rmStatus=0x%x\n",
                 reg_va.rmStatus);
         return -EIO;
+    }
+
+    fault.gpu_uuid = *gpu_uuid;
+    fault.fault_address = state->vaspace_base;
+    fault.access_type = UVM_FAULT_ACCESS_TYPE_WRITE;
+    if (ioctl(state->uvm_fd, UVM_TEST_POLARIS_DISPATCH_FAULT, &fault) == 0 &&
+        nv_status_ok(fault.rmStatus)) {
+        state->observed_gpu_id = fault.observed_gpu_id;
+        state->observed_rm_client_token = fault.observed_rm_client_token;
+        state->observed_va_space_token = fault.observed_va_space_token;
+        fprintf(stderr,
+                "[polaris-shim] UVM dispatch key gpu=%u client=0x%" PRIx64
+                " token=0x%" PRIx64 " dry_result=%d\n",
+                state->observed_gpu_id,
+                state->observed_rm_client_token,
+                state->observed_va_space_token,
+                fault.polaris_status);
+    } else {
+        int e = errno;
+        fprintf(stderr,
+                "[polaris-shim] UVM dispatch key probe unavailable "
+                "(errno=%d rmStatus=0x%x); using bootstrap RM handles\n",
+                e,
+                fault.rmStatus);
     }
 
     return 0;

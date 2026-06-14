@@ -282,6 +282,31 @@ int polaris_shim_register_block_mapping(uint64_t block_id,
     return 0;
 }
 
+int polaris_shim_unmap_block_mappings(uint64_t block_id,
+                                      uint32_t *unmapped_count_out)
+{
+    int fd = polaris_shim_device_fd();
+    if (fd < 0)
+        return -ENODEV;
+
+    struct polaris_unmap_block_mappings_arg arg = {
+        .block_id = block_id,
+    };
+
+    if (ioctl(fd, POLARIS_UNMAP_BLOCK_MAPPINGS, &arg) != 0) {
+        int e = errno;
+        fprintf(stderr,
+                "[polaris-shim] POLARIS_UNMAP_BLOCK_MAPPINGS block=%llu failed: %s\n",
+                (unsigned long long)block_id,
+                strerror(e));
+        return -e;
+    }
+
+    if (unmapped_count_out)
+        *unmapped_count_out = arg.unmapped_count;
+    return 0;
+}
+
 int polaris_shim_unregister_vaspace(uint32_t gpu_id,
                                     uint64_t rm_client_token,
                                     uint64_t va_space_token)

@@ -101,4 +101,7 @@ int polaris_shim_register_block_mapping(uint64_t block_id,
                                         uint64_t base,
                                         uint64_t length);
 
+int polaris_shim_unmap_block_mappings(uint64_t block_id,
+                                      uint32_t *unmapped_count_out);
+
 #endif /* POLARIS_SHIM_DEVICE_H */
