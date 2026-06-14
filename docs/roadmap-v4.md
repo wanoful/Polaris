@@ -573,6 +573,12 @@ Still to do on the Polaris side for M1/M2:
   `cuMemcpyHtoD_v2` after successful RM allocation and public UVM mapping, then
   the isolated child terminated with `SIGSEGV`, so the current implementation
   should not rely on ordinary CUDA copy APIs for RM-backed external VA.
+- RM CPU-map visibility probe wired: the same M2 harness has
+  `--rm-cpu-map-probe`, which calls `NV_ESC_RM_MAP_MEMORY` for the harness RM
+  vidmem object and then touches the returned CPU address in an isolated child.
+  Local validation on 2026-06-14 showed the RM map ioctl returned a CPU address,
+  but touching it terminated the child with `SIGSEGV`, so a simple daemon-side
+  `memcpy` path is also not viable for this backing shape.
 - RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
   block before tearing down observed UVM mappings, and rejects RM-backed
   bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real

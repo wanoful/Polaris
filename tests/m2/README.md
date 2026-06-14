@@ -152,6 +152,18 @@ current CUDA primary context and the child terminated with `SIGSEGV`. Treat that
 as evidence against using ordinary daemon-side CUDA copy APIs for the production
 RM-backed spill/reload path.
 
+The sibling RM CPU-map probe checks whether daemon-owned vidmem can be copied by
+mapping the RM object into the daemon CPU address space:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-cpu-map-probe
+```
+
+Local result on 2026-06-14: `NV_ESC_RM_MAP_MEMORY` returned a CPU address for
+the vidmem object, but the isolated child terminated with `SIGSEGV` as soon as
+it touched that mapping. Treat that as evidence against a simple daemon-side
+`memcpy` spill/reload path for these RM vidmem objects.
+
 ## Synthetic Fault Dispatch
 
 This leaves the external range unmapped, probes UVM for the exact dispatch key,

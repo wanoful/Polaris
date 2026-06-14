@@ -278,6 +278,31 @@ struct uvm_test_polaris_dispatch_fault_params {
     NV_STATUS rmStatus;
 };
 
+struct nv_os33_parameters {
+    NvHandle h_client;
+    NvHandle h_device;
+    NvHandle h_memory;
+    NvU64 offset;
+    NvU64 length;
+    NvP64 p_linear_address;
+    NvU32 status;
+    NvU32 flags;
+};
+
+struct nv_os34_parameters {
+    NvHandle h_client;
+    NvHandle h_device;
+    NvHandle h_memory;
+    NvP64 p_linear_address;
+    NvU32 status;
+    NvU32 flags;
+};
+
+struct nv_os33_parameters_with_fd {
+    struct nv_os33_parameters params;
+    int fd;
+};
+
 struct m2_state {
     int ctl_fd;
     int gpu_fd;
@@ -812,6 +837,162 @@ static int run_cuda_copy_probe_isolated(int ordinal, uint64_t base)
     return 0;
 }
 
+static int rm_map_memory_cpu(struct m2_state *s, uint64_t length, void **mapped_out)
+{
+    struct nv_os33_parameters_with_fd map = {
+        .params = {
+            .h_client = s->h_client,
+            .h_device = s->h_device,
+            .h_memory = s->h_memory,
+            .offset = 0,
+            .length = length,
+            .p_linear_address = 0,
+            .flags = 0,
+        },
+        .fd = s->gpu_fd,
+    };
+
+    if (nv_ioctl_checked(s->ctl_fd,
+                         NV_ESC_RM_MAP_MEMORY,
+                         &map,
+                         sizeof(map),
+                         "RM_MAP_MEMORY CPU") != 0)
+        return -1;
+    if (map.params.status != NV_OK) {
+        fprintf(stderr, "RM_MAP_MEMORY CPU status=0x%x\n", map.params.status);
+        return -1;
+    }
+    if (map.params.p_linear_address == 0) {
+        fprintf(stderr, "RM_MAP_MEMORY CPU returned null address\n");
+        return -1;
+    }
+
+    *mapped_out = (void *)(uintptr_t)map.params.p_linear_address;
+    printf("RM_MAP_MEMORY CPU mapped hMemory=0x%x len=0x%llx at %p\n",
+           s->h_memory,
+           (unsigned long long)length,
+           *mapped_out);
+    return 0;
+}
+
+static void rm_unmap_memory_cpu(struct m2_state *s, void *mapped)
+{
+    struct nv_os34_parameters unmap = {
+        .h_client = s->h_client,
+        .h_device = s->h_device,
+        .h_memory = s->h_memory,
+        .p_linear_address = (NvP64)(uintptr_t)mapped,
+        .flags = 0,
+    };
+
+    if (!mapped)
+        return;
+
+    if (nv_ioctl_checked(s->ctl_fd,
+                         NV_ESC_RM_UNMAP_MEMORY,
+                         &unmap,
+                         sizeof(unmap),
+                         "RM_UNMAP_MEMORY CPU") != 0)
+        return;
+    if (unmap.status != NV_OK)
+        fprintf(stderr, "RM_UNMAP_MEMORY CPU status=0x%x\n", unmap.status);
+}
+
+static int run_rm_cpu_map_probe_child(int ordinal)
+{
+    struct m2_state s = {
+        .ctl_fd = -1,
+        .gpu_fd = -1,
+        .uvm_fd = -1,
+        .uvm_mm_fd = -1,
+        .polaris_fd = -1,
+    };
+    unsigned char *mapped = NULL;
+    unsigned char *verify = NULL;
+    const size_t probe_len = 4096;
+    int ret = -1;
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (get_cuda_uuid(ordinal, &s.gpu_uuid) != 0)
+        goto out;
+    if (setup_rm(&s, ordinal) != 0)
+        goto out;
+
+    if (rm_map_memory_cpu(&s, POLARIS_BLOCK_SIZE, (void **)&mapped) != 0)
+        goto out;
+
+    verify = malloc(probe_len);
+    if (!verify) {
+        fprintf(stderr, "RM CPU map probe host verify allocation failed\n");
+        goto out;
+    }
+
+    for (size_t i = 0; i < probe_len; ++i)
+        mapped[i] = (unsigned char)((i * 29U + 3U) & 0xffU);
+    memcpy(verify, mapped, probe_len);
+    for (size_t i = 0; i < probe_len; ++i) {
+        unsigned char expected = (unsigned char)((i * 29U + 3U) & 0xffU);
+        if (verify[i] != expected) {
+            fprintf(stderr,
+                    "RM CPU map probe mismatch at byte %zu: got=0x%02x expected=0x%02x\n",
+                    i,
+                    verify[i],
+                    expected);
+            goto out;
+        }
+    }
+
+    puts("RM CPU map probe result: RM vidmem can be CPU-mapped and byte-round-tripped through the daemon process.");
+    ret = 0;
+
+out:
+    free(verify);
+    if (mapped)
+        rm_unmap_memory_cpu(&s, mapped);
+    cleanup(&s, 0, 0, 0);
+    return ret;
+}
+
+static int run_rm_cpu_map_probe_isolated(int ordinal)
+{
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid < 0) {
+        fprintf(stderr, "fork for RM CPU map probe failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        int ret = run_rm_cpu_map_probe_child(ordinal);
+        fflush(stdout);
+        fflush(stderr);
+        _exit(ret == 0 ? 0 : 1);
+    }
+
+    if (waitpid(pid, &status, 0) < 0) {
+        fprintf(stderr, "waitpid for RM CPU map probe failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    if (WIFSIGNALED(status)) {
+        int sig = WTERMSIG(status);
+        printf("RM CPU map probe result: child terminated by signal %d (%s) while touching the RM CPU mapping.\n",
+               sig,
+               strsignal(sig));
+        return 0;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "RM CPU map probe child exited inconclusively: status=0x%x\n", status);
+        return -1;
+    }
+
+    return 0;
+}
+
 static int dispatch_test_fault(struct m2_state *s, uint64_t fault_address)
 {
     struct uvm_test_polaris_dispatch_fault_params fault = {
@@ -1305,6 +1486,7 @@ int main(int argc, char **argv)
     bool deferred_complete_fault = false;
     bool spill_validation = false;
     bool cuda_copy_probe = false;
+    bool rm_cpu_map_probe = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -1360,6 +1542,10 @@ int main(int argc, char **argv)
             cuda_copy_probe = true;
             continue;
         }
+        if (strcmp(argv[i], "--rm-cpu-map-probe") == 0) {
+            rm_cpu_map_probe = true;
+            continue;
+        }
 
         switch (positional++) {
             case 0:
@@ -1373,10 +1559,15 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
+    }
+
+    if (rm_cpu_map_probe) {
+        rc = run_rm_cpu_map_probe_isolated(ordinal) == 0 ? 0 : 1;
+        goto out_no_cleanup;
     }
 
     if (cuda_copy_probe) {
