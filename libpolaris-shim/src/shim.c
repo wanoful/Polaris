@@ -49,6 +49,7 @@
 static pthread_once_t g_announce_once = PTHREAD_ONCE_INIT;
 static pthread_once_t g_bootstrap_once = PTHREAD_ONCE_INIT;
 static uint32_t g_registered_gpu_id;
+static uint32_t g_registered_cuda_ordinal;
 static uint64_t g_registered_rm_client_token;
 static uint64_t g_registered_va_space_token;
 static uint64_t g_managed_base;
@@ -63,6 +64,7 @@ static int g_manage_allocations;
 static int g_allocator_ready;
 static int g_create_external_ranges;
 static int g_bootstrap_rm_uvm;
+static int g_static_rm_backend;
 static int g_strict_managed_alloc;
 static int g_report_stats;
 static int g_runtime_selected_device = -1;
@@ -80,6 +82,8 @@ struct polaris_shim_allocation {
     uint32_t token_count;
     uint64_t block_id;
     uint64_t external_base;
+    uint32_t static_h_memory;
+    uint64_t static_size;
     struct polaris_shim_allocation *next;
 };
 
@@ -305,6 +309,74 @@ static void stats_note_fallback_free_result(int success)
     pthread_mutex_unlock(&g_alloc_lock);
 }
 
+static void release_static_rm_backend(uint32_t h_memory, uint64_t size)
+{
+    struct polaris_shim_rm_allocation allocation = {
+        .h_memory = h_memory,
+        .size = size,
+    };
+
+    if (h_memory == 0)
+        return;
+
+    polaris_shim_rm_free_device_memory(&g_bootstrap_state, &allocation);
+}
+
+static int allocate_static_rm_backend(uint64_t gpu_vaddr,
+                                      uint64_t rounded,
+                                      uint32_t *h_memory_out,
+                                      uint64_t *rm_size_out)
+{
+    struct polaris_shim_rm_allocation allocation = {0};
+    int ret;
+
+    if (!h_memory_out || !rm_size_out)
+        return -EINVAL;
+    *h_memory_out = 0;
+    *rm_size_out = 0;
+
+    if (!g_static_rm_backend)
+        return 0;
+
+    if (!g_bootstrap_rm_uvm || g_bootstrap_state.rm_control_fd < 0 ||
+        g_bootstrap_state.h_client == 0) {
+        fprintf(stderr,
+                "[polaris-shim] static RM backend requires "
+                "POLARIS_SHIM_BOOTSTRAP_RM_UVM=1\n");
+        return -EINVAL;
+    }
+
+    ret = polaris_shim_rm_alloc_device_memory(&g_bootstrap_state,
+                                              rounded,
+                                              &allocation);
+    if (ret != 0)
+        return ret;
+
+    ret = polaris_shim_register_static_block(g_registered_gpu_id,
+                                             g_registered_rm_client_token,
+                                             g_registered_va_space_token,
+                                             gpu_vaddr,
+                                             rounded,
+                                             0,
+                                             g_bootstrap_state.rm_control_fd,
+                                             g_bootstrap_state.h_client,
+                                             allocation.h_memory);
+    if (ret != 0) {
+        polaris_shim_rm_free_device_memory(&g_bootstrap_state, &allocation);
+        return ret;
+    }
+
+    *h_memory_out = allocation.h_memory;
+    *rm_size_out = allocation.size;
+    fprintf(stderr,
+            "[polaris-shim] static RM backend block va=0x%" PRIx64
+            " len=0x%" PRIx64 " hMemory=0x%x\n",
+            gpu_vaddr,
+            rounded,
+            allocation.h_memory);
+    return 0;
+}
+
 static void *resolve_next_symbol(const char *name)
 {
     void *symbol = dlsym(RTLD_NEXT, name);
@@ -420,6 +492,7 @@ static void unregister_vaspace_at_exit(void)
             if (ret == 0 && uvm_ret != 0)
                 ret = uvm_ret;
         }
+        release_static_rm_backend(list->static_h_memory, list->static_size);
         fprintf(stderr,
                 "[polaris-shim] exit cleanup ptr=0x%" PRIx64
                 " block=%" PRIu64 " ret=%d\n",
@@ -576,6 +649,17 @@ static void bootstrap_vaspace(void)
         g_manage_allocations = 1;
     g_strict_managed_alloc = env_enabled("POLARIS_SHIM_STRICT_MANAGED_ALLOC");
     g_report_stats = env_enabled("POLARIS_SHIM_REPORT_STATS");
+    g_static_rm_backend = env_enabled("POLARIS_SHIM_STATIC_RM_BACKEND");
+    if (g_static_rm_backend) {
+        if (!g_bootstrap_rm_uvm) {
+            fprintf(stderr,
+                    "[polaris-shim] POLARIS_SHIM_STATIC_RM_BACKEND requires "
+                    "POLARIS_SHIM_BOOTSTRAP_RM_UVM=1; disabling static backend\n");
+            g_static_rm_backend = 0;
+        } else {
+            g_create_external_ranges = 1;
+        }
+    }
 
     if (g_manage_allocations) {
         (void)parse_u64_env("POLARIS_SHIM_BLOCK_SIZE", &block_size);
@@ -639,6 +723,7 @@ static void bootstrap_vaspace(void)
 
     if (polaris_shim_register_vaspace(gpu_id, rm_client_token, token, base, length) == 0) {
         g_registered_gpu_id = gpu_id;
+        g_registered_cuda_ordinal = cuda_ordinal;
         g_registered_rm_client_token = rm_client_token;
         g_registered_va_space_token = token;
         g_managed_base = base;
@@ -739,7 +824,7 @@ static int get_managed_pointer_attribute(void *data, int attribute, CUdeviceptr 
             *(unsigned int *)data = 0;
             return 0;
         case CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL:
-            *(int *)data = (int)g_registered_gpu_id;
+            *(int *)data = (int)g_registered_cuda_ordinal;
             return 0;
         case CU_POINTER_ATTRIBUTE_RANGE_START_ADDR:
             *(CUdeviceptr *)data = base;
@@ -772,7 +857,7 @@ static int get_managed_runtime_pointer_attributes(
     (void)length;
     memset(attrs, 0, sizeof(*attrs));
     attrs->type = CUDA_MEMORY_TYPE_DEVICE;
-    attrs->device = (int)g_registered_gpu_id;
+    attrs->device = (int)g_registered_cuda_ordinal;
     attrs->devicePointer = (void *)(uintptr_t)raw;
     attrs->hostPointer = NULL;
     return 0;
@@ -883,6 +968,8 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
     uint64_t block_id = 0;
     uint64_t gpu_vaddr = 0;
     uint64_t rounded;
+    uint32_t static_h_memory = 0;
+    uint64_t static_size = 0;
     uint32_t token_start;
     uint32_t token_count;
     int ret;
@@ -928,6 +1015,20 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
         }
     }
 
+    ret = allocate_static_rm_backend(gpu_vaddr,
+                                     rounded,
+                                     &static_h_memory,
+                                     &static_size);
+    if (ret != 0) {
+        if (g_create_external_ranges)
+            (void)polaris_shim_uvm_free_external_range(gpu_vaddr);
+        (void)polaris_shim_block_release(g_session_id, token_start, token_count);
+        pthread_mutex_lock(&g_alloc_lock);
+        return_token_span_locked(token_start, token_count);
+        pthread_mutex_unlock(&g_alloc_lock);
+        return ret;
+    }
+
     ret = polaris_shim_register_block_mapping(block_id,
                                               g_registered_gpu_id,
                                               g_registered_rm_client_token,
@@ -935,6 +1036,7 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
                                               gpu_vaddr,
                                               rounded);
     if (ret != 0) {
+        release_static_rm_backend(static_h_memory, static_size);
         if (g_create_external_ranges)
             (void)polaris_shim_uvm_free_external_range(gpu_vaddr);
         (void)polaris_shim_block_release(g_session_id, token_start, token_count);
@@ -946,6 +1048,7 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
 
     alloc = calloc(1, sizeof(*alloc));
     if (!alloc) {
+        release_static_rm_backend(static_h_memory, static_size);
         if (g_create_external_ranges)
             (void)polaris_shim_uvm_free_external_range(gpu_vaddr);
         (void)polaris_shim_block_release(g_session_id, token_start, token_count);
@@ -960,6 +1063,8 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
     alloc->token_count = token_count;
     alloc->block_id = block_id;
     alloc->external_base = g_create_external_ranges ? gpu_vaddr : 0;
+    alloc->static_h_memory = static_h_memory;
+    alloc->static_size = static_size;
 
     pthread_mutex_lock(&g_alloc_lock);
     alloc->next = g_allocations;
@@ -992,6 +1097,8 @@ static int polaris_free_managed(CUdeviceptr ptr)
     uint32_t token_count;
     uint64_t block_id;
     uint64_t external_base;
+    uint32_t static_h_memory;
+    uint64_t static_size;
     size_t requested_size;
     uint64_t rounded_size;
     int ret;
@@ -1006,6 +1113,8 @@ static int polaris_free_managed(CUdeviceptr ptr)
     token_count = alloc->token_count;
     block_id = alloc->block_id;
     external_base = alloc->external_base;
+    static_h_memory = alloc->static_h_memory;
+    static_size = alloc->static_size;
     requested_size = alloc->requested_size;
     rounded_size = (uint64_t)token_count * g_block_size;
     pthread_mutex_unlock(&g_alloc_lock);
@@ -1018,6 +1127,8 @@ static int polaris_free_managed(CUdeviceptr ptr)
         if (ret == 0 && uvm_ret != 0)
             ret = uvm_ret;
     }
+    if (ret == 0)
+        release_static_rm_backend(static_h_memory, static_size);
     if (ret == 0) {
         pthread_mutex_lock(&g_alloc_lock);
         alloc = find_allocation(ptr, &link);

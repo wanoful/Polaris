@@ -118,6 +118,50 @@ This smoke does not launch kernels, does not map raw CUDA VMM memory, and does
 not dereference Polaris GPU pointers. The launch checks verify symbol coverage
 without invoking CUDA launch entry points.
 
+## M5 Integration Regression
+
+The repository includes a root/GPU integration test for the current llama.cpp
+state. It intentionally separates the part that passes today from the strict
+future fault-path gate:
+
+- if the local llama.cpp binary exposes `POLARIS0`, a real `llama-bench`
+  workload runs on that backend and must complete;
+- the LD_PRELOAD shim probe runs an unmodified CUDA `llama-bench` workload,
+  bootstraps RM/UVM, registers a Polaris VA-space, routes at least one real
+  llama allocation through Polaris, creates a UVM external range, allocates an
+  RM vidmem object, and registers it with `POLARIS_REGISTER_STATIC_BLOCK`;
+- today the shim probe is expected to stop cleanly at the guarded CUDA
+  host-copy surface, because llama.cpp immediately uploads model tensors with
+  `cudaMemcpyAsync` into the first intercepted allocation before any GPU
+  replayable fault reaches Polaris.
+
+Run it from this repository after loading the patched NVIDIA UVM module and
+`polaris.ko`:
+
+```sh
+make -C libpolaris-shim all tests
+sudo -E make llama-e2e \
+  LLAMA_CPP_DIR=/home/wano/workspace/llama.cpp \
+  LLAMA_CPP_MODEL=/home/wano/workspace/models/SmolLM2-135M-Instruct-F16.gguf
+```
+
+If `LLAMA_CPP_MODEL` is omitted, the script tries the local SmolLM2 model and
+then llama.cpp's tiny stories model. The default binary is `llama-bench` from
+`build-polaris/tools`, then the usual `build*/bin`/`tools` fallbacks. Override
+with `LLAMA_CPP_BIN=/path/to/binary`.
+
+`POLARIS_SHIM_STATIC_RM_BACKEND=1` is a test backend, not the final production
+spill/reload design. It proves the shim can allocate and register RM-backed
+external ranges for real llama.cpp allocations, but it does not make CUDA
+runtime host copies into Polaris external VA safe.
+
+Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require the future strict
+M5 behavior: the shimmed `llama-bench` command must complete and
+`/sys/kernel/polaris/stats` must show both `uvm_hook_calls` and `uvm_handled`
+increase. That mode is expected to fail until the host/device copy path is
+wired or the allocator policy selects only llama.cpp buffers that are not
+initialized through CUDA copy/fill APIs.
+
 ## Workload Run Shape
 
 Build llama.cpp with CUDA enabled using its normal upstream options. Then run

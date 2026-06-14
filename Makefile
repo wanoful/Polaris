@@ -8,32 +8,20 @@
 #
 # Examples:
 #   make KDIR=/path/to/kernel          # specify kernel tree
-#   make kernel NVIDIA_KO_DIR=/home/wano/workspace/open-gpu-kernel-modules
+#   make kernel NVIDIA_KO_DIR=third_party/open-gpu-kernel-modules
 #   make kernel CC=clang               # build kernel module with clang
 #   make setup-pacman-rustc            # one-time setup on Arch
 
 KDIR          ?= /lib/modules/$(shell uname -r)/build
 CC            ?= cc
 DEFAULT_NVIDIA_KO_DIR := $(abspath $(CURDIR)/third_party/open-gpu-kernel-modules)
-SIBLING_NVIDIA_KO_DIR := $(abspath $(CURDIR)/../open-gpu-kernel-modules)
 
-ifeq ($(origin NVIDIA_KO_DIR),undefined)
-    NVIDIA_KO_DIR := $(DEFAULT_NVIDIA_KO_DIR)
-    NVIDIA_KO_DIR_FROM_DEFAULT := 1
-else
-    NVIDIA_KO_DIR_FROM_DEFAULT := 0
-endif
+NVIDIA_KO_DIR ?= $(DEFAULT_NVIDIA_KO_DIR)
 
 ifneq (,$(wildcard $(NVIDIA_KO_DIR)/kernel-open/Module.symvers))
     POLARIS_EXTRA_SYMBOLS ?= $(abspath $(NVIDIA_KO_DIR)/kernel-open/Module.symvers)
 else ifneq (,$(wildcard $(NVIDIA_KO_DIR)/Module.symvers))
     POLARIS_EXTRA_SYMBOLS ?= $(abspath $(NVIDIA_KO_DIR)/Module.symvers)
-else ifeq ($(NVIDIA_KO_DIR_FROM_DEFAULT),1)
-    ifneq (,$(wildcard $(SIBLING_NVIDIA_KO_DIR)/kernel-open/Module.symvers))
-        POLARIS_EXTRA_SYMBOLS ?= $(abspath $(SIBLING_NVIDIA_KO_DIR)/kernel-open/Module.symvers)
-    else ifneq (,$(wildcard $(SIBLING_NVIDIA_KO_DIR)/Module.symvers))
-        POLARIS_EXTRA_SYMBOLS ?= $(abspath $(SIBLING_NVIDIA_KO_DIR)/Module.symvers)
-    endif
 endif
 
 # --- auto-detect pacman rustc for kernel builds (Arch Linux) ------------------
@@ -53,7 +41,7 @@ endif
 # Fallback: search PATH
 POLARIS_RUSTC ?= $(shell command -v rustc 2>/dev/null || echo rustc)
 
-.PHONY: all kernel userspace clean help rust-analyzer rust-toolchain setup-pacman-rustc
+.PHONY: all kernel userspace clean help rust-analyzer rust-toolchain setup-pacman-rustc llama-e2e
 
 help:
 	@echo "POLARIS Build System"
@@ -61,6 +49,7 @@ help:
 	@echo "Targets:"
 	@echo "  make kernel              Build the kernel module (polaris.ko)"
 	@echo "  make userspace           Build all Rust userspace programs"
+	@echo "  make llama-e2e           Run the root/GPU llama.cpp integration regression"
 	@echo "  make all                 Build everything"
 	@echo "  make clean               Clean all build artifacts"
 	@echo "  make setup-pacman-rustc  Download pacman rustc locally (Arch Linux)"
@@ -70,6 +59,7 @@ help:
 	@echo "Variables:"
 	@echo "  KDIR=<path>              Kernel source/build tree"
 	@echo "  NVIDIA_KO_DIR=<path>     Patched open-gpu-kernel-modules tree for UVM symbols"
+	@echo "                            (default: third_party/open-gpu-kernel-modules)"
 	@echo "  POLARIS_RUSTC=<path>     rustc for kernel builds (auto-detected)"
 	@echo "  CC=<compiler>            C compiler (default: cc)"
 
@@ -80,6 +70,10 @@ kernel:
 
 userspace:
 	cargo build --release
+
+llama-e2e:
+	$(MAKE) -C libpolaris-shim all tests NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" bash tests/llama_cpp/run_llama_shim_e2e.sh
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel clean 2>/dev/null || true

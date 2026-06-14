@@ -54,8 +54,10 @@ that actually landed on the `polaris-v4` driver branch
   The shim must pass both handles to polaris.ko because RM object handles are
   scoped to an RM client.
 - Application transparency is downgraded from "no source changes ever" to:
-  llama.cpp's `cudaMalloc` KV path is transparent through the shim;
-  PyTorch / vLLM still require an allocator backend in M7 because their
+  llama.cpp allocator interception is the first target, but transparent
+  execution still requires either avoiding host copy/fill APIs on intercepted
+  buffers or implementing a real host/device copy path for Polaris external
+  VA. PyTorch / vLLM still require an allocator backend in M7 because their
   caching allocators bypass driver-API interception.
 
 ## Why this works where raw CUDA VMM did not
@@ -408,7 +410,6 @@ changes. The honest position:
 **Transparent through shim, no source changes**:
 - `cudaMalloc` / `cuMemAlloc_v2` / `cudaFree` paths
 - Direct kernel dereference (`kernel<<<...>>>(p)` then `p[i]`)
-- `cudaMemcpy` between Polaris pointers and host
 - Pointer arithmetic and sub-range arguments
 
 **Requires Polaris allocations to be registered as external ranges**:
@@ -417,6 +418,10 @@ changes. The honest position:
   VA. The shim's external-range registration is what makes this work.
 
 **Not transparent in v1**:
+- `cudaMemcpy` / `cudaMemset` involving Polaris pointers. The current shim
+  guards these calls with `cudaErrorNotSupported`; llama.cpp's first
+  intercepted CUDA model-buffer allocation currently hits this path during
+  tensor upload before any replayable GPU fault can reach Polaris.
 - `cuIpcGetMemHandle` and IPC-based sharing.
 - CUDA Graph capture of accesses that depend on faulting in KV pages.
 - PyTorch caching allocator ownership of KV memory — even though the shim can
@@ -424,8 +429,11 @@ changes. The honest position:
   needs an allocator backend to force PyTorch KV allocations through Polaris
   deliberately.
 
-The course / paper claim should be: **llama.cpp's KV cache path is
-transparent**; vLLM and PyTorch require an explicit backend.
+The course / paper claim should be: **the UVM hook/PTE bridge and shim
+allocator registration path are wired; fully transparent llama.cpp execution
+still needs the host-copy gap closed or a KV-only allocation selection that
+does not use CUDA host copy/fill APIs**. vLLM and PyTorch require an explicit
+backend.
 
 ## Non-Goals
 
@@ -477,7 +485,7 @@ Polaris-side status:
   client. The UVM hook now dispatches both user RM handles, and the builtin
   test ioctl reports both so concurrent harnesses do not cross-match.
 - `make kernel` now consumes the patched UVM `Module.symvers` from the
-  sibling `../open-gpu-kernel-modules` checkout when available.
+  `third_party/open-gpu-kernel-modules` submodule by default.
 
 Still to do on the Polaris side for M1/M2:
 
@@ -746,6 +754,32 @@ Still to do on the Polaris side for M1/M2:
   `cudaGraphKernelNodeGetParams`, `cudaGraphKernelNodeSetParams`). The
   harness exercises safe query/host-callback calls and otherwise validates
   symbol coverage without running kernels.
+- Real llama.cpp regression added:
+  `tests/llama_cpp/run_llama_shim_e2e.sh` / `make llama-e2e` defaults to
+  `/home/wano/workspace/llama.cpp` and runs two checks. First, if the local
+  llama.cpp binary exposes `POLARIS0`, it runs a real `llama-bench` workload
+  on that device. Second, it runs an unmodified CUDA `llama-bench` workload
+  under `LD_PRELOAD` and asserts that the shim bootstraps RM/UVM, registers a
+  Polaris VA-space, routes a real llama allocation through Polaris, creates a
+  UVM external range, and registers static RM backing. Today that shim probe
+  is expected to stop cleanly at the guarded host-copy surface instead of
+  segfaulting or silently falling back.
+- Static RM backend wired for integration testing only:
+  `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
+  allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
+  allocation, and registers them with `POLARIS_REGISTER_STATIC_BLOCK` so the
+  current polaris.ko hook has resident backing available once a replayable GPU
+  fault reaches the UVM bridge. It is not the daemon-backed production
+  spill/reload path, and it does not make CUDA runtime host copies into
+  Polaris external VA safe.
+- Strict shim fault-path gate is still pending:
+  set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` for the future requirement
+  that the shimmed `llama-bench` command completes and increments both
+  `uvm_hook_calls` and `uvm_handled`. Current testing on the local SmolLM2
+  run shows the first intercepted llama allocation is a CUDA model-buffer
+  allocation; llama.cpp immediately uploads tensors with `cudaMemcpyAsync`
+  into the returned Polaris pointer, and the shim correctly rejects that path
+  with `cudaErrorNotSupported` before any real GPU dereference occurs.
 - Run llama.cpp end-to-end against shim+polaris.ko+polarisd, with both the
   ordinary `cudaMalloc` KV path and the `cudaMallocManaged` path selected by
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. CUDA Graph mode may need to be disabled

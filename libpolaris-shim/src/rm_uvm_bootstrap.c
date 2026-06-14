@@ -23,6 +23,7 @@
 #include "nvos.h"
 #include "class/cl0000.h"
 #include "class/cl003e.h"
+#include "class/cl0040.h"
 #include "class/cl0080.h"
 #include "class/cl2080.h"
 #include "class/cl90f1.h"
@@ -402,4 +403,59 @@ void polaris_shim_bootstrap_cleanup(struct polaris_shim_bootstrap *state)
         close(state->rm_control_fd);
         state->rm_control_fd = -1;
     }
+}
+
+int polaris_shim_rm_alloc_device_memory(const struct polaris_shim_bootstrap *state,
+                                        uint64_t size,
+                                        struct polaris_shim_rm_allocation *out)
+{
+    NV_MEMORY_ALLOCATION_PARAMS memory_params = {0};
+    NvHandle h_memory = 0;
+    int ret;
+
+    if (!state || !out || state->rm_control_fd < 0 || state->h_client == 0 ||
+        state->h_device == 0 || size == 0) {
+        return -EINVAL;
+    }
+
+    memory_params.size = size;
+    memory_params.owner = state->h_client;
+    memory_params.type = NVOS32_TYPE_IMAGE;
+    memory_params.attr = (NVOS32_ATTR_LOCATION_VIDMEM << 25);
+
+    ret = rm_alloc(state->rm_control_fd,
+                   state->h_client,
+                   state->h_device,
+                   &h_memory,
+                   NV01_MEMORY_LOCAL_USER,
+                   &memory_params,
+                   sizeof(memory_params),
+                   "RM_ALLOC shim static memory");
+    if (ret != 0)
+        return ret;
+
+    out->h_memory = h_memory;
+    out->size = memory_params.size;
+    fprintf(stderr,
+            "[polaris-shim] RM device allocation hMemory=0x%x size=0x%" PRIx64
+            " limit=0x%" PRIx64 " offset=0x%" PRIx64 "\n",
+            h_memory,
+            memory_params.size,
+            memory_params.limit,
+            memory_params.offset);
+    return 0;
+}
+
+void polaris_shim_rm_free_device_memory(const struct polaris_shim_bootstrap *state,
+                                        struct polaris_shim_rm_allocation *allocation)
+{
+    if (!state || !allocation || allocation->h_memory == 0)
+        return;
+
+    rm_free_object(state->rm_control_fd,
+                   state->h_client,
+                   state->h_device,
+                   allocation->h_memory);
+    allocation->h_memory = 0;
+    allocation->size = 0;
 }

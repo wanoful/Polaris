@@ -22,9 +22,20 @@ struct polaris_shim_bootstrap {
     uint64_t vaspace_size;
 };
 
+struct polaris_shim_rm_allocation {
+    uint32_t h_memory;
+    uint64_t size;
+};
+
 int polaris_shim_bootstrap_rm_uvm(int cuda_ordinal,
                                   uint32_t gpu_id,
                                   struct polaris_shim_bootstrap *out);
 void polaris_shim_bootstrap_cleanup(struct polaris_shim_bootstrap *state);
+
+int polaris_shim_rm_alloc_device_memory(const struct polaris_shim_bootstrap *state,
+                                        uint64_t size,
+                                        struct polaris_shim_rm_allocation *out);
+void polaris_shim_rm_free_device_memory(const struct polaris_shim_bootstrap *state,
+                                        struct polaris_shim_rm_allocation *allocation);
 
 #endif /* POLARIS_SHIM_RM_UVM_BOOTSTRAP_H */
