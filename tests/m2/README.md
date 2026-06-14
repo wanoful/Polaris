@@ -164,6 +164,31 @@ the vidmem object, but the isolated child terminated with `SIGSEGV` as soon as
 it touched that mapping. Treat that as evidence against a simple daemon-side
 `memcpy` spill/reload path for these RM vidmem objects.
 
+## RM Physical Address Probe
+
+This is the next diagnostic for the same RM-backed spill/reload gap. It follows
+the completion-backed resident path, fault-maps a harness-owned RM vidmem
+allocation, then calls `POLARIS_PROBE_RM_PHYS`. The kernel asks UVM to duplicate
+the RM allocation and query RM for GPU-visible physical-address geometry:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-phys-probe
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris RM phys probe passed.
+```
+
+The probe prints page size, physical-address count, first/last physical address,
+and flags (`contiguous`, `sysmem`, `egm`, `fabricmem`). Passing this test means
+the RM allocation shape can expose the physical-address metadata a later
+UVM/kernel copy helper will need. It does not copy data, does not validate CE
+programming, and does not make RM-backed `POLARIS_SPILL_BLOCK` production-ready;
+the `EOPNOTSUPP` guards remain correct until a real RM-backed spill/reload
+round-trip validates byte integrity.
+
 ## Synthetic Fault Dispatch
 
 This leaves the external range unmapped, probes UVM for the exact dispatch key,

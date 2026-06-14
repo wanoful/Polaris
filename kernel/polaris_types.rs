@@ -89,6 +89,9 @@ pub const POLARIS_SPILL_BLOCK: u32 =
 pub const POLARIS_REGISTER_BLOCK_BACKING: u32 =
     kernel::ioctl::_IOW::<PolarisRegisterBlockBackingArg>(POLARIS_IOCTL_MAGIC, 0x17);
 
+pub const POLARIS_PROBE_RM_PHYS: u32 =
+    kernel::ioctl::_IOWR::<PolarisProbeRmPhysArg>(POLARIS_IOCTL_MAGIC, 0x18);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -350,3 +353,6 @@ unsafe impl kernel::transmute::AsBytes for PolarisUnmapBlockMappingsArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisSpillBlockArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisSpillBlockArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisProbeRmPhysArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisProbeRmPhysArg {}

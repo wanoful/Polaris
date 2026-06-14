@@ -186,6 +186,18 @@ struct polaris_spill_block_arg {
     uint64_t _reserved[3];
 };
 
+struct polaris_probe_rm_phys_arg {
+    uint64_t block_id;
+    uint64_t offset;
+    uint64_t length;
+    uint64_t page_size;
+    uint64_t phys_addr_count;
+    uint64_t first_phys_addr;
+    uint64_t last_phys_addr;
+    uint64_t flags;
+    uint64_t _reserved[4];
+};
+
 enum {
     POLARIS_DECISION_OP_ALLOC = 0,
     POLARIS_DECISION_OP_FREE = 1,
@@ -251,9 +263,15 @@ struct polaris_complete_operation_arg {
 #define POLARIS_UNMAP_BLOCK_MAPPINGS _IOWR(POLARIS_IOCTL_MAGIC, 0x15, struct polaris_unmap_block_mappings_arg)
 #define POLARIS_SPILL_BLOCK _IOWR(POLARIS_IOCTL_MAGIC, 0x16, struct polaris_spill_block_arg)
 #define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
+#define POLARIS_PROBE_RM_PHYS _IOWR(POLARIS_IOCTL_MAGIC, 0x18, struct polaris_probe_rm_phys_arg)
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
 #define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)
+
+#define POLARIS_RM_PHYS_FLAG_CONTIGUOUS (1ULL << 0)
+#define POLARIS_RM_PHYS_FLAG_SYSMEM (1ULL << 1)
+#define POLARIS_RM_PHYS_FLAG_EGM (1ULL << 2)
+#define POLARIS_RM_PHYS_FLAG_FABRICMEM (1ULL << 3)
 
 #define NV_IOCTL(cmd, type) _IOWR(NV_IOCTL_MAGIC, (cmd), type)
 #define UVM_TEST_IOCTL_BASE(i) UVM_IOCTL_BASE(200 + (i))
@@ -1260,6 +1278,71 @@ static int unmap_block_mappings(struct m2_state *s,
     return 0;
 }
 
+static int probe_rm_phys(struct m2_state *s, uint64_t block_id)
+{
+    struct polaris_probe_rm_phys_arg probe = {
+        .block_id = block_id,
+        .offset = 0,
+        .length = POLARIS_BLOCK_SIZE,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_PROBE_RM_PHYS,
+                              &probe,
+                              "POLARIS_PROBE_RM_PHYS") != 0)
+        return -1;
+
+    printf("POLARIS RM phys probe: block=%llu offset=0x%llx len=0x%llx page=0x%llx count=%llu first=0x%llx last=0x%llx flags=0x%llx [%s%s%s%s]\n",
+           (unsigned long long)probe.block_id,
+           (unsigned long long)probe.offset,
+           (unsigned long long)probe.length,
+           (unsigned long long)probe.page_size,
+           (unsigned long long)probe.phys_addr_count,
+           (unsigned long long)probe.first_phys_addr,
+           (unsigned long long)probe.last_phys_addr,
+           (unsigned long long)probe.flags,
+           (probe.flags & POLARIS_RM_PHYS_FLAG_CONTIGUOUS) ? "contiguous" : "noncontiguous",
+           (probe.flags & POLARIS_RM_PHYS_FLAG_SYSMEM) ? "|sysmem" : "|vidmem",
+           (probe.flags & POLARIS_RM_PHYS_FLAG_EGM) ? "|egm" : "",
+           (probe.flags & POLARIS_RM_PHYS_FLAG_FABRICMEM) ? "|fabricmem" : "");
+
+    if (probe.length != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_PHYS returned len=0x%llx, expected 0x%llx\n",
+                (unsigned long long)probe.length,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        return -1;
+    }
+    if (probe.page_size == 0 || probe.phys_addr_count == 0) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_PHYS returned empty geometry: page=0x%llx count=%llu\n",
+                (unsigned long long)probe.page_size,
+                (unsigned long long)probe.phys_addr_count);
+        return -1;
+    }
+    if ((probe.offset % probe.page_size) != 0 || (probe.length % probe.page_size) != 0) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_PHYS returned unaligned range: offset=0x%llx len=0x%llx page=0x%llx\n",
+                (unsigned long long)probe.offset,
+                (unsigned long long)probe.length,
+                (unsigned long long)probe.page_size);
+        return -1;
+    }
+    if (probe.phys_addr_count != probe.length / probe.page_size) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_PHYS count=%llu, expected %llu for len/page geometry\n",
+                (unsigned long long)probe.phys_addr_count,
+                (unsigned long long)(probe.length / probe.page_size));
+        return -1;
+    }
+    if (probe.flags & POLARIS_RM_PHYS_FLAG_SYSMEM) {
+        fprintf(stderr,
+                "POLARIS_PROBE_RM_PHYS warning: RM reported sysmem for the diagnostic allocation; this does not prove the vidmem copy path\n");
+    }
+
+    return 0;
+}
+
 static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_id)
 {
     struct polaris_spill_block_arg spill = {
@@ -1487,6 +1570,7 @@ int main(int argc, char **argv)
     bool spill_validation = false;
     bool cuda_copy_probe = false;
     bool rm_cpu_map_probe = false;
+    bool rm_phys_probe = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -1520,6 +1604,13 @@ int main(int argc, char **argv)
             dispatch_fault = true;
             block_unmap_refault = true;
             logical_backed_refault = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--rm-phys-probe") == 0) {
+            dispatch_fault = true;
+            block_unmap_refault = true;
+            complete_backed_refault = true;
+            rm_phys_probe = true;
             continue;
         }
         if (strcmp(argv[i], "--complete-backed-refault") == 0) {
@@ -1559,7 +1650,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -1683,6 +1774,10 @@ int main(int argc, char **argv)
             if (dispatch_test_fault(&s, base) != 0)
                 goto out;
         }
+        if (rm_phys_probe) {
+            if (probe_rm_phys(&s, block_id) != 0)
+                goto out;
+        }
         if (block_unmap_refault) {
             uint32_t unmapped_count = 0;
             if (unmap_block_mappings(&s, block_id, &unmapped_count) != 0)
@@ -1708,7 +1803,9 @@ int main(int argc, char **argv)
         }
     }
 
-    if (deferred_complete_fault)
+    if (rm_phys_probe)
+        puts("M3 Polaris RM phys probe passed.");
+    else if (deferred_complete_fault)
         puts("M3 Polaris deferred completion fault test passed.");
     else if (complete_backed_refault)
         puts("M3 Polaris completion-backed block refault test passed.");

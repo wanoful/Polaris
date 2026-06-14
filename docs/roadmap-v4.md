@@ -579,6 +579,14 @@ Still to do on the Polaris side for M1/M2:
   Local validation on 2026-06-14 showed the RM map ioctl returned a CPU address,
   but touching it terminated the child with `SIGSEGV`, so a simple daemon-side
   `memcpy` path is also not viable for this backing shape.
+- RM physical-address visibility probe wired: UVM now exports the diagnostic
+  `uvm_polaris_probe_external_allocation`, polaris.ko exposes
+  `POLARIS_PROBE_RM_PHYS`, and the M2 harness's `--rm-phys-probe` mode
+  fault-maps a logical RM-backed block, asks UVM/RM for page size plus
+  GPU-visible physical addresses, and then verifies the same block still
+  unmaps/refaults through the bridge. This proves only that the backing shape
+  can expose geometry a later UVM/kernel copy helper needs; it does **not** copy
+  bytes, validate CE programming, or remove the RM-backed spill/reload guard.
 - RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
   block before tearing down observed UVM mappings, and rejects RM-backed
   bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real

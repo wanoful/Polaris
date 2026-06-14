@@ -316,6 +316,22 @@ unsafe extern "C" {
         base: u64,
         length: u64,
     ) -> c_int;
+    fn uvm_polaris_probe_external_allocation(
+        gpu_va_space_ptr: u64,
+        offset: u64,
+        length: u64,
+        rm_control_fd: i32,
+        h_client: u32,
+        h_memory: u32,
+        page_size_out: *mut u64,
+        phys_addr_count_out: *mut u64,
+        first_phys_addr_out: *mut u64,
+        last_phys_addr_out: *mut u64,
+        contiguous_out: *mut u64,
+        sysmem_out: *mut u64,
+        egm_out: *mut u64,
+        fabricmem_out: *mut u64,
+    ) -> c_int;
 }
 
 unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
@@ -642,6 +658,17 @@ struct PolarisMappingUnmap {
 }
 
 #[derive(Clone, Copy)]
+struct PolarisRmPhysProbeTarget {
+    block_id: u64,
+    gpu_id: u32,
+    gpu_va_space_ptr: u64,
+    rm_control_fd: i32,
+    h_client: u32,
+    h_memory: u32,
+    length: u64,
+}
+
+#[derive(Clone, Copy)]
 struct PolarisFaultMapping {
     base: u64,
     length: u64,
@@ -919,6 +946,46 @@ fn polaris_snapshot_block_mappings(inner: &PolarisInner, block_id: u64) -> Resul
         }
     }
     Ok(to_unmap)
+}
+
+fn polaris_snapshot_rm_phys_probe_target(
+    inner: &PolarisInner,
+    block_id: u64,
+) -> Result<PolarisRmPhysProbeTarget> {
+    let block = inner
+        .blocks
+        .iter()
+        .find(|b| b.block_id == block_id)
+        .ok_or(ENOENT)?;
+
+    if block.state != PolarisBlockState::Resident || !polaris_block_has_rm_backing(block) {
+        return Err(ENOENT);
+    }
+
+    let mut found_gpu_va_space_ptr = 0u64;
+    for mapping in &inner.block_mappings {
+        if mapping.block_id != block_id || mapping.last_gpu_va_space_ptr == 0 {
+            continue;
+        }
+        if found_gpu_va_space_ptr != 0 && found_gpu_va_space_ptr != mapping.last_gpu_va_space_ptr {
+            return Err(EBUSY);
+        }
+        found_gpu_va_space_ptr = mapping.last_gpu_va_space_ptr;
+    }
+
+    if found_gpu_va_space_ptr == 0 {
+        return Err(ENOENT);
+    }
+
+    Ok(PolarisRmPhysProbeTarget {
+        block_id: block.block_id,
+        gpu_id: block.home_gpu,
+        gpu_va_space_ptr: found_gpu_va_space_ptr,
+        rm_control_fd: block.rm_control_fd,
+        h_client: block.rm_h_client,
+        h_memory: block.rm_h_memory,
+        length: block.rm_backing_length,
+    })
 }
 
 fn polaris_unmap_observed_block_mappings(block_id: u64) -> Result<u32> {
@@ -1991,6 +2058,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_UNMAP_BLOCK_MAPPINGS => me.handle_unmap_block_mappings(user_ptr, size),
             POLARIS_SPILL_BLOCK => me.handle_spill_block(user_ptr, size),
             POLARIS_REGISTER_BLOCK_BACKING => me.handle_register_block_backing(user_ptr, size),
+            POLARIS_PROBE_RM_PHYS => me.handle_probe_rm_phys(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -3899,6 +3967,87 @@ impl PolarisDevice {
             arg.length,
             arg.h_client,
             arg.h_memory
+        );
+        Ok(0)
+    }
+
+    fn handle_probe_rm_phys(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let mut arg: PolarisProbeRmPhysArg = reader.read()?;
+
+        if arg.block_id == 0 {
+            return Err(EINVAL);
+        }
+
+        let target = {
+            let guard = POLARIS_STATE.lock();
+            let inner = guard.as_ref().ok_or(ENODEV)?;
+            polaris_snapshot_rm_phys_probe_target(inner, arg.block_id)?
+        };
+
+        let query_length = if arg.length == 0 {
+            target.length
+        } else {
+            arg.length
+        };
+        if query_length == 0 || arg.offset >= target.length || query_length > target.length.saturating_sub(arg.offset) {
+            return Err(EINVAL);
+        }
+
+        let mut page_size = 0u64;
+        let mut phys_addr_count = 0u64;
+        let mut first_phys_addr = 0u64;
+        let mut last_phys_addr = 0u64;
+        let mut contiguous = 0u64;
+        let mut sysmem = 0u64;
+        let mut egm = 0u64;
+        let mut fabricmem = 0u64;
+
+        let ret = unsafe {
+            uvm_polaris_probe_external_allocation(
+                target.gpu_va_space_ptr,
+                arg.offset,
+                query_length,
+                target.rm_control_fd,
+                target.h_client,
+                target.h_memory,
+                &mut page_size,
+                &mut phys_addr_count,
+                &mut first_phys_addr,
+                &mut last_phys_addr,
+                &mut contiguous,
+                &mut sysmem,
+                &mut egm,
+                &mut fabricmem,
+            )
+        };
+        if ret != 0 {
+            return Err(Error::from_errno(-ret));
+        }
+
+        arg.length = query_length;
+        arg.page_size = page_size;
+        arg.phys_addr_count = phys_addr_count;
+        arg.first_phys_addr = first_phys_addr;
+        arg.last_phys_addr = last_phys_addr;
+        arg.flags = (contiguous & 1)
+            | ((sysmem & 1) << 1)
+            | ((egm & 1) << 2)
+            | ((fabricmem & 1) << 3);
+
+        let mut writer = UserSlice::new(user_ptr, size).writer();
+        writer.write(&arg)?;
+
+        dev_info!(
+            self.dev,
+            "POLARIS: probed RM phys block={} gpu={} page=0x{:x} count={} first=0x{:x} last=0x{:x} flags=0x{:x}\n",
+            target.block_id,
+            target.gpu_id,
+            arg.page_size,
+            arg.phys_addr_count,
+            arg.first_phys_addr,
+            arg.last_phys_addr,
+            arg.flags
         );
         Ok(0)
     }

@@ -222,6 +222,20 @@ pub struct PolarisSpillBlockArg {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct PolarisProbeRmPhysArg {
+    pub block_id: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub page_size: u64,
+    pub phys_addr_count: u64,
+    pub first_phys_addr: u64,
+    pub last_phys_addr: u64,
+    pub flags: u64,
+    pub _reserved: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct PolarisSessionCreateArg {
     pub session_id: u64,
     pub home_gpu: u32,

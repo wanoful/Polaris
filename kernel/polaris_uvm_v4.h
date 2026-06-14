@@ -83,4 +83,24 @@ int uvm_polaris_unmap_external_allocation(u64 gpu_va_space_ptr,
 					  u64 base,
 					  u64 length);
 
+/*
+ * Exported by UVM (EXPORT_SYMBOL_GPL). Diagnostic helper for the RM-backed
+ * copy path: duplicate an RM allocation and query GPU-visible physical
+ * addresses through RM.
+ */
+int uvm_polaris_probe_external_allocation(u64 gpu_va_space_ptr,
+					  u64 offset,
+					  u64 length,
+					  s32 rm_control_fd,
+					  u32 h_client,
+					  u32 h_memory,
+					  u64 *page_size_out,
+					  u64 *phys_addr_count_out,
+					  u64 *first_phys_addr_out,
+					  u64 *last_phys_addr_out,
+					  u64 *contiguous_out,
+					  u64 *sysmem_out,
+					  u64 *egm_out,
+					  u64 *fabricmem_out);
+
 #endif /* POLARIS_UVM_V4_H */
