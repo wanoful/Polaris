@@ -225,11 +225,13 @@ M3 Polaris completion-backed block refault test passed.
 
 This closes the kernel ABI gap for daemon/runtime executors to publish
 UVM-bridge-mapable RM backing as part of normal decision completion. It still
-uses a harness-created RM object and does not yet implement daemon-owned RM
-allocation or host/device copy for production spill/reload. Until that copy
-path is implemented, `POLARIS_SPILL_BLOCK` intentionally supports only legacy
-CUDA VMM resident blocks with `gpu_phys_handle`; RM-backed bridge-resident
-blocks are rejected before any PTE teardown.
+uses a harness-created RM object. `polarisd` now has an opt-in
+`POLARISD_RM_BACKING=1` backend that exercises the same completion ABI with
+daemon-owned RM allocations and releases them on daemon `FREE` decisions, but
+host/device copy for production RM-backed spill/reload is still pending. Until
+that copy path is implemented, `POLARIS_SPILL_BLOCK` intentionally supports
+only legacy CUDA VMM resident blocks with `gpu_phys_handle`; RM-backed
+bridge-resident blocks are rejected before any PTE teardown.
 
 ## Deferred Completion Fault Diagnostic
 
@@ -313,6 +315,14 @@ Three FREE-lifetime tests cover live backing release without CUDA:
 that legacy resident backing, RM-backed resident backing with no legacy
 `gpu_phys_handle`, and RM-backed session teardown all reach the daemon
 `FREE` path.
+
+For real RM allocation/free smoke coverage, `polarisd` has an ignored unit test
+that opens `/dev/nvidiactl`, creates the daemon RM client/device/subdevice, and
+allocates/frees one `NV01_MEMORY_LOCAL_USER` object:
+
+```sh
+sudo cargo test -p polarisd rm::tests::rm_backend_allocates_and_frees_device_memory -- --ignored --nocapture
+```
 
 `child_block_release_decrements_inherited_shared_block` covers the COW-shared
 release case: after `SESSION_BRANCH`, the child releases an inherited block

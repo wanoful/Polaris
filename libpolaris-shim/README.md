@@ -130,9 +130,11 @@ rather than the shim-created RM/UVM VA-space; for that case polaris.ko services
 the fault only when a single unambiguous logical block mapping covers the
 faulting GPU/address. This remains test backing, not daemon-backed spill/reload.
 polaris.ko can also store RM backing from successful `POLARIS_COMPLETE_OPERATION`
-replies, which is the production-facing route for daemon/runtime executors; the
-shim's static RM backend intentionally stays on the explicit test-registration
-path until daemon-owned RM allocation is wired.
+replies, which is the production-facing route for daemon/runtime executors.
+`polarisd` can now publish daemon-owned RM allocations behind
+`POLARISD_RM_BACKING=1`, but that backend is currently limited to allocation
+and free ownership. Copy-backed RM spill/reload is still pending, so the shim's
+static RM backend intentionally remains the strict llama integration-test path.
 Set `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and/or
 `POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` to restrict which allocation sizes
 are routed through Polaris. Allocations outside that inclusive policy range
@@ -269,10 +271,12 @@ fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
 still uses the fixed managed window allocator model and the static RM
 integration-test backend. That backend now also registers logical-block RM
 backing, so the kernel can validate the non-static logical mapping path, but
-the RM object is still allocated by the shim. The local M5 regression validates
-llama.cpp's actual KV allocation and kernel-deref path for both runtime
-`cudaMalloc` and runtime `cudaMallocManaged`; daemon-backed spill/reload
-remains pending.
+the RM object is still allocated by the shim for that regression. The daemon can
+allocate/free RM-backed logical blocks with `POLARISD_RM_BACKING=1`, but
+daemon-backed RM spill/reload copies remain pending. The local M5 regression
+validates llama.cpp's actual KV allocation and kernel-deref path for both
+runtime `cudaMalloc` and runtime `cudaMallocManaged` through the static RM test
+backend.
 
 ## Why this is not a Cargo crate
 

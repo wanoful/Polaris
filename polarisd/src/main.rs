@@ -4,6 +4,7 @@ mod gpu;
 mod lifecycle;
 mod nvml;
 mod offload;
+mod rm;
 
 use gpu::GpuState;
 use libc::c_int;
@@ -54,7 +55,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get allocation granularity.
     let granule = cuda_vmm::get_allocation_granularity(info.index as i32)?;
-    eprintln!("polarisd: allocation granularity = {granule} bytes ({} MiB)", granule / (1024 * 1024));
+    eprintln!(
+        "polarisd: allocation granularity = {granule} bytes ({} MiB)",
+        granule / (1024 * 1024)
+    );
 
     // Reserve GPU virtual address space (configurable via POLARIS_VA_RESERVE_GIB).
     let vas_size = cuda_vmm::va_reserve_size();
@@ -81,15 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (cpu_pool_bytes, ptr)
         }
         Err(e) => {
-            eprintln!(
-                "polarisd: WARNING CPU pinned memory pool allocation failed: {e}"
-            );
-            eprintln!(
-                "polarisd:   GPU↔CPU offload will not be available."
-            );
-            eprintln!(
-                "polarisd:   Check available host memory and try reducing the pool size."
-            );
+            eprintln!("polarisd: WARNING CPU pinned memory pool allocation failed: {e}");
+            eprintln!("polarisd:   GPU↔CPU offload will not be available.");
+            eprintln!("polarisd:   Check available host memory and try reducing the pool size.");
             (0u64, 0u64)
         }
     };
@@ -163,6 +161,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("polarisd: [TEST] error injection mode enabled (POLARIS_TEST_ERROR={test_err})");
     }
 
+    let rm_backing_enabled = env_enabled("POLARISD_RM_BACKING");
+    let mut rm_backend = if rm_backing_enabled {
+        eprintln!(
+            "polarisd: daemon-owned RM backing enabled (POLARISD_RM_BACKING=1); RM-backed spill/reload copies remain unsupported"
+        );
+        Some(
+            rm::RmBackend::new(info.index as i32)
+                .map_err(|e| format!("RM backing initialization failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     // Reconcile state with the kernel module.
     lifecycle::reconcile();
 
@@ -171,7 +182,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enter the decision loop.
     eprintln!("polarisd: entering decision loop");
-    decision_loop(fd, &mut gpu_state, &mut cpu_pool, test_err)?;
+    decision_loop(
+        fd,
+        &mut gpu_state,
+        &mut cpu_pool,
+        rm_backend.as_mut(),
+        test_err,
+    )?;
 
     // Notify systemd that the daemon is stopping cleanly.
     lifecycle::notify_stopping();
@@ -183,6 +200,7 @@ fn decision_loop(
     fd: c_int,
     gpu: &mut GpuState,
     cpu_pool: &mut offload::CpuPool,
+    mut rm_backend: Option<&mut rm::RmBackend>,
     test_err: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut decision_arg = PolarisGetDecisionArg::default();
@@ -198,22 +216,31 @@ fn decision_loop(
                 eprintln!("polarisd: received {count} decision(s)");
                 for i in 0..count {
                     let dec = &decision_arg.decisions[i];
-                    let exec = decision::execute(fd, dec, gpu, cpu_pool, test_err);
+                    let exec = decision::execute(
+                        fd,
+                        dec,
+                        gpu,
+                        cpu_pool,
+                        rm_backend.as_deref_mut(),
+                        test_err,
+                    );
 
                     let complete = PolarisCompleteOperationArg {
                         decision_id: dec.decision_id,
                         generation: dec.generation,
                         result: exec.result,
+                        rm_control_fd: exec.rm_control_fd,
                         output_handle: exec.output_handle,
                         output_cpu_addr: exec.output_cpu_addr,
+                        rm_h_client: exec.rm_h_client,
+                        rm_h_memory: exec.rm_h_memory,
+                        rm_backing_length: exec.rm_backing_length,
                         ..Default::default()
                     };
 
-                    if let Err(e) = ioctl::ioctl_write(
-                        fd,
-                        ioctl::POLARIS_COMPLETE_OPERATION,
-                        &complete,
-                    ) {
+                    if let Err(e) =
+                        ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
+                    {
                         eprintln!(
                             "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
                             dec.decision_id
@@ -244,4 +271,16 @@ fn decision_loop(
     }
 
     Ok(())
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty()
+                && v != "0"
+                && !v.eq_ignore_ascii_case("false")
+                && !v.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
 }

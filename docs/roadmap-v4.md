@@ -551,6 +551,17 @@ Still to do on the Polaris side for M1/M2:
   refaults successfully. This closes the kernel ABI gap for daemon/runtime
   executors to publish UVM-bridge-mapable residency, but the executor still
   needs real daemon-owned RM allocation and host/device copy wiring.
+- Daemon-owned RM allocation/free slice wired: `polarisd` now has an opt-in
+  `POLARISD_RM_BACKING=1` backend that opens RM, creates a root client/device/
+  subdevice, allocates `NV01_MEMORY_LOCAL_USER` per `ALLOC` decision, and
+  returns the real daemon-owned `(rm_control_fd, h_client, h_memory, length)`
+  tuple through `POLARIS_COMPLETE_OPERATION`. `FREE` decisions release the
+  daemon-owned RM object by block id, so normal `BLOCK_RELEASE` /
+  `SESSION_DESTROY` cleanup now has a real RM owner on the daemon path. This
+  deliberately does **not** remove the RM-backed spill guard: RM-backed
+  device↔host copy for `OFFLOAD` / `RELOAD` / `COW_BREAK` remains pending, and
+  those operations return `EOPNOTSUPP` in the opt-in backend until the copy path
+  is implemented.
 - RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
   block before tearing down observed UVM mappings, and rejects RM-backed
   bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real
