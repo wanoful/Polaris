@@ -2465,7 +2465,8 @@ static int rm_cow_roundtrip(struct m2_state *s,
                             uint32_t gpu_id,
                             uint64_t rm_client_token,
                             uint64_t va_space_token,
-                            uint64_t parent_block_id)
+                            uint64_t parent_block_id,
+                            bool use_daemon_executor)
 {
     uint8_t *src = NULL;
     uint8_t *parent_dst = NULL;
@@ -2526,12 +2527,14 @@ static int rm_cow_roundtrip(struct m2_state *s,
         .child_h_memory = 0,
         .result = -1,
     };
-    int thread_ret = pthread_create(&cow_thread, NULL, rm_cow_executor, &cow_args);
-    if (thread_ret != 0) {
-        fprintf(stderr, "pthread_create COW executor failed: %s\n", strerror(thread_ret));
-        goto out;
+    if (!use_daemon_executor) {
+        int thread_ret = pthread_create(&cow_thread, NULL, rm_cow_executor, &cow_args);
+        if (thread_ret != 0) {
+            fprintf(stderr, "pthread_create COW executor failed: %s\n", strerror(thread_ret));
+            goto out;
+        }
+        cow_thread_started = true;
     }
-    cow_thread_started = true;
 
     struct polaris_block_reserve_arg reserve = {
         .session_id = child_session_id,
@@ -2556,29 +2559,50 @@ static int rm_cow_roundtrip(struct m2_state *s,
         goto out;
     }
 
-    if (pthread_join(cow_thread, NULL) != 0) {
+    if (use_daemon_executor) {
+        struct polaris_block_get_state_arg child_state = {0};
+        if (wait_for_block_state(s,
+                                 child_session_id,
+                                 s->polaris_block_token_start,
+                                 s->polaris_block_token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon RM COW completion",
+                                 &child_state) != 0)
+            goto out;
+        if (child_state.block_id != child_block_id || child_state.gpu_vaddr != child_vaddr) {
+            fprintf(stderr,
+                    "daemon COW state block=%llu vaddr=0x%llx, expected block=%llu vaddr=0x%llx\n",
+                    (unsigned long long)child_state.block_id,
+                    (unsigned long long)child_state.gpu_vaddr,
+                    (unsigned long long)child_block_id,
+                    (unsigned long long)child_vaddr);
+            goto out;
+        }
+    } else {
+        if (pthread_join(cow_thread, NULL) != 0) {
+            cow_thread_started = false;
+            fprintf(stderr, "pthread_join COW executor failed\n");
+            goto out;
+        }
         cow_thread_started = false;
-        fprintf(stderr, "pthread_join COW executor failed\n");
-        goto out;
+        if (cow_args.result != 0 || cow_args.child_h_memory == 0) {
+            fprintf(stderr,
+                    "COW executor result=%d hMemory=0x%x\n",
+                    cow_args.result,
+                    (unsigned int)cow_args.child_h_memory);
+            goto out;
+        }
+        if (cow_args.child_block_id != child_block_id || cow_args.child_vaddr != child_vaddr) {
+            fprintf(stderr,
+                    "COW executor completed block=%llu vaddr=0x%llx, expected block=%llu vaddr=0x%llx\n",
+                    (unsigned long long)cow_args.child_block_id,
+                    (unsigned long long)cow_args.child_vaddr,
+                    (unsigned long long)child_block_id,
+                    (unsigned long long)child_vaddr);
+            goto out;
+        }
+        child_h_memory = cow_args.child_h_memory;
     }
-    cow_thread_started = false;
-    if (cow_args.result != 0 || cow_args.child_h_memory == 0) {
-        fprintf(stderr,
-                "COW executor result=%d hMemory=0x%x\n",
-                cow_args.result,
-                (unsigned int)cow_args.child_h_memory);
-        goto out;
-    }
-    if (cow_args.child_block_id != child_block_id || cow_args.child_vaddr != child_vaddr) {
-        fprintf(stderr,
-                "COW executor completed block=%llu vaddr=0x%llx, expected block=%llu vaddr=0x%llx\n",
-                (unsigned long long)cow_args.child_block_id,
-                (unsigned long long)cow_args.child_vaddr,
-                (unsigned long long)child_block_id,
-                (unsigned long long)child_vaddr);
-        goto out;
-    }
-    child_h_memory = cow_args.child_h_memory;
 
     struct polaris_register_block_mapping_arg child_mapping = {
         .block_id = child_block_id,
@@ -2634,7 +2658,8 @@ static int rm_cow_roundtrip(struct m2_state *s,
         }
     }
 
-    printf("POLARIS RM COW roundtrip complete: parent_block=%llu child_block=%llu parent_hMemory=0x%x child_hMemory=0x%x bytes=0x%llx\n",
+    printf("POLARIS %sRM COW roundtrip complete: parent_block=%llu child_block=%llu parent_hMemory=0x%x child_hMemory=0x%x bytes=0x%llx\n",
+           use_daemon_executor ? "daemon " : "",
            (unsigned long long)parent_block_id,
            (unsigned long long)child_block_id,
            parent_h_memory,
@@ -2654,21 +2679,35 @@ out:
                                     POLARIS_SESSION_DESTROY,
                                     &destroy_child,
                                     "POLARIS_SESSION_DESTROY RM COW child");
+        if (use_daemon_executor) {
+            (void)wait_for_sysfs_stat_u64("pending_decs",
+                                          0,
+                                          "daemon-backed child COW FREE queue drain");
+        }
     }
     if (s->polaris_session_id != 0 && s->polaris_block_reserved) {
         struct polaris_block_release_arg release_parent = {
             .session_id = s->polaris_session_id,
             .token_start = s->polaris_block_token_start,
             .token_count = s->polaris_block_token_count,
-            .flags = POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING,
+            .flags = use_daemon_executor ? 0 : POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING,
         };
         (void)polaris_ioctl_checked(s->polaris_fd,
                                     POLARIS_BLOCK_RELEASE,
                                     &release_parent,
                                     "POLARIS_BLOCK_RELEASE RM COW parent");
+        if (use_daemon_executor) {
+            (void)wait_for_sysfs_stat_u64("blocks",
+                                          0,
+                                          "daemon-backed RM COW cleanup");
+            (void)wait_for_sysfs_stat_u64("pending_decs",
+                                          0,
+                                          "daemon-backed parent COW FREE queue drain");
+        }
         s->polaris_block_reserved = false;
     }
-    rm_free_object(s->ctl_fd, s->h_client, s->h_device, child_h_memory);
+    if (!use_daemon_executor)
+        rm_free_object(s->ctl_fd, s->h_client, s->h_device, child_h_memory);
     free(child_dst);
     free(parent_dst);
     free(src);
@@ -2890,6 +2929,7 @@ int main(int argc, char **argv)
     bool rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_roundtrip_mode = false;
     bool rm_cow_roundtrip_mode = false;
+    bool daemon_rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -2958,6 +2998,12 @@ int main(int argc, char **argv)
             daemon_rm_spill_reload_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-cow-roundtrip") == 0) {
+            dispatch_fault = true;
+            deferred_complete_fault = true;
+            daemon_rm_cow_roundtrip_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             complete_backed_refault = true;
@@ -3001,7 +3047,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -3019,9 +3065,12 @@ int main(int argc, char **argv)
 
     if (get_cuda_uuid(ordinal, &s.gpu_uuid) != 0)
         goto out;
-    if (setup_rm(&s, ordinal, !daemon_rm_spill_reload_roundtrip_mode) != 0)
+    if (setup_rm(&s,
+                 ordinal,
+                 !daemon_rm_spill_reload_roundtrip_mode &&
+                     !daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
-    uint64_t managed_length = rm_cow_roundtrip_mode
+    uint64_t managed_length = (rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
         ? (2 * POLARIS_MANAGED_SIZE)
         : POLARIS_MANAGED_SIZE;
     if (setup_uvm(&s, base, managed_length, !dispatch_fault) != 0)
@@ -3042,7 +3091,9 @@ int main(int argc, char **argv)
                       !logical_backed_refault && !complete_backed_refault && !deferred_complete_fault) != 0)
         goto out;
     if (complete_backed_refault ||
-        (deferred_complete_fault && !daemon_rm_spill_reload_roundtrip_mode)) {
+        (deferred_complete_fault &&
+         !daemon_rm_spill_reload_roundtrip_mode &&
+         !daemon_rm_cow_roundtrip_mode)) {
         exec_args.state = &s;
         exec_args.gpu_id = polaris_gpu_id;
         exec_args.expected_base = base;
@@ -3071,7 +3122,8 @@ int main(int argc, char **argv)
                                                    &block_id) != 0) {
             goto out;
         }
-        if (daemon_rm_spill_reload_roundtrip_mode)
+        if (daemon_rm_spill_reload_roundtrip_mode ||
+            daemon_rm_cow_roundtrip_mode)
             s.polaris_block_caller_owns_backing = false;
         if (complete_backed_refault) {
             if (pthread_join(completion_executor, NULL) != 0) {
@@ -3113,7 +3165,9 @@ int main(int argc, char **argv)
     if (dispatch_fault) {
         if (dispatch_test_fault(&s, base) != 0)
             goto out;
-        if (deferred_complete_fault && !daemon_rm_spill_reload_roundtrip_mode) {
+        if (deferred_complete_fault &&
+            !daemon_rm_spill_reload_roundtrip_mode &&
+            !daemon_rm_cow_roundtrip_mode) {
             if (pthread_join(completion_executor, NULL) != 0) {
                 completion_executor_started = false;
                 fprintf(stderr, "pthread_join completion executor failed\n");
@@ -3132,7 +3186,8 @@ int main(int argc, char **argv)
         if ((complete_backed_refault || deferred_complete_fault) &&
             !rm_spill_reload_roundtrip_mode &&
             !daemon_rm_spill_reload_roundtrip_mode &&
-            !rm_cow_roundtrip_mode) {
+            !rm_cow_roundtrip_mode &&
+            !daemon_rm_cow_roundtrip_mode) {
             if (dispatch_test_fault(&s, base) != 0)
                 goto out;
         }
@@ -3166,7 +3221,17 @@ int main(int argc, char **argv)
                                  polaris_gpu_id,
                                  polaris_rm_client_token,
                                  polaris_va_space_token,
-                                 block_id) != 0)
+                                 block_id,
+                                 false) != 0)
+                goto out;
+        }
+        if (daemon_rm_cow_roundtrip_mode) {
+            if (rm_cow_roundtrip(&s,
+                                 polaris_gpu_id,
+                                 polaris_rm_client_token,
+                                 polaris_va_space_token,
+                                 block_id,
+                                 true) != 0)
                 goto out;
         }
         if (block_unmap_refault) {
@@ -3196,6 +3261,8 @@ int main(int argc, char **argv)
 
     if (rm_phys_probe)
         puts("M3 Polaris RM phys probe passed.");
+    else if (daemon_rm_cow_roundtrip_mode)
+        puts("M4 Polaris daemon-backed RM COW roundtrip passed.");
     else if (rm_cow_roundtrip_mode)
         puts("M4 Polaris RM COW roundtrip passed.");
     else if (daemon_rm_spill_reload_roundtrip_mode)

@@ -615,8 +615,11 @@ Still to do on the Polaris side for M1/M2:
   daemon-owned destination RM backing, copying the staged bytes into it, and
   returning the destination RM tuple through `POLARIS_COMPLETE_OPERATION`. The
   M2 `--rm-cow-roundtrip` mode validates parent and child byte preservation for
-  the current `SESSION_BRANCH` + overwrite-reserve COW surface. Full
-  write-fault permission-split COW remains future M4 hardening.
+  the current `SESSION_BRANCH` + overwrite-reserve COW surface with a harness
+  executor, and `--daemon-rm-cow-roundtrip` validates the same byte preservation
+  with a real `polarisd` running `POLARISD_RM_BACKING=1` and daemon-owned
+  parent/child RM backing. Full write-fault permission-split COW remains future
+  M4 hardening.
 - Live-backing FREE lifetime slice wired: `BLOCK_RELEASE` and
   `SESSION_DESTROY` now queue daemon `FREE` decisions for resident legacy
   physical handles, RM-backed bridge-resident logical blocks, and CPU-offloaded
@@ -677,6 +680,16 @@ Still to do on the Polaris side for M1/M2:
   forces daemon `RELOAD`, refaults, and verifies cleanup drains daemon `FREE`.
   This closes the gap between the harness-owned RM byte roundtrip and the
   llama.cpp gate; broader multi-iteration stress remains M6 work.
+- Focused daemon-backed RM COW gate wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
+  real daemon-backed RM path, reserves a deferred parent block without static RM
+  registration or harness-owned logical backing, lets `polarisd` handle parent
+  `ALLOC`, writes deterministic parent bytes with `POLARIS_RM_COPY`, branches the
+  session, triggers overwrite-reserve `COW_BREAK`, lets `polarisd` publish fresh
+  daemon-owned child RM backing, fault-maps the child, verifies parent and child
+  bytes, and waits for daemon `FREE` cleanup to drain. This removes the remaining
+  harness-executor dependency from the RM-backed overwrite COW gate; permission-
+  based write-fault COW and broader stress remain M4/M6 work.
 - Kernel state-machine coverage added: `libpolaris` has ignored root-only
   `kernel_spill_state` tests that drive legacy
   `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through
@@ -716,8 +729,10 @@ Still to do on the Polaris side for M1/M2:
 - RM-backed overwrite COW data path wired for the same
   `SESSION_BRANCH` + overwrite-reserve surface: `polarisd` stages source RM
   backing through the pinned CPU pool, publishes fresh daemon-owned RM backing
-  for the child block, and the M2 `--rm-cow-roundtrip` diagnostic verifies both
-  parent and child bytes after the split. This does not yet implement
+  for the child block, the M2 `--rm-cow-roundtrip` diagnostic verifies both
+  parent and child bytes with a harness executor, and
+  `--daemon-rm-cow-roundtrip` verifies the same split with a real daemon-backed
+  parent allocation and daemon-executed `COW_BREAK`. This does not yet implement
   permission-based write-fault COW on already-mapped read-mostly pages.
 - Multi-worker cleanup slice wired: the same ignored test file registers two
   v4 worker VA-spaces for one logical block, registers one block mapping per

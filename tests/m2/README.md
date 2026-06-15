@@ -288,6 +288,36 @@ This is not permission-based write-fault COW for already mapped read-mostly
 pages; it covers the overwrite-reserve COW control surface currently wired in
 M4.
 
+## Daemon-Backed RM COW Roundtrip
+
+This validates the same RM-backed overwrite COW surface with a real
+long-running `polarisd` and daemon-owned RM backing. Unlike
+`--rm-cow-roundtrip`, this mode does not consume `GET_DECISION` or complete
+operations inside the harness, does not register static backing, and does not
+allocate harness-owned logical backing for the tested parent or child blocks.
+Start `polarisd` with daemon-owned RM backing first:
+
+```sh
+POLARISD_RM_BACKING=1 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip
+```
+
+The mode reserves a deferred logical parent block, triggers the first synthetic
+fault, waits for daemon-backed `ALLOC`, writes a deterministic parent pattern
+with `POLARIS_RM_COPY`, branches the session, reserves an overwrite block in the
+child, lets daemon `COW_BREAK` publish fresh child RM backing, fault-maps the
+child, verifies parent and child bytes, and waits for daemon `FREE` cleanup to
+drain.
+
+Expected success ends with:
+
+```text
+M4 Polaris daemon-backed RM COW roundtrip passed.
+```
+
+This is the focused M4 gate for daemon-backed RM COW. It still covers the
+overwrite-reserve control surface, not permission-based write-fault COW.
+
 ## Synthetic Fault Dispatch
 
 This leaves the external range unmapped, probes UVM for the exact dispatch key,
@@ -491,7 +521,9 @@ branching a session increments parent block refcounts, overwrite reserve on
 the child creates a private block, and the queued `COW_BREAK` decision carries
 the writer's destination VA. The test also checks that the child session's
 block table contains only the new private block after the split, so teardown
-does not accidentally release the parent's remaining block.
+does not accidentally release the parent's remaining block. Byte-integrity
+coverage lives in `--rm-cow-roundtrip`; the equivalent real-daemon gate is
+`--daemon-rm-cow-roundtrip`.
 
 It also covers the first multi-worker mapping cleanup slice without CUDA:
 two v4 worker VA-spaces register mappings for the same logical block, explicit
