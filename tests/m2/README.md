@@ -538,6 +538,35 @@ M6 Polaris daemon-backed RM spill/reload stress passed.
 This is still a focused single-block stress gate. Fragmentation, dynamic KV
 growth, and OOM pressure remain broader M6 work.
 
+## Daemon-Backed RM Multi-Block Stress
+
+This broadens the daemon-backed stress gate from one block to several deferred
+logical blocks in one Polaris session. It still uses the production-shaped
+daemon RM path: no static RM registration, no harness-owned logical backing, and
+no harness-side decision executor. Start `polarisd` with daemon-owned RM backing
+first:
+
+```sh
+POLARISD_RM_BACKING=1 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-multi-block-stress
+```
+
+The mode registers one UVM external range, reserves multiple deferred logical
+blocks, fault-materializes each block through daemon `ALLOC`, writes unique
+deterministic bytes into each daemon-owned RM backing, spills all blocks, waits
+for daemon `OFFLOAD`, reloads the blocks in reverse order, refaults them, and
+verifies byte integrity for every block after each cycle.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM multi-block stress passed.
+```
+
+This catches cross-block cleanup and queued decision ordering issues while
+remaining a focused gate. Fragmentation, dynamic KV growth, and OOM pressure
+remain broader M6 work.
+
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete
 legacy `ALLOC`, `OFFLOAD`, and `RELOAD` decisions, plus a real-`polarisd`

@@ -51,6 +51,8 @@
 #define POLARIS_BLOCK_SIZE (2ULL * 1024ULL * 1024ULL)
 #define POLARIS_MANAGED_SIZE (4ULL * 1024ULL * 1024ULL)
 #define POLARIS_DAEMON_RM_STRESS_ITERS 4U
+#define POLARIS_DAEMON_RM_MULTI_BLOCKS 3U
+#define POLARIS_DAEMON_RM_MULTI_ITERS 2U
 
 struct polaris_register_gpu_arg {
     uint32_t gpu_id;
@@ -447,10 +449,20 @@ struct rm_cow_args {
     int result;
 };
 
+struct daemon_rm_stress_block {
+    uint64_t block_id;
+    uint32_t token_start;
+    uint32_t token_count;
+    uint64_t vaddr;
+};
+
 static void cleanup(struct m2_state *s,
                     uint32_t gpu_id,
                     uint64_t rm_client_token,
                     uint64_t va_space_token);
+static int wait_for_sysfs_stat_u64(const char *name,
+                                   uint64_t expected,
+                                   const char *what);
 
 static int nv_ioctl_checked(int fd, unsigned int esc, void *arg, size_t size, const char *what)
 {
@@ -1326,6 +1338,133 @@ static int register_logical_block_mapping(struct m2_state *s,
            (unsigned long long)length,
            defer_fault ? "yes" : "no");
     return 0;
+}
+
+static int setup_multi_deferred_blocks(struct m2_state *s,
+                                       uint32_t gpu_id,
+                                       uint64_t rm_client_token,
+                                       uint64_t va_space_token,
+                                       uint64_t base,
+                                       uint64_t managed_length,
+                                       struct daemon_rm_stress_block *blocks,
+                                       uint32_t block_count,
+                                       uint64_t *session_id_out)
+{
+    struct polaris_register_va_range_arg range = {
+        .gpu_id = gpu_id,
+        .base = base,
+        .length = managed_length,
+        .block_size = POLARIS_BLOCK_SIZE,
+    };
+    struct polaris_session_create_arg session = {
+        .home_gpu = gpu_id,
+        .beam_width = 1,
+        .gpu_vas_bytes = managed_length,
+        .bytes_per_token = POLARIS_BLOCK_SIZE,
+        .priority = 5,
+    };
+
+    if (block_count == 0 || managed_length < (uint64_t)block_count * POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "invalid multi-block setup block_count=%u managed_length=0x%llx\n",
+                block_count,
+                (unsigned long long)managed_length);
+        return -1;
+    }
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_VA_RANGE,
+                              &range,
+                              "POLARIS_REGISTER_VA_RANGE multi") != 0)
+        return -1;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_SESSION_CREATE,
+                              &session,
+                              "POLARIS_SESSION_CREATE multi") != 0)
+        return -1;
+
+    s->polaris_session_id = session.session_id;
+    *session_id_out = session.session_id;
+
+    for (uint32_t i = 0; i < block_count; ++i) {
+        uint64_t expected_vaddr = base + ((uint64_t)i * POLARIS_BLOCK_SIZE);
+        struct polaris_block_reserve_arg reserve = {
+            .session_id = session.session_id,
+            .token_start = i,
+            .token_count = 1,
+            .phase = 2,
+            .flags = POLARIS_RESERVE_FLAG_DEFER_FAULT,
+        };
+
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_BLOCK_RESERVE,
+                                  &reserve,
+                                  "POLARIS_BLOCK_RESERVE multi deferred") != 0)
+            return -1;
+        if (reserve.block_id == 0 || reserve.gpu_vaddr != expected_vaddr) {
+            fprintf(stderr,
+                    "multi deferred reserve[%u] block=%llu vaddr=0x%llx expected_vaddr=0x%llx\n",
+                    i,
+                    (unsigned long long)reserve.block_id,
+                    (unsigned long long)reserve.gpu_vaddr,
+                    (unsigned long long)expected_vaddr);
+            return -1;
+        }
+
+        struct polaris_register_block_mapping_arg mapping = {
+            .block_id = reserve.block_id,
+            .gpu_id = gpu_id,
+            .rm_client_token = rm_client_token,
+            .va_space_token = va_space_token,
+            .base = reserve.gpu_vaddr,
+            .length = POLARIS_BLOCK_SIZE,
+        };
+
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_REGISTER_BLOCK_MAPPING,
+                                  &mapping,
+                                  "POLARIS_REGISTER_BLOCK_MAPPING multi") != 0)
+            return -1;
+
+        blocks[i].block_id = reserve.block_id;
+        blocks[i].token_start = reserve.token_start;
+        blocks[i].token_count = reserve.token_count;
+        blocks[i].vaddr = reserve.gpu_vaddr;
+
+        printf("POLARIS registered multi daemon block[%u]: block=%llu token=%u vaddr=0x%llx\n",
+               i,
+               (unsigned long long)blocks[i].block_id,
+               blocks[i].token_start,
+               (unsigned long long)blocks[i].vaddr);
+    }
+
+    return 0;
+}
+
+static void cleanup_multi_deferred_blocks(struct m2_state *s,
+                                          const struct daemon_rm_stress_block *blocks,
+                                          uint32_t block_count)
+{
+    if (s->polaris_session_id == 0 || block_count == 0)
+        return;
+
+    for (uint32_t i = 0; i < block_count; ++i) {
+        if (blocks[i].block_id == 0)
+            continue;
+
+        struct polaris_block_release_arg release = {
+            .session_id = s->polaris_session_id,
+            .token_start = blocks[i].token_start,
+            .token_count = blocks[i].token_count,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_BLOCK_RELEASE,
+                                    &release,
+                                    "POLARIS_BLOCK_RELEASE multi daemon");
+    }
+
+    (void)wait_for_sysfs_stat_u64("blocks", 0, "daemon-backed multi BLOCK_RELEASE cleanup");
+    (void)wait_for_sysfs_stat_u64("pending_decs", 0, "daemon-backed multi FREE queue drain");
 }
 
 static int get_block_state(struct m2_state *s,
@@ -2638,6 +2777,220 @@ out:
     return rc;
 }
 
+static int daemon_rm_multi_block_stress(struct m2_state *s,
+                                        uint64_t session_id,
+                                        const struct daemon_rm_stress_block *blocks,
+                                        uint32_t block_count,
+                                        uint32_t iterations)
+{
+    uint8_t *src = NULL;
+    uint8_t *dst = NULL;
+    const uint64_t seed = 0x4d554c5449524d31ULL;
+    int rc = -1;
+
+    if (block_count == 0) {
+        fprintf(stderr, "daemon multi-block stress requires at least one block\n");
+        return -1;
+    }
+    if (iterations == 0)
+        iterations = POLARIS_DAEMON_RM_MULTI_ITERS;
+
+    if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon multi src failed\n");
+        goto out;
+    }
+    if (posix_memalign((void **)&dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon multi dst failed\n");
+        goto out;
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+            goto out;
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 blocks[block_idx].token_start,
+                                 blocks[block_idx].token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon multi initial ALLOC",
+                                 NULL) != 0)
+            goto out;
+    }
+
+    for (uint32_t iter = 0; iter < iterations; ++iter) {
+        for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+            uint64_t block_seed = seed ^
+                ((uint64_t)(iter + 1) * 0x9e3779b97f4a7c15ULL) ^
+                ((uint64_t)(block_idx + 1) * 0xbf58476d1ce4e5b9ULL);
+
+            for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+                src[i] = rm_copy_roundtrip_pattern(block_seed, i);
+                dst[i] = 0;
+            }
+
+            struct polaris_rm_copy_arg write_initial = {
+                .block_id = blocks[block_idx].block_id,
+                .length = POLARIS_BLOCK_SIZE,
+                .user_cpu_addr = (uint64_t)(uintptr_t)src,
+                .direction = POLARIS_RM_COPY_FROM_CPU,
+            };
+            if (polaris_ioctl_checked(s->polaris_fd,
+                                      POLARIS_RM_COPY,
+                                      &write_initial,
+                                      "POLARIS_RM_COPY daemon multi FROM_CPU") != 0)
+                goto out;
+            if (write_initial.bytes_copied != POLARIS_BLOCK_SIZE) {
+                fprintf(stderr,
+                        "daemon multi write bytes=0x%llx expected=0x%llx iter=%u block=%u\n",
+                        (unsigned long long)write_initial.bytes_copied,
+                        (unsigned long long)POLARIS_BLOCK_SIZE,
+                        iter,
+                        block_idx);
+                goto out;
+            }
+        }
+
+        for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+            struct polaris_spill_block_arg spill = {
+                .block_id = blocks[block_idx].block_id,
+            };
+            if (polaris_ioctl_checked(s->polaris_fd,
+                                      POLARIS_SPILL_BLOCK,
+                                      &spill,
+                                      "POLARIS_SPILL_BLOCK daemon multi") != 0)
+                goto out;
+            if (spill.decision_id == 0) {
+                fprintf(stderr,
+                        "POLARIS_SPILL_BLOCK did not queue daemon OFFLOAD decision in multi iter=%u block=%u\n",
+                        iter,
+                        block_idx);
+                goto out;
+            }
+            printf("POLARIS daemon RM multi spill iter=%u block_index=%u block=%llu decision=%llu unmapped=%u\n",
+                   iter + 1,
+                   block_idx,
+                   (unsigned long long)blocks[block_idx].block_id,
+                   (unsigned long long)spill.decision_id,
+                   spill.unmapped_count);
+        }
+
+        for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+            if (wait_for_block_state(s,
+                                     session_id,
+                                     blocks[block_idx].token_start,
+                                     blocks[block_idx].token_count,
+                                     POLARIS_BLOCK_STATE_CPU_OFFLOADED,
+                                     "daemon multi OFFLOAD completion",
+                                     NULL) != 0)
+                goto out;
+        }
+
+        for (uint32_t reverse = block_count; reverse > 0; --reverse) {
+            uint32_t block_idx = reverse - 1;
+            struct polaris_block_reserve_arg reserve = {
+                .session_id = session_id,
+                .token_start = blocks[block_idx].token_start,
+                .token_count = blocks[block_idx].token_count,
+                .phase = 2,
+                .flags = POLARIS_RESERVE_FLAG_OVERWRITE,
+            };
+            if (polaris_ioctl_checked(s->polaris_fd,
+                                      POLARIS_BLOCK_RESERVE,
+                                      &reserve,
+                                      "POLARIS_BLOCK_RESERVE daemon multi reload") != 0)
+                goto out;
+            if (reserve.block_id != blocks[block_idx].block_id ||
+                reserve.gpu_vaddr != blocks[block_idx].vaddr) {
+                fprintf(stderr,
+                        "daemon multi reload reserve returned block=%llu vaddr=0x%llx; expected block=%llu vaddr=0x%llx iter=%u block=%u\n",
+                        (unsigned long long)reserve.block_id,
+                        (unsigned long long)reserve.gpu_vaddr,
+                        (unsigned long long)blocks[block_idx].block_id,
+                        (unsigned long long)blocks[block_idx].vaddr,
+                        iter,
+                        block_idx);
+                goto out;
+            }
+
+            if (wait_for_block_state(s,
+                                     session_id,
+                                     blocks[block_idx].token_start,
+                                     blocks[block_idx].token_count,
+                                     POLARIS_BLOCK_STATE_RESIDENT,
+                                     "daemon multi RELOAD completion",
+                                     NULL) != 0)
+                goto out;
+            if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+                goto out;
+        }
+
+        for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+            uint64_t block_seed = seed ^
+                ((uint64_t)(iter + 1) * 0x9e3779b97f4a7c15ULL) ^
+                ((uint64_t)(block_idx + 1) * 0xbf58476d1ce4e5b9ULL);
+
+            for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+                src[i] = rm_copy_roundtrip_pattern(block_seed, i);
+                dst[i] = 0;
+            }
+
+            struct polaris_rm_copy_arg read_back = {
+                .block_id = blocks[block_idx].block_id,
+                .length = POLARIS_BLOCK_SIZE,
+                .user_cpu_addr = (uint64_t)(uintptr_t)dst,
+                .direction = POLARIS_RM_COPY_TO_CPU,
+            };
+            if (polaris_ioctl_checked(s->polaris_fd,
+                                      POLARIS_RM_COPY,
+                                      &read_back,
+                                      "POLARIS_RM_COPY daemon multi TO_CPU") != 0)
+                goto out;
+            if (read_back.bytes_copied != POLARIS_BLOCK_SIZE) {
+                fprintf(stderr,
+                        "daemon multi read bytes=0x%llx expected=0x%llx iter=%u block=%u\n",
+                        (unsigned long long)read_back.bytes_copied,
+                        (unsigned long long)POLARIS_BLOCK_SIZE,
+                        iter,
+                        block_idx);
+                goto out;
+            }
+
+            for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+                if (dst[i] != src[i]) {
+                    fprintf(stderr,
+                            "daemon RM multi mismatch iter=%u block=%u at 0x%llx: expected=0x%x actual=0x%x\n",
+                            iter + 1,
+                            block_idx,
+                            (unsigned long long)i,
+                            src[i],
+                            dst[i]);
+                    goto out;
+                }
+            }
+        }
+
+        if (wait_for_sysfs_stat_u64("pending_decs",
+                                    0,
+                                    "daemon-backed multi decision drain") != 0)
+            goto out;
+        if (wait_for_sysfs_stat_u64("static_blocks",
+                                    0,
+                                    "daemon-backed multi static-block guard") != 0)
+            goto out;
+    }
+
+    printf("POLARIS daemon RM multi-block stress complete: blocks=%u iterations=%u bytes_per_block=0x%llx\n",
+           block_count,
+           iterations,
+           (unsigned long long)POLARIS_BLOCK_SIZE);
+    rc = 0;
+
+out:
+    free(dst);
+    free(src);
+    return rc;
+}
+
 static int rm_cow_roundtrip(struct m2_state *s,
                             uint32_t gpu_id,
                             uint64_t rm_client_token,
@@ -3106,9 +3459,12 @@ int main(int argc, char **argv)
     bool rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_stress_mode = false;
+    bool daemon_rm_multi_block_stress_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
+    struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_MULTI_BLOCKS] = {0};
+    bool daemon_multi_blocks_setup = false;
     struct m2_state s = {
         .ctl_fd = -1,
         .gpu_fd = -1,
@@ -3182,6 +3538,10 @@ int main(int argc, char **argv)
             daemon_rm_spill_reload_stress_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-multi-block-stress") == 0) {
+            daemon_rm_multi_block_stress_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--daemon-rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             deferred_complete_fault = true;
@@ -3231,7 +3591,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -3253,12 +3613,18 @@ int main(int argc, char **argv)
                  ordinal,
                  !daemon_rm_spill_reload_roundtrip_mode &&
                      !daemon_rm_spill_reload_stress_mode &&
+                     !daemon_rm_multi_block_stress_mode &&
                      !daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
-    uint64_t managed_length = (rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
-        ? (2 * POLARIS_MANAGED_SIZE)
-        : POLARIS_MANAGED_SIZE;
-    if (setup_uvm(&s, base, managed_length, !dispatch_fault) != 0)
+    uint64_t managed_length = daemon_rm_multi_block_stress_mode
+        ? ((uint64_t)POLARIS_DAEMON_RM_MULTI_BLOCKS * POLARIS_BLOCK_SIZE)
+        : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
+               ? (2 * POLARIS_MANAGED_SIZE)
+               : POLARIS_MANAGED_SIZE);
+    if (setup_uvm(&s,
+                  base,
+                  managed_length,
+                  !dispatch_fault && !daemon_rm_multi_block_stress_mode) != 0)
         goto out;
     polaris_va_space_token = s.h_vaspace;
     if (probe_uvm_dispatch_key(&s,
@@ -3273,8 +3639,33 @@ int main(int argc, char **argv)
                       polaris_va_space_token,
                       base,
                       managed_length,
-                      !logical_backed_refault && !complete_backed_refault && !deferred_complete_fault) != 0)
+                      !logical_backed_refault && !complete_backed_refault &&
+                          !deferred_complete_fault &&
+                          !daemon_rm_multi_block_stress_mode) != 0)
         goto out;
+    if (daemon_rm_multi_block_stress_mode) {
+        if (setup_multi_deferred_blocks(&s,
+                                        polaris_gpu_id,
+                                        polaris_rm_client_token,
+                                        polaris_va_space_token,
+                                        base,
+                                        managed_length,
+                                        daemon_multi_blocks,
+                                        POLARIS_DAEMON_RM_MULTI_BLOCKS,
+                                        &s.polaris_session_id) != 0)
+            goto out;
+        daemon_multi_blocks_setup = true;
+        if (daemon_rm_multi_block_stress(&s,
+                                         s.polaris_session_id,
+                                         daemon_multi_blocks,
+                                         POLARIS_DAEMON_RM_MULTI_BLOCKS,
+                                         POLARIS_DAEMON_RM_MULTI_ITERS) != 0)
+            goto out;
+        cleanup_multi_deferred_blocks(&s,
+                                      daemon_multi_blocks,
+                                      POLARIS_DAEMON_RM_MULTI_BLOCKS);
+        daemon_multi_blocks_setup = false;
+    }
     if (complete_backed_refault ||
         (deferred_complete_fault &&
          !daemon_rm_spill_reload_roundtrip_mode &&
@@ -3468,6 +3859,8 @@ int main(int argc, char **argv)
         puts("M3 Polaris daemon-backed RM spill/reload roundtrip passed.");
     else if (daemon_rm_spill_reload_stress_mode)
         puts("M6 Polaris daemon-backed RM spill/reload stress passed.");
+    else if (daemon_rm_multi_block_stress_mode)
+        puts("M6 Polaris daemon-backed RM multi-block stress passed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)
@@ -3484,11 +3877,17 @@ int main(int argc, char **argv)
         puts("M2 Polaris unmap/refault test passed.");
     else
         puts(dispatch_fault ? "M2 Polaris fault-dispatch test passed." : "M2 static-block setup passed.");
-    if (!dispatch_fault)
+    if (!dispatch_fault && !daemon_rm_multi_block_stress_mode)
         puts("Next step: add an RM GPFIFO channel bound to this VA-space and submit a write to the unmapped block.");
     rc = 0;
 
 out:
+    if (daemon_multi_blocks_setup) {
+        cleanup_multi_deferred_blocks(&s,
+                                      daemon_multi_blocks,
+                                      POLARIS_DAEMON_RM_MULTI_BLOCKS);
+        daemon_multi_blocks_setup = false;
+    }
     if (completion_executor_started)
         (void)pthread_join(completion_executor, NULL);
     cleanup(&s, polaris_gpu_id, polaris_rm_client_token, polaris_va_space_token);

@@ -1054,6 +1054,12 @@ fn polaris_block_needs_free_decision(block: &PolarisBlock) -> bool {
     }
 }
 
+fn polaris_gpu_va_allocator_idle(inner: &PolarisInner, gpu_id: u32) -> bool {
+    !inner.sessions.iter().any(|session| session.home_gpu == gpu_id)
+        && !inner.blocks.iter().any(|block| block.home_gpu == gpu_id)
+        && !inner.block_mappings.iter().any(|mapping| mapping.gpu_id == gpu_id)
+}
+
 fn polaris_account_direct_block_removal(
     inner: &mut PolarisInner,
     gpu_id: u32,
@@ -2542,6 +2548,7 @@ impl PolarisDevice {
             arg.range_id = ((arg.gpu_id as u64) << 32) | inner.next_range_id;
             inner.next_range_id += 1;
         }
+        let reset_va_cursor = polaris_gpu_va_allocator_idle(inner, arg.gpu_id);
         let gpu = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id).ok_or(ENOENT)?;
         gpu.va_range_id = arg.range_id;
         gpu.va_range_base = arg.base;
@@ -2549,6 +2556,9 @@ impl PolarisDevice {
         gpu.va_block_size = arg.block_size;
         gpu.va_range_flags = arg.flags;
         gpu.va_range_registered = true;
+        if reset_va_cursor {
+            gpu.next_va_offset = 0;
+        }
         self.registered_va_gpu.store(arg.gpu_id, Relaxed);
         self.registered_va_range_id.store(arg.range_id, Relaxed);
 

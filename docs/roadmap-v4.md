@@ -688,6 +688,15 @@ Still to do on the Polaris side for M1/M2:
   byte integrity, and checks daemon decision-queue drain between cycles. This is
   a focused single-block stress gate; fragmentation, dynamic KV growth, and OOM
   pressure remain broader M6 work.
+- Daemon-backed RM multi-block stress wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-multi-block-stress` reserves
+  several deferred logical blocks in one Polaris session, materializes each block
+  through real daemon-backed `ALLOC`, writes unique byte patterns into
+  daemon-owned RM backing, spills all blocks, waits for daemon `OFFLOAD`,
+  reloads them in reverse order, refaults, verifies byte integrity for every
+  block, and drains daemon `FREE` cleanup. This broadens coverage beyond a
+  single block while keeping static RM diagnostic-only; dynamic KV growth,
+  fragmentation, and OOM pressure remain broader M6 work.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -972,7 +981,7 @@ Still to do on the Polaris side for M1/M2:
   KV-only path through daemon-published RM backing.
 - Remaining production shim work: replace the fixed managed-window reservation
   model with workload-appropriate VA management, broaden daemon-backed stress
-  beyond the focused single-block spill/reload gate, and document or disable
+  into dynamic-growth / fragmentation / OOM pressure, and document or disable
   CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
