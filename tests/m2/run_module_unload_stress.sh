@@ -12,6 +12,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NVIDIA_KO_DIR="${NVIDIA_KO_DIR:-/home/wano/workspace/open-gpu-kernel-modules}"
+NVIDIA_UVM_KO="${NVIDIA_UVM_KO:-$NVIDIA_KO_DIR/kernel-open/nvidia-uvm.ko}"
 POLARIS_KO="${POLARIS_KO:-$ROOT_DIR/kernel/polaris.ko}"
 M2_BIN="${M2_BIN:-$ROOT_DIR/tests/m2/m2_static_block_setup}"
 POLARISD_BIN="${POLARISD_BIN:-$ROOT_DIR/target/debug/polarisd}"
@@ -83,8 +84,34 @@ reload_module() {
     cleanup_processes
     wait_for_idle || die "/dev/polaris stayed busy before module reload"
     sudo rmmod polaris 2>/dev/null || true
+    verify_patched_uvm
     sudo insmod "$POLARIS_KO"
+    sudo chmod 666 /dev/polaris /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null || true
     [[ -r "$STATS_PATH" ]] || die "$STATS_PATH not readable after insmod"
+}
+
+load_patched_modules() {
+    cleanup_processes
+    wait_for_idle || die "/dev/polaris stayed busy before module reload"
+    note "loading patched nvidia-uvm.ko and polaris.ko"
+    sudo rmmod polaris 2>/dev/null || true
+    sudo rmmod nvidia_uvm 2>/dev/null || sudo rmmod nvidia-uvm 2>/dev/null || true
+    sudo insmod "$NVIDIA_UVM_KO" uvm_enable_builtin_tests=1
+    verify_patched_uvm
+    sudo insmod "$POLARIS_KO"
+    sudo chmod 666 /dev/polaris /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null || true
+    [[ -r "$STATS_PATH" ]] || die "$STATS_PATH not readable after insmod"
+}
+
+verify_patched_uvm() {
+    if [[ -r /proc/kallsyms ]]; then
+        grep -q 'uvm_polaris_register_hook' /proc/kallsyms ||
+            die "loaded nvidia-uvm.ko does not expose uvm_polaris_register_hook"
+        grep -q 'uvm_polaris_map_external_allocation' /proc/kallsyms ||
+            die "loaded nvidia-uvm.ko does not expose uvm_polaris_map_external_allocation"
+        grep -q 'uvm_polaris_copy_external_allocation' /proc/kallsyms ||
+            die "loaded nvidia-uvm.ko does not expose uvm_polaris_copy_external_allocation"
+    fi
 }
 
 wait_for_stat_eq() {
@@ -151,10 +178,10 @@ stop_polarisd() {
 require_file "$POLARIS_KO" "polaris.ko"
 require_executable "$M2_BIN" "M2 harness"
 require_executable "$POLARISD_BIN" "polarisd"
+require_file "$NVIDIA_UVM_KO" "patched nvidia-uvm.ko"
 require_file "$NVIDIA_KO_DIR/kernel-open/Module.symvers" "patched NVIDIA Module.symvers"
 
-note "reloading polaris.ko for live-worker unload check"
-reload_module
+load_patched_modules
 
 note "starting real RM/UVM registered worker holder"
 rm -f "$ready_path" "$holder_log"
@@ -206,6 +233,7 @@ fi
 
 note "reloading module after unload"
 sudo insmod "$POLARIS_KO"
+sudo chmod 666 /dev/polaris /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null || true
 [[ -r "$STATS_PATH" ]] || die "$STATS_PATH not readable after reload"
 assert_clean_kernel_state "post-reload"
 assert_no_gpu_accounting "post-reload"
