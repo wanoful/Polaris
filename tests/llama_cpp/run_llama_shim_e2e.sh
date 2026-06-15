@@ -107,10 +107,13 @@ if [[ "$(basename "$LLAMA_CPP_BIN")" != "llama-bench" ]]; then
 fi
 
 if [[ "${POLARIS_LLAMA_LOAD_MODULE:-0}" == "1" ]]; then
-    note "loading kernel/polaris.ko"
+    require_file "$ROOT_DIR/kernel/polaris.ko" "polaris.ko"
+    note "loading patched nvidia-uvm.ko and kernel/polaris.ko"
     rmmod polaris 2>/dev/null || true
+    rmmod nvidia_uvm 2>/dev/null || rmmod nvidia-uvm 2>/dev/null || true
+    insmod "$NVIDIA_KO_DIR/kernel-open/nvidia-uvm.ko" uvm_enable_builtin_tests=1
     insmod "$ROOT_DIR/kernel/polaris.ko"
-    chmod 666 /dev/polaris 2>/dev/null || true
+    chmod 666 /dev/polaris /dev/nvidiactl /dev/nvidia-uvm 2>/dev/null || true
 fi
 
 [[ -r /dev/polaris && -w /dev/polaris ]] ||
