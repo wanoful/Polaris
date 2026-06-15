@@ -597,9 +597,40 @@ M6 Polaris daemon-backed RM dynamic fragmentation stress passed.
 ```
 
 This covers the first dynamic-growth / fragmentation slice for the production
-daemon-backed RM path. OOM pressure remains separate M6 work because it needs a
-controlled VRAM or host-pool budget rather than an incidental allocation
-failure.
+daemon-backed RM path. Host-pool OOM pressure lives in the next daemon-backed
+gate; VRAM/RM allocation pressure remains separate M6 work.
+
+## Daemon-Backed RM Host-Pool OOM Pressure
+
+This validates a deterministic host pinned-pool exhaustion path with the same
+production-shaped daemon RM backend. It still avoids static RM registration,
+harness-owned logical backing, and harness-side decision execution. Start
+`polarisd` with daemon-owned RM backing and a one-block CPU pool:
+
+```sh
+POLARISD_RM_BACKING=1 POLARISD_CPU_POOL_BYTES=2097152 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-host-pool-oom-pressure
+```
+
+The mode reserves two deferred logical blocks, fault-materializes both through
+real daemon `ALLOC`, writes deterministic bytes into each daemon-owned RM
+object with `POLARIS_RM_COPY`, and spills the first block. That first daemon
+`OFFLOAD` succeeds and fills the 2 MiB CPU pool. The second spill then reaches
+real daemon `-ENOMEM`, the kernel retries the `OFFLOAD` decision, and the block
+is marked `Evicted` after the bounded retry limit. Cleanup releases both the
+CPU-offloaded block and the evicted block through daemon `FREE`, including the
+evicted block's still-owned RM backing.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM host-pool OOM pressure passed.
+```
+
+Passing this gate proves the host-pool OOM path on the live daemon-backed RM
+route without falling back to static RM or a fake test error. It does not cover
+VRAM/RM allocation failure pressure, which still needs a separate controlled
+budget or fault-injection mechanism.
 
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete

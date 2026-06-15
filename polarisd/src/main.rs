@@ -69,20 +69,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         vas_size / (1024 * 1024 * 1024)
     );
 
-    // Compute budget (use 75% of total GPU memory for KV cache).
-    let budget_bytes = info.total_memory * 3 / 4;
-    // CPU pool: 4 GiB for offload testing (Phase 2 feature, reserve a
-    // reasonable amount rather than 2× GPU memory).
-    let cpu_pool_bytes = 4 * 1024 * 1024 * 1024u64;
+    // Compute budget (use 75% of total GPU memory for KV cache by default).
+    let budget_bytes = env_bytes("POLARISD_GPU_BUDGET_BYTES").unwrap_or(info.total_memory * 3 / 4);
+    // CPU pool: 4 GiB by default for offload testing. Tests can shrink this to
+    // make host-pool ENOMEM deterministic without exhausting machine memory.
+    let requested_cpu_pool_bytes =
+        env_bytes("POLARISD_CPU_POOL_BYTES").unwrap_or(4 * 1024 * 1024 * 1024u64);
 
     // Pre-allocate CPU pinned memory pool for block offloads.
-    let (cpu_pool_bytes, cpu_pool_base) = match cuda_vmm::allocate_host(cpu_pool_bytes) {
+    let (cpu_pool_bytes, cpu_pool_base) = match cuda_vmm::allocate_host(requested_cpu_pool_bytes) {
         Ok(ptr) => {
             eprintln!(
                 "polarisd: allocated CPU pinned memory pool: {} MiB at {ptr:#x}",
-                cpu_pool_bytes / (1024 * 1024)
+                requested_cpu_pool_bytes / (1024 * 1024)
             );
-            (cpu_pool_bytes, ptr)
+            (requested_cpu_pool_bytes, ptr)
         }
         Err(e) => {
             eprintln!("polarisd: WARNING CPU pinned memory pool allocation failed: {e}");
@@ -281,4 +282,19 @@ fn env_enabled(name: &str) -> bool {
                 && !v.eq_ignore_ascii_case("no")
         })
         .unwrap_or(false)
+}
+
+fn env_bytes(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<u64>() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            eprintln!("polarisd: ignoring invalid {name}={value}: {e}");
+            None
+        }
+    }
 }

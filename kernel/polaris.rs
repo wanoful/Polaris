@@ -1050,6 +1050,9 @@ fn polaris_block_needs_free_decision(block: &PolarisBlock) -> bool {
     match block.state {
         PolarisBlockState::Resident => block.gpu_phys_handle != 0 || polaris_block_has_rm_backing(block),
         PolarisBlockState::CpuOffloaded => block.cpu_buf_addr != 0,
+        PolarisBlockState::Evicted => {
+            block.gpu_phys_handle != 0 || block.cpu_buf_addr != 0 || polaris_block_has_rm_backing(block)
+        }
         _ => false,
     }
 }
@@ -3629,7 +3632,6 @@ impl PolarisDevice {
                         POLARIS_MAX_RETRIES,
                     );
                     inner.blocks[block_idx].state = PolarisBlockState::Evicted;
-                    polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
                     polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                     inner.blocks[block_idx].pending_decision_id = 0;
                     inner.blocks[block_idx].pending_fault_id = 0;
@@ -3743,7 +3745,13 @@ impl PolarisDevice {
         };
 
         let src_handle = match block.state {
-            PolarisBlockState::OffloadPending => block.gpu_phys_handle,
+            PolarisBlockState::OffloadPending => {
+                if polaris_block_has_rm_backing(block) {
+                    0
+                } else {
+                    block.gpu_phys_handle
+                }
+            }
             PolarisBlockState::CowPending => block.cow_src_handle,
             _ => 0,
         };

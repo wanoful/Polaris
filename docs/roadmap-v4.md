@@ -707,8 +707,24 @@ Still to do on the Polaris side for M1/M2:
   blocks, waits for daemon `OFFLOAD`, reloads/refaults them, verifies byte
   integrity for survivor and regrown blocks, and checks `pending_decs=0` plus
   `static_blocks=0`. This covers the first dynamic-growth / fragmentation M6
-  slice on the production daemon-backed RM path; OOM pressure remains separate
-  M6 work because it needs controlled VRAM or host-pool budgeting.
+  slice on the production daemon-backed RM path; host-pool OOM pressure is now
+  covered separately, while VRAM/RM allocation failure still needs controlled
+  pressure.
+- Daemon-backed RM host-pool OOM pressure wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-host-pool-oom-pressure` runs
+  against a real `polarisd` started with
+  `POLARISD_RM_BACKING=1 POLARISD_CPU_POOL_BYTES=2097152`, reserves two
+  deferred logical blocks, materializes both through daemon-backed `ALLOC`,
+  writes deterministic bytes into daemon-owned RM backing, spills the first
+  block into the one-block CPU pool, then spills the second block and observes
+  real daemon `-ENOMEM`. The kernel retries the RM-backed `OFFLOAD` decision,
+  marks the second block `Evicted` after the bounded retry limit, and cleanup
+  releases both the CPU-offloaded block and the evicted block through daemon
+  `FREE`, with `blocks=0`, `pending_decs=0`, `static_blocks=0`, and
+  `block_mappings=0`. This covers the host pinned-pool side of the M6 OOM
+  requirement on the production daemon-backed RM path without static RM or a
+  fake `POLARIS_TEST_ERROR`; VRAM/RM allocation failure pressure remains
+  separate.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -993,8 +1009,8 @@ Still to do on the Polaris side for M1/M2:
   KV-only path through daemon-published RM backing.
 - Remaining production shim work: replace the fixed managed-window reservation
   model with workload-appropriate VA management, broaden daemon-backed stress
-  into dynamic-growth / fragmentation / OOM pressure, and document or disable
-  CUDA Graph interactions.
+  into VRAM/RM allocation pressure, and document or disable CUDA Graph
+  interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening
@@ -1013,7 +1029,9 @@ Still to do on the Polaris side for M1/M2:
 - Tracing for: faults serviced, faults rejected, spills, reloads, bridge
   call latency, policy-mirror sequence drift.
 - Stress: dynamic KV growth, fragmentation pressure, OOM behavior on
-  both VRAM (RM alloc fails) and host pinned pool sides.
+  both VRAM (RM alloc fails) and host pinned pool sides. The host pinned-pool
+  side now has a deterministic daemon-backed gate; VRAM/RM allocation failure
+  remains open.
 
 ### M7: PyTorch / vLLM integration
 
