@@ -125,6 +125,7 @@ typedef CUresult (*cuMemGetAllocationGranularity_fn)(
 typedef CUresult (*cuGetErrorString_fn)(CUresult error, const char **pStr);
 typedef CUresult (*cuGetErrorName_fn)(CUresult error, const char **pStr);
 typedef CUresult (*cuStreamBeginCapture_fn)(CUstream hStream, cudaStreamCaptureMode mode);
+typedef CUresult (*cuStreamEndCapture_fn)(CUstream hStream, cudaGraph_t *phGraph);
 typedef CUresult (*cuMemGetAddressRange_fn)(CUdeviceptr *pbase,
                                             size_t *psize,
                                             CUdeviceptr dptr);

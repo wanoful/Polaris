@@ -125,6 +125,7 @@ static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct polaris_shim_allocation *g_allocations;
 static struct polaris_shim_free_span *g_free_spans;
 static size_t g_live_managed_allocations;
+static size_t g_active_graph_captures;
 
 enum polaris_shim_alloc_api {
     POLARIS_SHIM_ALLOC_API_DRIVER,
@@ -258,6 +259,7 @@ static int should_manage_allocation_size(size_t size)
 static int should_manage_allocation(size_t size)
 {
     int selected;
+    size_t active_captures;
 
     if (!should_manage_allocation_size(size)) {
         if (g_trace_scope) {
@@ -270,6 +272,24 @@ static int should_manage_allocation(size_t size)
         }
         return 0;
     }
+
+    pthread_mutex_lock(&g_alloc_lock);
+    active_captures = g_active_graph_captures;
+    pthread_mutex_unlock(&g_alloc_lock);
+    if (active_captures != 0) {
+        if (g_trace_scope) {
+            fprintf(stderr,
+                    "[polaris-shim] allocation policy size=%zu selected=0 "
+                    "reason=graph_capture active_captures=%zu scope_kv=%d "
+                    "require_kv_scope=%d\n",
+                    size,
+                    active_captures,
+                    g_allocation_scope_is_kv,
+                    g_require_kv_scope);
+        }
+        return 0;
+    }
+
     if (g_require_kv_scope && !g_allocation_scope_is_kv) {
         if (g_trace_scope) {
             fprintf(stderr,
@@ -594,6 +614,19 @@ static void *resolve_cudart_symbol(const char *name)
     if (!g_cudart_handle)
         return NULL;
     return dlsym(g_cudart_handle, name);
+}
+
+static void *resolve_cuda_symbol_with_alias(const char *name, const char *alias)
+{
+    void *symbol = resolve_next_symbol(name);
+
+    if (!symbol && alias)
+        symbol = resolve_next_symbol(alias);
+    if (!symbol)
+        symbol = polaris_shim_resolve_cuda_symbol(name);
+    if (!symbol && alias)
+        symbol = polaris_shim_resolve_cuda_symbol(alias);
+    return symbol;
 }
 
 static void report_stats_at_exit(void)
@@ -1421,11 +1454,27 @@ static int has_live_managed_allocations(void)
     return live;
 }
 
+static void graph_capture_started(void)
+{
+    pthread_mutex_lock(&g_alloc_lock);
+    g_active_graph_captures++;
+    pthread_mutex_unlock(&g_alloc_lock);
+}
+
+static void graph_capture_finished(void)
+{
+    pthread_mutex_lock(&g_alloc_lock);
+    if (g_active_graph_captures != 0)
+        g_active_graph_captures--;
+    pthread_mutex_unlock(&g_alloc_lock);
+}
+
 static CUresult cu_stream_begin_capture_impl(const char *real_name,
                                              CUstream hStream,
                                              cudaStreamCaptureMode mode)
 {
     cuStreamBeginCapture_fn real;
+    CUresult result;
 
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
@@ -1443,7 +1492,43 @@ static CUresult cu_stream_begin_capture_impl(const char *real_name,
         fprintf(stderr, "[polaris-shim] %s: real symbol unavailable\n", real_name);
         return CUDA_ERROR_NOT_INITIALIZED;
     }
-    return real(hStream, mode);
+    result = real(hStream, mode);
+    if (result == CUDA_SUCCESS)
+        graph_capture_started();
+    return result;
+}
+
+static CUresult cu_stream_end_capture_impl(const char *real_name,
+                                           CUstream hStream,
+                                           cudaGraph_t *phGraph)
+{
+    cuStreamEndCapture_fn real;
+    const char *alias = strcmp(real_name, "cuStreamEndCapture_v2") == 0
+                            ? "cuStreamEndCapture"
+                            : NULL;
+    CUresult result;
+
+    pthread_once(&g_announce_once, announce);
+    pthread_once(&g_bootstrap_once, bootstrap_vaspace);
+
+    if (has_live_managed_allocations()) {
+        if (phGraph)
+            *phGraph = NULL;
+        fprintf(stderr,
+                "[polaris-shim] %s is unsupported while "
+                "Polaris-managed allocations are live\n",
+                real_name);
+        return CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED;
+    }
+
+    *(void **)(&real) = resolve_cuda_symbol_with_alias(real_name, alias);
+    if (!real) {
+        fprintf(stderr, "[polaris-shim] %s: real symbol unavailable\n", real_name);
+        return CUDA_ERROR_NOT_INITIALIZED;
+    }
+    result = real(hStream, phGraph);
+    graph_capture_finished();
+    return result;
 }
 
 POLARIS_SHIM_INTERPOSER
@@ -1589,6 +1674,9 @@ static CUresult cu_mem_alloc_async_impl(const char *real_name,
                                         cudaStream_t hStream)
 {
     cuMemAllocAsync_fn real;
+    const char *alias = strcmp(real_name, "cuMemAllocAsync_v2") == 0
+                            ? "cuMemAllocAsync"
+                            : NULL;
     CUresult result;
     int selected = 0;
 
@@ -1619,7 +1707,7 @@ static CUresult cu_mem_alloc_async_impl(const char *real_name,
     if (g_manage_allocations)
         stats_note_fallback_alloc(bytesize);
 
-    *(void **)(&real) = polaris_shim_resolve_cuda_symbol(real_name);
+    *(void **)(&real) = resolve_cuda_symbol_with_alias(real_name, alias);
     if (!real) {
         fprintf(stderr, "[polaris-shim] %s: real symbol unavailable\n", real_name);
         if (g_manage_allocations)
@@ -1669,6 +1757,9 @@ static CUresult cu_mem_free_async_impl(const char *real_name,
                                        cudaStream_t hStream)
 {
     cuMemFreeAsync_fn real;
+    const char *alias = strcmp(real_name, "cuMemFreeAsync_v2") == 0
+                            ? "cuMemFreeAsync"
+                            : NULL;
     CUresult result;
     int ret;
 
@@ -1687,7 +1778,7 @@ static CUresult cu_mem_free_async_impl(const char *real_name,
         stats_note_fallback_free();
     }
 
-    *(void **)(&real) = polaris_shim_resolve_cuda_symbol(real_name);
+    *(void **)(&real) = resolve_cuda_symbol_with_alias(real_name, alias);
     if (!real) {
         fprintf(stderr, "[polaris-shim] %s: real symbol unavailable\n", real_name);
         if (g_manage_allocations)
@@ -3575,6 +3666,7 @@ POLARIS_SHIM_INTERPOSER
 cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mode)
 {
     cudaStreamBeginCapture_fn real;
+    cudaError_t result;
 
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
@@ -3591,13 +3683,17 @@ cudaError_t cudaStreamBeginCapture(cudaStream_t stream, cudaStreamCaptureMode mo
         fprintf(stderr, "[polaris-shim] cudaStreamBeginCapture: real symbol unavailable\n");
         return CUDA_ERROR_NOT_INITIALIZED;
     }
-    return real(stream, mode);
+    result = real(stream, mode);
+    if (result == CUDA_SUCCESS)
+        graph_capture_started();
+    return result;
 }
 
 POLARIS_SHIM_INTERPOSER
 cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph)
 {
     cudaStreamEndCapture_fn real;
+    cudaError_t result;
 
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
@@ -3616,7 +3712,9 @@ cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph)
         fprintf(stderr, "[polaris-shim] cudaStreamEndCapture: real symbol unavailable\n");
         return CUDA_ERROR_NOT_INITIALIZED;
     }
-    return real(stream, pGraph);
+    result = real(stream, pGraph);
+    graph_capture_finished();
+    return result;
 }
 
 POLARIS_SHIM_INTERPOSER
@@ -3778,6 +3876,18 @@ POLARIS_SHIM_INTERPOSER
 CUresult cuStreamBeginCapture_v2(CUstream hStream, cudaStreamCaptureMode mode)
 {
     return cu_stream_begin_capture_impl("cuStreamBeginCapture_v2", hStream, mode);
+}
+
+POLARIS_SHIM_INTERPOSER
+CUresult cuStreamEndCapture(CUstream hStream, cudaGraph_t *phGraph)
+{
+    return cu_stream_end_capture_impl("cuStreamEndCapture", hStream, phGraph);
+}
+
+POLARIS_SHIM_INTERPOSER
+CUresult cuStreamEndCapture_v2(CUstream hStream, cudaGraph_t *phGraph)
+{
+    return cu_stream_end_capture_impl("cuStreamEndCapture_v2", hStream, phGraph);
 }
 
 static cudaError_t cuda_memcpy_impl(const char *real_name,

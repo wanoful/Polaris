@@ -976,12 +976,19 @@ Still to do on the Polaris side for M1/M2:
   non-Polaris IPC calls to fall through.
 - CUDA Graph guard/pass-through slice wired: the shim interposes runtime
   `cudaStreamBeginCapture`, `cudaStreamEndCapture`, and `cudaGraphLaunch`
-  plus driver `cuStreamBeginCapture` / `cuStreamBeginCapture_v2`, returning
-  the stream-capture unsupported error while shim-managed Polaris allocations
-  are live. Runtime graph lifecycle/update calls (`cudaGraphInstantiate`,
+  plus driver `cuStreamBeginCapture` / `cuStreamBeginCapture_v2` and
+  `cuStreamEndCapture` / `cuStreamEndCapture_v2`, returning the stream-capture
+  unsupported error while shim-managed Polaris allocations are live. If capture
+  starts before any Polaris allocation exists, selected-size
+  `cudaMallocAsync` / `cuMemAllocAsync_v2` calls pass through to CUDA instead
+  of returning Polaris VA, so captured graphs do not record work against
+  unmapped Polaris external ranges. Runtime graph lifecycle/update calls
+  (`cudaGraphInstantiate`,
   `cudaGraphExecUpdate`, `cudaGraphDestroy`, and `cudaGraphExecDestroy`) pass
   through for non-Polaris graph management. The `managed_alloc` harness covers
-  the runtime and driver guards with `POLARIS_SHIM_TEST_GRAPH=1`.
+  the runtime and driver live-allocation guards with `POLARIS_SHIM_TEST_GRAPH=1`
+  and the capture-before-allocation fallback with
+  `POLARIS_SHIM_TEST_GRAPH_CAPTURE_ALLOC=1`.
 - CUDA VMM compatibility slice wired: the shim interposes and forwards the
   driver VMM pool primitives used by llama.cpp's CUDA backend
   (`cuMemAddressReserve`, `cuMemAddressFree`, `cuMemCreate`, `cuMemRelease`,
@@ -1058,9 +1065,8 @@ Still to do on the Polaris side for M1/M2:
   no-source-change KV-only llama.cpp path through daemon-published RM backing
   without static RM registration for the strict gate.
 - Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management, extend long-duration
-  daemon-backed soak coverage beyond the focused near-capacity gate, and
-  document or disable CUDA Graph interactions.
+  model with workload-appropriate VA management and audit CUDA PDL launch
+  behavior with live Polaris allocations.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

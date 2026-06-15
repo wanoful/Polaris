@@ -221,15 +221,20 @@ allocations, so callers cannot accidentally create an IPC handle for a VA
 range whose residency is owned by Polaris.
 CUDA Graph capture and launch are also guarded at the runtime and driver API
 boundaries: `cudaStreamBeginCapture`, `cudaStreamEndCapture`,
-`cudaGraphLaunch`, `cuStreamBeginCapture`, and `cuStreamBeginCapture_v2`
-return the stream-capture unsupported error while the process has live
-shim-managed Polaris allocations. This keeps graph capture or replay from
+`cudaGraphLaunch`, `cuStreamBeginCapture`, `cuStreamBeginCapture_v2`,
+`cuStreamEndCapture`, and `cuStreamEndCapture_v2` return the stream-capture
+unsupported error while the process has live shim-managed Polaris allocations.
+If capture starts before any Polaris allocation exists, selected-size
+`cudaMallocAsync` and `cuMemAllocAsync_v2` calls intentionally pass through to
+CUDA instead of returning Polaris VA. This keeps graph capture or replay from
 recording or launching work that may dereference unmapped Polaris VA.
 The llama.cpp shim regression also sets `GGML_CUDA_PDL=0` by default to keep
 programmatic dependent launch on the documented unsupported side of the M5
 contract until the launch path is audited with live Polaris allocations.
 Set `POLARIS_SHIM_TEST_GRAPH=1` in the `managed_alloc` harness to validate
-the runtime and driver guards.
+the runtime and driver guards after Polaris allocations are live, and
+`POLARIS_SHIM_TEST_GRAPH_CAPTURE_ALLOC=1` to validate capture-before-allocation
+fallback.
 Set `POLARIS_SHIM_TEST_VMM=1` to validate VMM symbol coverage and driver
 pass-through with a safe invalid-argument probe that does not map or
 dereference memory.

@@ -895,8 +895,12 @@ Set `POLARIS_SHIM_TEST_IPC=1` to validate that driver and runtime IPC handle
 export calls reject shim-managed Polaris pointers with `cudaErrorNotSupported`.
 Set `POLARIS_SHIM_TEST_GRAPH=1` to validate that runtime
 `cudaStreamBeginCapture`, `cudaStreamEndCapture`, and `cudaGraphLaunch`, plus
-driver `cuStreamBeginCapture_v2`, reject graph capture/launch while
-shim-managed Polaris allocations are live.
+driver `cuStreamBeginCapture_v2` and `cuStreamEndCapture_v2`, reject graph
+capture/launch while shim-managed Polaris allocations are live. Set
+`POLARIS_SHIM_TEST_GRAPH_CAPTURE_ALLOC=1` to validate the opposite ordering:
+if capture starts before any Polaris allocation exists, selected-size
+`cudaMallocAsync` and `cuMemAllocAsync_v2` calls fall through to CUDA instead
+of returning Polaris VA.
 Set `POLARIS_SHIM_TEST_VMM=1` to validate that CUDA driver VMM symbols used by
 llama.cpp resolve through the shim and reach the real driver through a safe
 invalid-argument probe.

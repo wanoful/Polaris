@@ -125,6 +125,7 @@ typedef CUresult (*cuMemGetAllocationGranularity_fn)(
 typedef CUresult (*cuGetErrorString_fn)(CUresult error, const char **pStr);
 typedef CUresult (*cuGetErrorName_fn)(CUresult error, const char **pStr);
 typedef CUresult (*cuStreamBeginCapture_v2_fn)(CUstream stream, cudaStreamCaptureMode mode);
+typedef CUresult (*cuStreamEndCapture_v2_fn)(CUstream stream, cudaGraph_t *graph);
 typedef CUresult (*cuMemGetAddressRange_v2_fn)(CUdeviceptr *pbase,
                                                size_t *psize,
                                                CUdeviceptr dptr);
@@ -361,6 +362,22 @@ static void *must_resolve(const char *name)
     return sym;
 }
 
+static void *must_resolve_alias(const char *name, const char *alias)
+{
+    void *sym = dlsym(RTLD_DEFAULT, name);
+
+    if (!sym && alias)
+        sym = dlsym(RTLD_DEFAULT, alias);
+    if (!sym)
+        fprintf(stderr,
+                "managed_alloc: dlsym(%s%s%s) failed: %s\n",
+                name,
+                alias ? " or " : "",
+                alias ? alias : "",
+                dlerror());
+    return sym;
+}
+
 static int env_enabled(const char *name)
 {
     const char *value = getenv(name);
@@ -560,6 +577,7 @@ int main(void)
     cuGetErrorString_fn driver_get_error_string_fn;
     cuGetErrorName_fn driver_get_error_name_fn;
     cuStreamBeginCapture_v2_fn driver_stream_begin_capture_fn;
+    cuStreamEndCapture_v2_fn driver_stream_end_capture_fn;
     cudaMalloc_fn runtime_alloc_fn;
     cudaMallocManaged_fn runtime_alloc_managed_fn;
     cudaFree_fn runtime_free_fn;
@@ -668,8 +686,8 @@ int main(void)
     *(void **)(&driver_ctx_set_current_fn) = must_resolve("cuCtxSetCurrent");
     *(void **)(&alloc_fn) = must_resolve("cuMemAlloc_v2");
     *(void **)(&free_fn) = must_resolve("cuMemFree_v2");
-    *(void **)(&alloc_async_fn) = must_resolve("cuMemAllocAsync_v2");
-    *(void **)(&free_async_fn) = must_resolve("cuMemFreeAsync_v2");
+    *(void **)(&alloc_async_fn) = must_resolve_alias("cuMemAllocAsync_v2", "cuMemAllocAsync");
+    *(void **)(&free_async_fn) = must_resolve_alias("cuMemFreeAsync_v2", "cuMemFreeAsync");
     *(void **)(&driver_mem_get_info_fn) = must_resolve("cuMemGetInfo_v2");
     *(void **)(&vmm_address_reserve_fn) = must_resolve("cuMemAddressReserve");
     *(void **)(&vmm_address_free_fn) = must_resolve("cuMemAddressFree");
@@ -682,6 +700,8 @@ int main(void)
     *(void **)(&driver_get_error_string_fn) = must_resolve("cuGetErrorString");
     *(void **)(&driver_get_error_name_fn) = must_resolve("cuGetErrorName");
     *(void **)(&driver_stream_begin_capture_fn) = must_resolve("cuStreamBeginCapture_v2");
+    *(void **)(&driver_stream_end_capture_fn) =
+        must_resolve_alias("cuStreamEndCapture_v2", "cuStreamEndCapture");
     *(void **)(&runtime_alloc_fn) = must_resolve("cudaMalloc");
     *(void **)(&runtime_alloc_managed_fn) = must_resolve("cudaMallocManaged");
     *(void **)(&runtime_free_fn) = must_resolve("cudaFree");
@@ -1263,6 +1283,163 @@ int main(void)
         return 1;
     }
     expected_range_size = (size_t)align_up_u64((uint64_t)primary_alloc_size, block_size);
+
+    if (env_enabled("POLARIS_SHIM_TEST_GRAPH_CAPTURE_ALLOC")) {
+        uint64_t managed_base = 0;
+        uint64_t managed_length = 0;
+        void *runtime_capture_ptr = NULL;
+        CUdeviceptr driver_capture_ptr = 0;
+        cudaStream_t stream = NULL;
+        cudaGraph_t graph = NULL;
+        cudaError_t cr;
+
+        if (!runtime_stream_create_fn ||
+            !runtime_stream_destroy_fn ||
+            !stream_begin_capture_fn ||
+            !stream_end_capture_fn ||
+            !graph_destroy_fn ||
+            !runtime_alloc_async_fn ||
+            !runtime_free_async_fn ||
+            !alloc_async_fn ||
+            !free_async_fn ||
+            !driver_stream_begin_capture_fn ||
+            !driver_stream_end_capture_fn) {
+            return 1;
+        }
+        if (parse_u64_env("POLARIS_SHIM_MANAGED_BASE", &managed_base) <= 0 ||
+            parse_u64_env("POLARIS_SHIM_MANAGED_LENGTH", &managed_length) <= 0) {
+            fprintf(stderr,
+                    "managed_alloc: graph-capture allocation test requires "
+                    "POLARIS_SHIM_MANAGED_BASE and POLARIS_SHIM_MANAGED_LENGTH\n");
+            return 1;
+        }
+
+        cr = runtime_stream_create_fn(&stream);
+        if (cr != 0 || stream == NULL) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamCreate(graph capture) returned %d stream=%p\n",
+                    cr,
+                    stream);
+            return 1;
+        }
+        cr = stream_begin_capture_fn(stream, 0);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamBeginCapture before allocation returned %d\n",
+                    cr);
+            return 1;
+        }
+        cr = runtime_alloc_async_fn(&runtime_capture_ptr, primary_alloc_size, stream);
+        if (cr != 0 || runtime_capture_ptr == NULL) {
+            fprintf(stderr,
+                    "managed_alloc: cudaMallocAsync during capture returned %d ptr=%p\n",
+                    cr,
+                    runtime_capture_ptr);
+            return 1;
+        }
+        if (pointer_in_range((CUdeviceptr)(uintptr_t)runtime_capture_ptr,
+                             managed_base,
+                             managed_length)) {
+            fprintf(stderr,
+                    "managed_alloc: cudaMallocAsync during capture returned Polaris ptr=%p\n",
+                    runtime_capture_ptr);
+            return 1;
+        }
+        cr = runtime_free_async_fn(runtime_capture_ptr, stream);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaFreeAsync capture fallback returned %d\n",
+                    cr);
+            return 1;
+        }
+        graph = (cudaGraph_t)(uintptr_t)0x1;
+        cr = stream_end_capture_fn(stream, &graph);
+        if (cr != 0 || graph == NULL) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamEndCapture after fallback allocation "
+                    "returned %d graph=%p\n",
+                    cr,
+                    graph);
+            return 1;
+        }
+        cr = graph_destroy_fn(graph);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaGraphDestroy(runtime capture) returned %d\n",
+                    cr);
+            return 1;
+        }
+        cr = runtime_stream_destroy_fn(stream);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamDestroy(graph capture) returned %d\n",
+                    cr);
+            return 1;
+        }
+        stream = NULL;
+
+        cr = runtime_stream_create_fn(&stream);
+        if (cr != 0 || stream == NULL) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamCreate(driver graph capture) returned %d stream=%p\n",
+                    cr,
+                    stream);
+            return 1;
+        }
+        r = driver_stream_begin_capture_fn((CUstream)stream, 0);
+        if (r != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cuStreamBeginCapture_v2 before allocation returned %d\n",
+                    r);
+            return 1;
+        }
+        r = alloc_async_fn(&driver_capture_ptr, primary_alloc_size, (CUstream)stream);
+        if (r != 0 || driver_capture_ptr == 0) {
+            fprintf(stderr,
+                    "managed_alloc: cuMemAllocAsync_v2 during capture returned %d ptr=0x%llx\n",
+                    r,
+                    driver_capture_ptr);
+            return 1;
+        }
+        if (pointer_in_range(driver_capture_ptr, managed_base, managed_length)) {
+            fprintf(stderr,
+                    "managed_alloc: cuMemAllocAsync_v2 during capture returned Polaris ptr=0x%llx\n",
+                    driver_capture_ptr);
+            return 1;
+        }
+        r = free_async_fn(driver_capture_ptr, (CUstream)stream);
+        if (r != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cuMemFreeAsync_v2 capture fallback returned %d\n",
+                    r);
+            return 1;
+        }
+        graph = (cudaGraph_t)(uintptr_t)0x1;
+        r = driver_stream_end_capture_fn((CUstream)stream, &graph);
+        if (r != 0 || graph == NULL) {
+            fprintf(stderr,
+                    "managed_alloc: cuStreamEndCapture_v2 after fallback allocation "
+                    "returned %d graph=%p\n",
+                    r,
+                    graph);
+            return 1;
+        }
+        cr = graph_destroy_fn(graph);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaGraphDestroy(driver capture) returned %d\n",
+                    cr);
+            return 1;
+        }
+        cr = runtime_stream_destroy_fn(stream);
+        if (cr != 0) {
+            fprintf(stderr,
+                    "managed_alloc: cudaStreamDestroy(driver graph capture) returned %d\n",
+                    cr);
+            return 1;
+        }
+        stream = NULL;
+    }
 
     if (alloc_test_pointer(use_runtime,
                            use_async,
