@@ -272,7 +272,7 @@ now runs against a real `polarisd` with `POLARISD_RM_BACKING=1`, so llama.cpp
 KV allocations are materialized through daemon-owned RM backing rather than
 the shim's static RM diagnostic backend. Remaining production work is focused
 on workload-appropriate VA/window management, broader stress coverage, and
-RM-backed COW.
+permission-based write-fault COW.
 
 ## Why this is not a Cargo crate
 

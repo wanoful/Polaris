@@ -607,8 +607,16 @@ Still to do on the Polaris side for M1/M2:
   RM-backed bridge-resident blocks. `polarisd` uses `POLARIS_RM_COPY` to copy
   daemon-owned RM backing to the pinned CPU pool, frees the RM allocation, then
   later services `RELOAD` by allocating fresh daemon-owned RM backing and
-  copying the CPU buffer back. `COW_BREAK` for RM-backed blocks remains guarded
-  until an RM-to-RM or staged copy path is integrated.
+  copying the CPU buffer back.
+- RM-backed overwrite COW execution wired: COW decisions now carry the source
+  `block_id` in the reserved decision metadata when no legacy CUDA physical
+  handle exists. `polarisd` services RM-backed `COW_BREAK` by staging source RM
+  backing through the pinned CPU pool with `POLARIS_RM_COPY`, allocating fresh
+  daemon-owned destination RM backing, copying the staged bytes into it, and
+  returning the destination RM tuple through `POLARIS_COMPLETE_OPERATION`. The
+  M2 `--rm-cow-roundtrip` mode validates parent and child byte preservation for
+  the current `SESSION_BRANCH` + overwrite-reserve COW surface. Full
+  write-fault permission-split COW remains future M4 hardening.
 - Live-backing FREE lifetime slice wired: `BLOCK_RELEASE` and
   `SESSION_DESTROY` now queue daemon `FREE` decisions for resident legacy
   physical handles, RM-backed bridge-resident logical blocks, and CPU-offloaded
@@ -696,6 +704,12 @@ Still to do on the Polaris side for M1/M2:
   cannot later drop the parent's still-live block. `libpolaris/tests/kernel_spill_state.rs`
   includes an ignored root-only fake-executor test for this branch/overwrite
   path and validates the child block table after the split.
+- RM-backed overwrite COW data path wired for the same
+  `SESSION_BRANCH` + overwrite-reserve surface: `polarisd` stages source RM
+  backing through the pinned CPU pool, publishes fresh daemon-owned RM backing
+  for the child block, and the M2 `--rm-cow-roundtrip` diagnostic verifies both
+  parent and child bytes after the split. This does not yet implement
+  permission-based write-fault COW on already-mapped read-mostly pages.
 - Multi-worker cleanup slice wired: the same ignored test file registers two
   v4 worker VA-spaces for one logical block, registers one block mapping per
   worker, then verifies explicit `POLARIS_UNREGISTER_VASPACE` and fd-close

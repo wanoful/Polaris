@@ -88,6 +88,12 @@ struct polaris_session_destroy_arg {
     uint64_t _reserved[4];
 };
 
+struct polaris_session_branch_arg {
+    uint64_t parent_session_id;
+    uint64_t child_session_id;
+    uint64_t _reserved[4];
+};
+
 struct polaris_block_reserve_arg {
     uint64_t session_id;
     uint32_t token_start;
@@ -288,6 +294,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_REGISTER_VA_RANGE _IOWR(POLARIS_IOCTL_MAGIC, 0x02, struct polaris_register_va_range_arg)
 #define POLARIS_SESSION_CREATE _IOWR(POLARIS_IOCTL_MAGIC, 0x03, struct polaris_session_create_arg)
 #define POLARIS_SESSION_DESTROY _IOW(POLARIS_IOCTL_MAGIC, 0x04, struct polaris_session_destroy_arg)
+#define POLARIS_SESSION_BRANCH _IOWR(POLARIS_IOCTL_MAGIC, 0x06, struct polaris_session_branch_arg)
 #define POLARIS_BLOCK_RESERVE _IOWR(POLARIS_IOCTL_MAGIC, 0x07, struct polaris_block_reserve_arg)
 #define POLARIS_BLOCK_RELEASE _IOW(POLARIS_IOCTL_MAGIC, 0x08, struct polaris_block_release_arg)
 #define POLARIS_GET_DECISION _IOWR(POLARIS_IOCTL_MAGIC, 0x0b, struct polaris_get_decision_arg)
@@ -312,6 +319,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_RM_PHYS_FLAG_SYSMEM (1ULL << 1)
 #define POLARIS_RM_PHYS_FLAG_EGM (1ULL << 2)
 #define POLARIS_RM_PHYS_FLAG_FABRICMEM (1ULL << 3)
+#define POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID (1ULL << 0)
 #define POLARIS_RM_COPY_NO_MISMATCH UINT64_MAX
 #define POLARIS_RM_COPY_TO_CPU 0U
 #define POLARIS_RM_COPY_FROM_CPU 1U
@@ -400,6 +408,15 @@ struct rm_spill_reload_args {
     uint64_t block_id;
     uint64_t cpu_addr;
     NvHandle new_h_memory;
+    int result;
+};
+
+struct rm_cow_args {
+    struct m2_state *state;
+    uint64_t parent_block_id;
+    uint64_t child_block_id;
+    uint64_t child_vaddr;
+    NvHandle child_h_memory;
     int result;
 };
 
@@ -1196,6 +1213,7 @@ static int register_logical_block_mapping(struct m2_state *s,
                                           uint64_t rm_client_token,
                                           uint64_t va_space_token,
                                           uint64_t base,
+                                          uint64_t managed_length,
                                           uint64_t length,
                                           bool defer_fault,
                                           uint64_t *block_id_out)
@@ -1203,7 +1221,7 @@ static int register_logical_block_mapping(struct m2_state *s,
     struct polaris_register_va_range_arg range = {
         .gpu_id = gpu_id,
         .base = base,
-        .length = POLARIS_MANAGED_SIZE,
+        .length = managed_length,
         .block_size = POLARIS_BLOCK_SIZE,
     };
     struct polaris_session_create_arg session = {
@@ -1813,6 +1831,154 @@ static void *rm_reload_executor(void *arg)
     return NULL;
 }
 
+static int execute_rm_cow_decision(struct m2_state *s,
+                                   const struct polaris_decision *decision,
+                                   uint64_t expected_parent_block_id,
+                                   NvHandle *new_h_memory_out)
+{
+    uint8_t *scratch = NULL;
+    NvHandle new_h_memory = 0;
+    struct polaris_rm_copy_arg copy = {0};
+
+    if (decision->_reserved[1] != POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID ||
+        decision->_reserved[0] != expected_parent_block_id) {
+        fprintf(stderr,
+                "COW decision source block metadata invalid: reserved0=%llu reserved1=0x%llx expected_block=%llu\n",
+                (unsigned long long)decision->_reserved[0],
+                (unsigned long long)decision->_reserved[1],
+                (unsigned long long)expected_parent_block_id);
+        return -1;
+    }
+    if (decision->dst_vaddr == 0) {
+        fprintf(stderr, "COW decision missing destination VA\n");
+        return -1;
+    }
+
+    if (posix_memalign((void **)&scratch, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign COW scratch failed\n");
+        return -1;
+    }
+
+    copy.block_id = expected_parent_block_id;
+    copy.length = POLARIS_BLOCK_SIZE;
+    copy.user_cpu_addr = (uint64_t)(uintptr_t)scratch;
+    copy.direction = POLARIS_RM_COPY_TO_CPU;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &copy,
+                              "POLARIS_RM_COPY COW source TO_CPU") != 0)
+        goto fail;
+    if (copy.bytes_copied != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "COW source copy bytes=0x%llx expected=0x%llx\n",
+                (unsigned long long)copy.bytes_copied,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        goto fail;
+    }
+
+    if (allocate_rm_memory(s, "RM_ALLOC COW memory", POLARIS_BLOCK_SIZE, &new_h_memory) != 0)
+        goto fail;
+
+    memset(&copy, 0, sizeof(copy));
+    copy.block_id = decision->block_id;
+    copy.length = POLARIS_BLOCK_SIZE;
+    copy.user_cpu_addr = (uint64_t)(uintptr_t)scratch;
+    copy.direction = POLARIS_RM_COPY_FROM_CPU;
+    copy.rm_control_fd = s->ctl_fd;
+    copy.rm_h_client = s->h_client;
+    copy.rm_h_memory = new_h_memory;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &copy,
+                              "POLARIS_RM_COPY COW destination FROM_CPU") != 0)
+        goto fail_free_rm;
+    if (copy.bytes_copied != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "COW destination copy bytes=0x%llx expected=0x%llx\n",
+                (unsigned long long)copy.bytes_copied,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        goto fail_free_rm;
+    }
+
+    if (complete_decision(s, decision, 0, 0, new_h_memory) != 0)
+        goto fail_free_rm;
+
+    free(scratch);
+    *new_h_memory_out = new_h_memory;
+    printf("POLARIS RM COW completed: src_block=%llu child_block=%llu hMemory=0x%x bytes=0x%llx\n",
+           (unsigned long long)expected_parent_block_id,
+           (unsigned long long)decision->block_id,
+           new_h_memory,
+           (unsigned long long)copy.bytes_copied);
+    return 0;
+
+fail_free_rm:
+    rm_free_object(s->ctl_fd, s->h_client, s->h_device, new_h_memory);
+fail:
+    free(scratch);
+    return -1;
+}
+
+static void *rm_cow_executor(void *arg)
+{
+    struct rm_cow_args *args = arg;
+    struct polaris_decision cow = {0};
+
+    args->result = -1;
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        struct polaris_get_decision_arg get = {0};
+
+        if (polaris_ioctl_checked(args->state->polaris_fd,
+                                  POLARIS_GET_DECISION,
+                                  &get,
+                                  "POLARIS_GET_DECISION COW executor") != 0)
+            return NULL;
+
+        for (uint32_t i = 0; i < get.count && i < POLARIS_MAX_DECISIONS_PER_POLL; ++i) {
+            if (get.decisions[i].op == POLARIS_DECISION_OP_COW_BREAK &&
+                (args->child_block_id == 0 ||
+                 get.decisions[i].block_id == args->child_block_id)) {
+                cow = get.decisions[i];
+                goto found;
+            }
+
+            fprintf(stderr,
+                    "unexpected decision while waiting for COW block=%llu: op=%u block=%llu decision=%llu\n",
+                    (unsigned long long)args->child_block_id,
+                    get.decisions[i].op,
+                    (unsigned long long)get.decisions[i].block_id,
+                    (unsigned long long)get.decisions[i].decision_id);
+            if (complete_decision(args->state, &get.decisions[i], -EINVAL, 0, 0) != 0)
+                return NULL;
+        }
+
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "timed out waiting for COW decision block=%llu\n",
+            (unsigned long long)args->child_block_id);
+    return NULL;
+
+found:
+    if (args->child_vaddr != 0 && cow.dst_vaddr != args->child_vaddr) {
+        fprintf(stderr,
+                "COW dst_vaddr=0x%llx expected=0x%llx\n",
+                (unsigned long long)cow.dst_vaddr,
+                (unsigned long long)args->child_vaddr);
+        return NULL;
+    }
+    args->child_block_id = cow.block_id;
+    args->child_vaddr = cow.dst_vaddr;
+    if (execute_rm_cow_decision(args->state,
+                                &cow,
+                                args->parent_block_id,
+                                &args->child_h_memory) != 0)
+        return NULL;
+    args->result = 0;
+    return NULL;
+}
+
 static int rm_spill_reload_roundtrip(struct m2_state *s, uint64_t block_id)
 {
     uint8_t *src = NULL;
@@ -1965,6 +2131,220 @@ out:
     return rc;
 }
 
+static int rm_cow_roundtrip(struct m2_state *s,
+                            uint32_t gpu_id,
+                            uint64_t rm_client_token,
+                            uint64_t va_space_token,
+                            uint64_t parent_block_id)
+{
+    uint8_t *src = NULL;
+    uint8_t *parent_dst = NULL;
+    uint8_t *child_dst = NULL;
+    NvHandle parent_h_memory = s->h_memory;
+    NvHandle child_h_memory = 0;
+    uint64_t child_session_id = 0;
+    uint64_t child_block_id = 0;
+    uint64_t child_vaddr = 0;
+    pthread_t cow_thread = 0;
+    bool cow_thread_started = false;
+    const uint64_t seed = 0x434f57524d434f50ULL;
+    int rc = -1;
+
+    if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0 ||
+        posix_memalign((void **)&parent_dst, 4096, POLARIS_BLOCK_SIZE) != 0 ||
+        posix_memalign((void **)&child_dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign COW buffers failed\n");
+        goto out;
+    }
+    for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+        src[i] = rm_copy_roundtrip_pattern(seed, i);
+        parent_dst[i] = 0;
+        child_dst[i] = 0;
+    }
+
+    struct polaris_rm_copy_arg write_parent = {
+        .block_id = parent_block_id,
+        .length = POLARIS_BLOCK_SIZE,
+        .user_cpu_addr = (uint64_t)(uintptr_t)src,
+        .direction = POLARIS_RM_COPY_FROM_CPU,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &write_parent,
+                              "POLARIS_RM_COPY COW parent FROM_CPU") != 0)
+        goto out;
+
+    struct polaris_session_branch_arg branch = {
+        .parent_session_id = s->polaris_session_id,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_SESSION_BRANCH,
+                              &branch,
+                              "POLARIS_SESSION_BRANCH RM COW") != 0)
+        goto out;
+    child_session_id = branch.child_session_id;
+    if (child_session_id == 0) {
+        fprintf(stderr, "POLARIS_SESSION_BRANCH returned child_session_id=0\n");
+        goto out;
+    }
+
+    struct rm_cow_args cow_args = {
+        .state = s,
+        .parent_block_id = parent_block_id,
+        .child_block_id = 0,
+        .child_vaddr = 0,
+        .child_h_memory = 0,
+        .result = -1,
+    };
+    int thread_ret = pthread_create(&cow_thread, NULL, rm_cow_executor, &cow_args);
+    if (thread_ret != 0) {
+        fprintf(stderr, "pthread_create COW executor failed: %s\n", strerror(thread_ret));
+        goto out;
+    }
+    cow_thread_started = true;
+
+    struct polaris_block_reserve_arg reserve = {
+        .session_id = child_session_id,
+        .token_start = s->polaris_block_token_start,
+        .token_count = s->polaris_block_token_count,
+        .phase = 2,
+        .flags = POLARIS_RESERVE_FLAG_OVERWRITE,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RESERVE,
+                              &reserve,
+                              "POLARIS_BLOCK_RESERVE RM COW deferred") != 0)
+        goto out;
+    child_block_id = reserve.block_id;
+    child_vaddr = reserve.gpu_vaddr;
+    if (child_block_id == 0 || child_block_id == parent_block_id || child_vaddr == 0) {
+        fprintf(stderr,
+                "RM COW reserve returned invalid child block=%llu vaddr=0x%llx parent=%llu\n",
+                (unsigned long long)child_block_id,
+                (unsigned long long)child_vaddr,
+                (unsigned long long)parent_block_id);
+        goto out;
+    }
+
+    if (pthread_join(cow_thread, NULL) != 0) {
+        cow_thread_started = false;
+        fprintf(stderr, "pthread_join COW executor failed\n");
+        goto out;
+    }
+    cow_thread_started = false;
+    if (cow_args.result != 0 || cow_args.child_h_memory == 0) {
+        fprintf(stderr,
+                "COW executor result=%d hMemory=0x%x\n",
+                cow_args.result,
+                (unsigned int)cow_args.child_h_memory);
+        goto out;
+    }
+    if (cow_args.child_block_id != child_block_id || cow_args.child_vaddr != child_vaddr) {
+        fprintf(stderr,
+                "COW executor completed block=%llu vaddr=0x%llx, expected block=%llu vaddr=0x%llx\n",
+                (unsigned long long)cow_args.child_block_id,
+                (unsigned long long)cow_args.child_vaddr,
+                (unsigned long long)child_block_id,
+                (unsigned long long)child_vaddr);
+        goto out;
+    }
+    child_h_memory = cow_args.child_h_memory;
+
+    struct polaris_register_block_mapping_arg child_mapping = {
+        .block_id = child_block_id,
+        .gpu_id = gpu_id,
+        .rm_client_token = rm_client_token,
+        .va_space_token = va_space_token,
+        .base = child_vaddr,
+        .length = POLARIS_BLOCK_SIZE,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_BLOCK_MAPPING,
+                              &child_mapping,
+                              "POLARIS_REGISTER_BLOCK_MAPPING RM COW child") != 0)
+        goto out;
+
+    if (dispatch_test_fault(s, child_vaddr) != 0) {
+        goto out;
+    }
+
+    struct polaris_rm_copy_arg read_parent = {
+        .block_id = parent_block_id,
+        .length = POLARIS_BLOCK_SIZE,
+        .user_cpu_addr = (uint64_t)(uintptr_t)parent_dst,
+        .direction = POLARIS_RM_COPY_TO_CPU,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &read_parent,
+                              "POLARIS_RM_COPY COW parent TO_CPU") != 0)
+        goto out;
+
+    struct polaris_rm_copy_arg read_child = {
+        .block_id = child_block_id,
+        .length = POLARIS_BLOCK_SIZE,
+        .user_cpu_addr = (uint64_t)(uintptr_t)child_dst,
+        .direction = POLARIS_RM_COPY_TO_CPU,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &read_child,
+                              "POLARIS_RM_COPY COW child TO_CPU") != 0)
+        goto out;
+
+    for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+        if (parent_dst[i] != src[i] || child_dst[i] != src[i]) {
+            fprintf(stderr,
+                    "RM COW mismatch at 0x%llx: expected=0x%x parent=0x%x child=0x%x\n",
+                    (unsigned long long)i,
+                    src[i],
+                    parent_dst[i],
+                    child_dst[i]);
+            goto out;
+        }
+    }
+
+    printf("POLARIS RM COW roundtrip complete: parent_block=%llu child_block=%llu parent_hMemory=0x%x child_hMemory=0x%x bytes=0x%llx\n",
+           (unsigned long long)parent_block_id,
+           (unsigned long long)child_block_id,
+           parent_h_memory,
+           child_h_memory,
+           (unsigned long long)read_child.bytes_copied);
+    rc = 0;
+
+out:
+    if (cow_thread_started) {
+        (void)pthread_join(cow_thread, NULL);
+    }
+    if (child_session_id != 0) {
+        struct polaris_session_destroy_arg destroy_child = {
+            .session_id = child_session_id,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_SESSION_DESTROY,
+                                    &destroy_child,
+                                    "POLARIS_SESSION_DESTROY RM COW child");
+    }
+    if (s->polaris_session_id != 0 && s->polaris_block_reserved) {
+        struct polaris_block_release_arg release_parent = {
+            .session_id = s->polaris_session_id,
+            .token_start = s->polaris_block_token_start,
+            .token_count = s->polaris_block_token_count,
+            .flags = POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_BLOCK_RELEASE,
+                                    &release_parent,
+                                    "POLARIS_BLOCK_RELEASE RM COW parent");
+        s->polaris_block_reserved = false;
+    }
+    rm_free_object(s->ctl_fd, s->h_client, s->h_device, child_h_memory);
+    free(child_dst);
+    free(parent_dst);
+    free(src);
+    return rc;
+}
+
 static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_id)
 {
     struct polaris_spill_block_arg spill = {
@@ -1988,34 +2368,6 @@ static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_i
     }
 
     printf("POLARIS spill validation rejected unresident block=%llu with ENOENT\n",
-           (unsigned long long)block_id);
-    return 0;
-}
-
-static int expect_rm_backed_spill_unsupported(struct m2_state *s, uint64_t block_id)
-{
-    struct polaris_spill_block_arg spill = {
-        .block_id = block_id,
-    };
-
-    if (ioctl(s->polaris_fd, POLARIS_SPILL_BLOCK, &spill) == 0) {
-        fprintf(stderr,
-                "POLARIS_SPILL_BLOCK unexpectedly succeeded for RM-backed block=%llu decision=%llu unmapped=%u\n",
-                (unsigned long long)block_id,
-                (unsigned long long)spill.decision_id,
-                spill.unmapped_count);
-        return -1;
-    }
-    if (errno != EOPNOTSUPP) {
-        fprintf(stderr,
-                "POLARIS_SPILL_BLOCK errno=%d (%s), expected EOPNOTSUPP for RM-backed block=%llu\n",
-                errno,
-                strerror(errno),
-                (unsigned long long)block_id);
-        return -1;
-    }
-
-    printf("POLARIS spill validation rejected RM-backed block=%llu with EOPNOTSUPP\n",
            (unsigned long long)block_id);
     return 0;
 }
@@ -2196,6 +2548,7 @@ int main(int argc, char **argv)
     bool rm_copy_probe = false;
     bool rm_copy_roundtrip_mode = false;
     bool rm_spill_reload_roundtrip_mode = false;
+    bool rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -2258,6 +2611,12 @@ int main(int argc, char **argv)
             rm_spill_reload_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--rm-cow-roundtrip") == 0) {
+            dispatch_fault = true;
+            complete_backed_refault = true;
+            rm_cow_roundtrip_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--complete-backed-refault") == 0) {
             dispatch_fault = true;
             block_unmap_refault = true;
@@ -2295,7 +2654,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -2315,7 +2674,10 @@ int main(int argc, char **argv)
         goto out;
     if (setup_rm(&s, ordinal) != 0)
         goto out;
-    if (setup_uvm(&s, base, POLARIS_MANAGED_SIZE, !dispatch_fault) != 0)
+    uint64_t managed_length = rm_cow_roundtrip_mode
+        ? (2 * POLARIS_MANAGED_SIZE)
+        : POLARIS_MANAGED_SIZE;
+    if (setup_uvm(&s, base, managed_length, !dispatch_fault) != 0)
         goto out;
     polaris_va_space_token = s.h_vaspace;
     if (probe_uvm_dispatch_key(&s,
@@ -2329,7 +2691,7 @@ int main(int argc, char **argv)
                       polaris_rm_client_token,
                       polaris_va_space_token,
                       base,
-                      POLARIS_MANAGED_SIZE,
+                      managed_length,
                       !logical_backed_refault && !complete_backed_refault && !deferred_complete_fault) != 0)
         goto out;
     if (complete_backed_refault || deferred_complete_fault) {
@@ -2350,12 +2712,13 @@ int main(int argc, char **argv)
 
         if (register_logical_block_mapping(&s,
                                            polaris_gpu_id,
-                                           polaris_rm_client_token,
-                                           polaris_va_space_token,
-                                           base,
-                                           POLARIS_BLOCK_SIZE,
-                                           deferred_complete_fault,
-                                           &block_id) != 0) {
+                                                   polaris_rm_client_token,
+                                                   polaris_va_space_token,
+                                                   base,
+                                                   managed_length,
+                                                   POLARIS_BLOCK_SIZE,
+                                                   deferred_complete_fault,
+                                                   &block_id) != 0) {
             goto out;
         }
         if (complete_backed_refault) {
@@ -2378,12 +2741,13 @@ int main(int argc, char **argv)
     if ((block_unmap_refault || spill_validation) && !complete_backed_refault && !deferred_complete_fault) {
         if (register_logical_block_mapping(&s,
                                            polaris_gpu_id,
-                                           polaris_rm_client_token,
-                                           polaris_va_space_token,
-                                           base,
-                                           POLARIS_BLOCK_SIZE,
-                                           true,
-                                           &block_id) != 0)
+                                                   polaris_rm_client_token,
+                                                   polaris_va_space_token,
+                                                   base,
+                                                   managed_length,
+                                                   POLARIS_BLOCK_SIZE,
+                                                   true,
+                                                   &block_id) != 0)
             goto out;
     }
     if (logical_backed_refault) {
@@ -2413,9 +2777,9 @@ int main(int argc, char **argv)
                 goto out;
             }
         }
-        if ((complete_backed_refault || deferred_complete_fault) && !rm_spill_reload_roundtrip_mode) {
-            if (expect_rm_backed_spill_unsupported(&s, block_id) != 0)
-                goto out;
+        if ((complete_backed_refault || deferred_complete_fault) &&
+            !rm_spill_reload_roundtrip_mode &&
+            !rm_cow_roundtrip_mode) {
             if (dispatch_test_fault(&s, base) != 0)
                 goto out;
         }
@@ -2433,6 +2797,14 @@ int main(int argc, char **argv)
         }
         if (rm_spill_reload_roundtrip_mode) {
             if (rm_spill_reload_roundtrip(&s, block_id) != 0)
+                goto out;
+        }
+        if (rm_cow_roundtrip_mode) {
+            if (rm_cow_roundtrip(&s,
+                                 polaris_gpu_id,
+                                 polaris_rm_client_token,
+                                 polaris_va_space_token,
+                                 block_id) != 0)
                 goto out;
         }
         if (block_unmap_refault) {
@@ -2462,6 +2834,8 @@ int main(int argc, char **argv)
 
     if (rm_phys_probe)
         puts("M3 Polaris RM phys probe passed.");
+    else if (rm_cow_roundtrip_mode)
+        puts("M4 Polaris RM COW roundtrip passed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)

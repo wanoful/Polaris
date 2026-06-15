@@ -152,9 +152,11 @@ pub struct PolarisBlock {
     pub phase: PolarisPhase,
     pub last_touch_ns: u64,
     pub map_time_ns: u64,
-    /// Opaque phys handle of the source block for in-flight COW_BREAK.
-    /// Set when the decision is queued; used by requeue_decision on retry.
+    /// Opaque CUDA VMM phys handle of the source block for legacy COW_BREAK.
     pub cow_src_handle: u64,
+    /// Source block id for in-flight COW_BREAK. RM-backed COW uses this because
+    /// daemon-owned RM allocations do not have a CUDA VMM phys handle.
+    pub cow_src_block_id: u64,
     /// Number of consecutive COMPLETE_OPERATION failures for this block.
     /// Reset to 0 on success. After MAX_RETRIES (=3) → EVICTED.
     pub retry_count: u32,

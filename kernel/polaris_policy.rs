@@ -49,19 +49,33 @@ pub fn select_victim(
     requesting_session_id: u64,
     target_gpu: u32,
     protected_phys_handle: u64,
+    protected_block_id: u64,
 ) -> Option<(usize, u64, u64, u32)> {
     match inner.eviction_policy {
         PolarisEvictionPolicy::Fifo => {
-            find_victim_fifo(inner, requesting_session_id, target_gpu, protected_phys_handle)
+            find_victim_fifo(
+                inner,
+                requesting_session_id,
+                target_gpu,
+                protected_phys_handle,
+                protected_block_id,
+            )
         }
         PolarisEvictionPolicy::Lru => {
-            find_victim_lru(inner, requesting_session_id, target_gpu, protected_phys_handle)
+            find_victim_lru(
+                inner,
+                requesting_session_id,
+                target_gpu,
+                protected_phys_handle,
+                protected_block_id,
+            )
         }
         PolarisEvictionPolicy::PhaseAware => find_victim_phase_aware(
             inner,
             requesting_session_id,
             target_gpu,
             protected_phys_handle,
+            protected_block_id,
         ),
     }
 }
@@ -94,8 +108,13 @@ fn is_eligible_fifo_lru(block: &PolarisBlock, inner: &PolarisInner, target_gpu: 
     }
 }
 
-fn is_protected_source(block: &PolarisBlock, protected_phys_handle: u64) -> bool {
-    protected_phys_handle != 0 && block.gpu_phys_handle == protected_phys_handle
+fn is_protected_source(
+    block: &PolarisBlock,
+    protected_phys_handle: u64,
+    protected_block_id: u64,
+) -> bool {
+    (protected_block_id != 0 && block.block_id == protected_block_id)
+        || (protected_phys_handle != 0 && block.gpu_phys_handle == protected_phys_handle)
 }
 
 /// Returns true if the block is eligible for eviction under Phase-Aware.
@@ -127,6 +146,7 @@ fn find_victim_fifo(
     requesting_session_id: u64,
     target_gpu: u32,
     protected_phys_handle: u64,
+    protected_block_id: u64,
 ) -> Option<(usize, u64, u64, u32)> {
     // Pass 1: other sessions only.
     let mut best: Option<(usize, u64, u64, u32)> = None;
@@ -136,7 +156,7 @@ fn find_victim_fifo(
         if block_owned_by_session(inner, block, requesting_session_id) {
             continue;
         }
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
@@ -155,7 +175,7 @@ fn find_victim_fifo(
     // Pass 2: any session (including the requesting one).
     best_time = u64::MAX;
     for (idx, block) in inner.blocks.iter().enumerate() {
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
@@ -176,6 +196,7 @@ fn find_victim_lru(
     requesting_session_id: u64,
     target_gpu: u32,
     protected_phys_handle: u64,
+    protected_block_id: u64,
 ) -> Option<(usize, u64, u64, u32)> {
     // Pass 1: other sessions only.
     let mut best: Option<(usize, u64, u64, u32)> = None;
@@ -185,7 +206,7 @@ fn find_victim_lru(
         if block_owned_by_session(inner, block, requesting_session_id) {
             continue;
         }
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
@@ -204,7 +225,7 @@ fn find_victim_lru(
     // Pass 2: any session (including the requesting one).
     best_time = u64::MAX;
     for (idx, block) in inner.blocks.iter().enumerate() {
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
@@ -277,6 +298,7 @@ fn find_victim_phase_aware(
     requesting_session_id: u64,
     target_gpu: u32,
     protected_phys_handle: u64,
+    protected_block_id: u64,
 ) -> Option<(usize, u64, u64, u32)> {
     let now = unsafe { bindings::ktime_get_mono_fast_ns() };
 
@@ -294,7 +316,7 @@ fn find_victim_phase_aware(
         if block_owned_by_session(inner, block, requesting_session_id) {
             continue;
         }
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_phase_aware(block, inner, target_gpu) {
@@ -318,7 +340,7 @@ fn find_victim_phase_aware(
     // Pass 2: any session (including the requesting one).
     best_score = i64::MIN;
     for (idx, block) in inner.blocks.iter().enumerate() {
-        if is_protected_source(block, protected_phys_handle) {
+        if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
         }
         if !is_eligible_phase_aware(block, inner, target_gpu) {

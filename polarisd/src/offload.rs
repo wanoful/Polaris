@@ -531,6 +531,171 @@ pub fn execute_rm_reload(
     }
 }
 
+/// Execute RM-backed COW_BREAK by staging through the pinned CPU pool:
+///   1. Copy source block RM backing -> temporary CPU buffer
+///   2. Allocate destination daemon-owned RM backing
+///   3. Copy temporary CPU buffer -> destination RM backing
+///   4. Return destination RM metadata for the private child block
+pub fn execute_rm_cow_break(
+    fd: i32,
+    dec: &PolarisDecision,
+    gpu: &mut gpu::GpuState,
+    cpu_pool: &mut CpuPool,
+    backend: &mut rm::RmBackend,
+) -> ExecutionResult {
+    let size = snap_up(dec.size_bytes, gpu.granule);
+    let src_block_id = if dec._reserved[1] & POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID != 0 {
+        dec._reserved[0]
+    } else {
+        0
+    };
+    if size == 0 || src_block_id == 0 {
+        eprintln!(
+            "polarisd: RM COW_BREAK block {} missing source block id size=0x{:x} flags=0x{:x}",
+            dec.block_id,
+            size,
+            dec._reserved[1]
+        );
+        return ExecutionResult {
+            result: -(libc::EINVAL as i32),
+            ..Default::default()
+        };
+    }
+    if !backend.has_block(src_block_id) {
+        eprintln!(
+            "polarisd: RM COW_BREAK block {} source block {} has no daemon RM backing",
+            dec.block_id,
+            src_block_id
+        );
+        return ExecutionResult {
+            result: -(libc::ENOENT as i32),
+            ..Default::default()
+        };
+    }
+
+    let scratch = match cpu_pool.allocate(size) {
+        Some(addr) => addr,
+        None => {
+            eprintln!(
+                "polarisd: RM COW_BREAK block {} CPU pool exhausted for scratch (used={} total={})",
+                dec.block_id,
+                cpu_pool.used_bytes(),
+                cpu_pool.total
+            );
+            return ExecutionResult {
+                result: -(libc::ENOMEM as i32),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut from_src = PolarisRmCopyArg {
+        block_id: src_block_id,
+        offset: 0,
+        length: size,
+        user_cpu_addr: scratch,
+        direction: POLARIS_RM_COPY_TO_CPU,
+        ..Default::default()
+    };
+    if let Err(errno) = ioctl::rm_copy(fd, &mut from_src) {
+        eprintln!(
+            "polarisd: RM COW_BREAK source copy block {} from {} failed: errno={errno}",
+            dec.block_id,
+            src_block_id
+        );
+        cpu_pool.free(scratch, size);
+        return ExecutionResult {
+            result: -errno,
+            ..Default::default()
+        };
+    }
+    if from_src.bytes_copied != size {
+        eprintln!(
+            "polarisd: RM COW_BREAK short source copy block {} bytes=0x{:x} expected=0x{:x}",
+            dec.block_id,
+            from_src.bytes_copied,
+            size
+        );
+        cpu_pool.free(scratch, size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    let allocation = match backend.alloc_for_block(dec.block_id, size) {
+        Ok(allocation) => allocation,
+        Err(e) => {
+            eprintln!("polarisd: RM COW_BREAK alloc failed for block {}: {e}", dec.block_id);
+            cpu_pool.free(scratch, size);
+            return ExecutionResult {
+                result: -(libc::ENOMEM as i32),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut to_dst = PolarisRmCopyArg {
+        block_id: dec.block_id,
+        offset: 0,
+        length: size,
+        user_cpu_addr: scratch,
+        direction: POLARIS_RM_COPY_FROM_CPU,
+        rm_control_fd: backend.rm_control_fd(),
+        rm_h_client: backend.h_client,
+        rm_h_memory: allocation.h_memory,
+        ..Default::default()
+    };
+    if let Err(errno) = ioctl::rm_copy(fd, &mut to_dst) {
+        eprintln!(
+            "polarisd: RM COW_BREAK destination copy block {} failed: errno={errno}",
+            dec.block_id
+        );
+        let _ = backend.free_block(dec.block_id);
+        cpu_pool.free(scratch, size);
+        return ExecutionResult {
+            result: -errno,
+            ..Default::default()
+        };
+    }
+    if to_dst.bytes_copied != size {
+        eprintln!(
+            "polarisd: RM COW_BREAK short destination copy block {} bytes=0x{:x} expected=0x{:x}",
+            dec.block_id,
+            to_dst.bytes_copied,
+            size
+        );
+        let _ = backend.free_block(dec.block_id);
+        cpu_pool.free(scratch, size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    cpu_pool.free(scratch, size);
+    gpu.track_va(dec.block_id, dec.dst_vaddr, size, false);
+    gpu.used_bytes += size;
+
+    eprintln!(
+        "polarisd: RM COW_BREAK block {} complete: src_block={} hClient=0x{:x} hMemory=0x{:x} bytes=0x{:x}",
+        dec.block_id,
+        src_block_id,
+        backend.h_client,
+        allocation.h_memory,
+        to_dst.bytes_copied
+    );
+
+    ExecutionResult {
+        result: 0,
+        rm_control_fd: backend.rm_control_fd(),
+        rm_h_client: backend.h_client,
+        rm_h_memory: allocation.h_memory,
+        rm_backing_length: allocation.size,
+        ..Default::default()
+    }
+}
+
 fn snap_up(val: u64, align: u64) -> u64 {
     if align == 0 {
         return val;

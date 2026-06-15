@@ -376,6 +376,15 @@ fn dispatch(
             let size = snap_up(dec.size_bytes, gpu.granule);
             let sz_usize = size as usize;
 
+            if let Some(backend) = rm_backend.as_mut() {
+                if dec._reserved[1] & POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID != 0
+                    || backend.has_block(dec.block_id)
+                    || dec.src_handle == 0
+                {
+                    return crate::offload::execute_rm_cow_break(fd, dec, gpu, cpu_pool, backend);
+                }
+            }
+
             let src_vaddr = match dec.src_vaddr {
                 0 => {
                     let src_phys = dec.src_handle;
@@ -423,23 +432,6 @@ fn dispatch(
                 }
             };
             let dst_vaddr = dst.vaddr;
-
-            if rm_backend
-                .as_ref()
-                .is_some_and(|backend| backend.has_block(dec.block_id) || dec.src_handle == 0)
-            {
-                eprintln!(
-                    "polarisd: COW_BREAK into RM backing for block {} is not wired yet",
-                    dec.block_id
-                );
-                if dst.release_to_pool {
-                    gpu.vas.free(dst_vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EOPNOTSUPP as i32),
-                    ..Default::default()
-                };
-            }
 
             if let Some(existing) = gpu.get_va_alloc(dec.block_id) {
                 if existing.vaddr != dst_vaddr {

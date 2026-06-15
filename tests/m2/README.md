@@ -238,8 +238,7 @@ The helper still supports only the narrow local shape proven by the probe:
 contiguous vidmem reachable through UVM's CE path. Passing this mode proves the
 kernel/UVM helper can move bytes between an RM-backed block and an ordinary
 userspace CPU pointer, which is the primitive needed by daemon-backed
-`OFFLOAD` and `RELOAD`. `COW_BREAK` remains guarded until an RM-to-RM or
-staged copy path is integrated.
+`OFFLOAD`, `RELOAD`, and staged overwrite `COW_BREAK`.
 
 ## RM Spill / Reload Roundtrip
 
@@ -264,6 +263,30 @@ The test still uses harness-owned RM allocations and a tiny executor loop; it
 does not replace the long-running `polarisd` integration tests. It does prove
 the same kernel/UVM copy primitive used by `polarisd` can preserve bytes across
 RM-backed OFFLOAD and RELOAD.
+
+## RM COW Roundtrip
+
+This validates RM-backed COW byte preservation for the current
+`SESSION_BRANCH` + overwrite-reserve COW surface. It writes a deterministic
+pattern into a parent RM-backed block, branches the session, reserves an
+overwrite block in the child, services the queued `COW_BREAK` by staging parent
+RM backing through a CPU buffer with `POLARIS_RM_COPY`, copies that staged data
+into fresh child RM backing, fault-maps the child, and verifies both parent and
+child bytes:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-cow-roundtrip
+```
+
+Expected success ends with:
+
+```text
+M4 Polaris RM COW roundtrip passed.
+```
+
+This is not permission-based write-fault COW for already mapped read-mostly
+pages; it covers the overwrite-reserve COW control surface currently wired in
+M4.
 
 ## Synthetic Fault Dispatch
 

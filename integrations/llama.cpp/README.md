@@ -166,7 +166,9 @@ GPU access faults into polaris.ko, the kernel queues `ALLOC`, `polarisd`
 allocates daemon-owned RM vidmem and returns the RM tuple through
 `POLARIS_COMPLETE_OPERATION`, and the same fault is bridge-mapped through UVM
 before returning `HANDLED`. Daemon-backed `OFFLOAD` and `RELOAD` use
-`POLARIS_RM_COPY`; RM-backed `COW_BREAK` remains guarded.
+`POLARIS_RM_COPY`; overwrite-reserve RM-backed `COW_BREAK` uses the same copy
+primitive with CPU staging. Permission-based write-fault COW remains future M4
+hardening.
 
 Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
 `llama-bench` commands complete and `/sys/kernel/polaris/stats` shows both

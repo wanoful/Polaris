@@ -1206,7 +1206,9 @@ fn polaris_snapshot_rm_copy_target(
         }
         if !matches!(
             block.state,
-            PolarisBlockState::Resident | PolarisBlockState::ReloadPending
+            PolarisBlockState::Resident
+                | PolarisBlockState::ReloadPending
+                | PolarisBlockState::CowPending
         ) {
             return Err(ENOENT);
         }
@@ -1399,6 +1401,7 @@ fn polaris_schedule_budget_victim(
     target_gpu: u32,
     needed_bytes: u64,
     protected_phys_handle: u64,
+    protected_block_id: u64,
 ) -> Result<()> {
     if needed_bytes == 0 {
         return Ok(());
@@ -1425,6 +1428,7 @@ fn polaris_schedule_budget_victim(
             requesting_session_id,
             target_gpu,
             protected_phys_handle,
+            protected_block_id,
         )
     else {
         return Err(ENOMEM);
@@ -1627,6 +1631,7 @@ fn polaris_resolve_gpu_fault(
                             last_touch_ns: 0,
                             map_time_ns: 0,
                             cow_src_handle: 0,
+                            cow_src_block_id: 0,
                             retry_count: 0,
                             pending_decision_id: decision_id,
                             pending_fault_id: new_fault_id,
@@ -1728,12 +1733,18 @@ fn polaris_resolve_gpu_fault(
         } else {
             0
         };
+        let protected_block_id = if op == PolarisDecisionOp::CowBreak {
+            inner.blocks[block_idx].cow_src_block_id
+        } else {
+            0
+        };
         polaris_schedule_budget_victim(
             inner,
             requesting_session_id,
             gpu_id,
             needed_bytes,
             protected_phys_handle,
+            protected_block_id,
         )?;
     }
     let decision_id = inner.next_decision_id;
@@ -1742,6 +1753,7 @@ fn polaris_resolve_gpu_fault(
         block_id,
         session_id,
         src_handle,
+        src_block_id,
         dst_vaddr,
         size_bytes,
         cpu_addr,
@@ -1765,6 +1777,11 @@ fn polaris_resolve_gpu_fault(
             block.cow_src_handle
         } else {
             block.gpu_phys_handle
+        };
+        src_block_id = if block.state == PolarisBlockState::CowPending {
+            block.cow_src_block_id
+        } else {
+            0
         };
         dst_vaddr = block.gpu_vaddr;
         size_bytes = block.size_bytes;
@@ -1803,7 +1820,16 @@ fn polaris_resolve_gpu_fault(
             cpu_addr,
             access_flags: access_type,
             timeout_ms,
-            _reserved: [0u64; 4],
+            _reserved: if src_block_id != 0 {
+                [
+                    src_block_id,
+                    POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID,
+                    0,
+                    0,
+                ]
+            } else {
+                [0u64; 4]
+            },
         },
         GFP_KERNEL,
     )?;
@@ -2981,6 +3007,8 @@ impl PolarisDevice {
                 inner.next_block_id += 1;
                 let old_block_id = eb.block_id;
                 let cow_src = eb.gpu_phys_handle;
+                let cow_src_block_id = eb.block_id;
+                let cow_copy_gpu_va_space_ptr = eb.copy_gpu_va_space_ptr;
                 eb.refcount -= 1;
                 if eb.refcount == 1 {
                     eb.flags = eb.flags & !PolarisBlockFlag::Shared;
@@ -2999,7 +3027,7 @@ impl PolarisDevice {
                         rm_h_memory: 0,
                         rm_backing_length: 0,
                         rm_backing_offset: 0,
-                        copy_gpu_va_space_ptr: 0,
+                        copy_gpu_va_space_ptr: cow_copy_gpu_va_space_ptr,
                         cpu_buf_addr: 0,
                         size_bytes,
                         refcount: 1,
@@ -3013,6 +3041,7 @@ impl PolarisDevice {
                         last_touch_ns: 0,
                         map_time_ns: 0,
                         cow_src_handle: cow_src,
+                        cow_src_block_id,
                         retry_count: 0,
                         pending_decision_id: 0,
                         pending_fault_id: 0,
@@ -3114,6 +3143,7 @@ impl PolarisDevice {
                 last_touch_ns: 0,
                 map_time_ns: 0,
                 cow_src_handle: 0,
+                cow_src_block_id: 0,
                 retry_count: 0,
                 pending_decision_id: 0,
                 pending_fault_id: 0,
@@ -3707,6 +3737,10 @@ impl PolarisDevice {
             PolarisBlockState::CowPending => block.cow_src_handle,
             _ => 0,
         };
+        let src_block_id = match block.state {
+            PolarisBlockState::CowPending => block.cow_src_block_id,
+            _ => 0,
+        };
 
         let cpu_addr = match block.state {
             PolarisBlockState::ReloadPending => block.cpu_buf_addr,
@@ -3730,7 +3764,16 @@ impl PolarisDevice {
                 cpu_addr,
                 access_flags: 0,
                 timeout_ms: 0,
-                _reserved: [0u64; 4],
+                _reserved: if src_block_id != 0 {
+                    [
+                        src_block_id,
+                        POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID,
+                        0,
+                        0,
+                    ]
+                } else {
+                    [0u64; 4]
+                },
             },
             GFP_KERNEL,
         );

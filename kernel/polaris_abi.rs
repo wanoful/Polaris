@@ -78,6 +78,7 @@ pub const POLARIS_RM_PHYS_FLAG_CONTIGUOUS: u64 = 1 << 0;
 pub const POLARIS_RM_PHYS_FLAG_SYSMEM: u64 = 1 << 1;
 pub const POLARIS_RM_PHYS_FLAG_EGM: u64 = 1 << 2;
 pub const POLARIS_RM_PHYS_FLAG_FABRICMEM: u64 = 1 << 3;
+pub const POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID: u64 = 1 << 0;
 pub const POLARIS_RM_COPY_NO_MISMATCH: u64 = u64::MAX;
 pub const POLARIS_RM_COPY_TO_CPU: u32 = 0;
 pub const POLARIS_RM_COPY_FROM_CPU: u32 = 1;
@@ -391,6 +392,10 @@ pub struct PolarisDecision {
     pub cpu_addr: u64,
     pub access_flags: u32,
     pub timeout_ms: u32,
+    // _reserved[0]: source block_id for COW_BREAK when
+    // POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID is set in _reserved[1].
+    // This keeps the ioctl struct size stable while letting RM-backed COW use
+    // block identity instead of a legacy CUDA physical handle.
     pub _reserved: [u64; 4],
 }
 
