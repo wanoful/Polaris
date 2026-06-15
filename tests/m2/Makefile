@@ -20,12 +20,15 @@ CPPFLAGS += \
 LDFLAGS += -pthread
 LDLIBS += -lcuda
 
-.PHONY: all clean
+.PHONY: all clean module-unload-stress
 
 all: m2_static_block_setup
 
 m2_static_block_setup: m2_static_block_setup.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+
+module-unload-stress: m2_static_block_setup
+	./run_module_unload_stress.sh
 
 clean:
 	rm -f m2_static_block_setup

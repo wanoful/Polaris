@@ -768,6 +768,20 @@ kills the child and verifies fd-close cleanup drops both `v4_va_spaces` and
 `v4_worker_pids` aggregate in `/sys/kernel/polaris/stats`; it does not yet
 exercise a real UVM `gpu_va_space_ptr` invalidation callback.
 
+For real module unload/reload coverage, run:
+
+```sh
+sudo tests/m2/run_module_unload_stress.sh
+```
+
+This gate reloads `polaris.ko`, starts
+`m2_static_block_setup --hold-registered-worker` to keep a real RM/UVM
+fault-capable VA-space and Polaris logical block mapping registered without
+static RM backing, verifies `rmmod polaris` is refused while that worker fd is
+live, stops the worker, verifies fd-close cleanup drains `v4_va_spaces` and
+`block_mappings`, unloads/reloads the module, and finally runs the
+daemon-backed RM spill/reload roundtrip on the reloaded module.
+
 The M5 shim allocator slice is build-covered under `libpolaris-shim`:
 `make -C libpolaris-shim all tests` builds the LD_PRELOAD library plus
 `build/smoke` and `build/managed_alloc`. `managed_alloc` resolves the shim's

@@ -1076,6 +1076,15 @@ Still to do on the Polaris side for M1/M2:
   remain deferred.
 - Module unload with workers still attached: rely on UVM's
   `try_module_get` + `synchronize_rcu` ordering; verify under stress.
+- First module unload/reload stress gate wired and verified:
+  `tests/m2/run_module_unload_stress.sh` reloads real `polaris.ko`, starts a
+  real RM/UVM fault-capable worker holder through
+  `m2_static_block_setup --hold-registered-worker`, verifies normal
+  `rmmod polaris` is refused while that worker fd pins the module, then stops
+  the worker, verifies `v4_va_spaces=0` and `block_mappings=0`, unloads/reloads
+  the module, and runs the daemon-backed RM spill/reload roundtrip on the
+  reloaded module. Static RM is not registered in the holder or the final
+  daemon-backed regression.
 - Tracing for: faults serviced, faults rejected, spills, reloads, bridge
   call latency, policy-mirror sequence drift.
 - Bridge map latency telemetry slice wired: `polaris.ko` now times each

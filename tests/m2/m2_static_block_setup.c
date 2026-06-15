@@ -23,6 +23,7 @@
 #include <inttypes.h>
 #include <linux/ioctl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,6 +62,8 @@
 #define POLARIS_DAEMON_RM_ALLOC_OOM_BUDGET_BYTES (64ULL * 1024ULL * 1024ULL * 1024ULL)
 #define POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BYTES \
     ((uint64_t)POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BLOCKS * POLARIS_BLOCK_SIZE)
+
+static volatile sig_atomic_t g_hold_registered_worker_stop;
 
 enum {
     POLARIS_UVM_FAULT_ERROR = -1,
@@ -1803,6 +1806,90 @@ static int read_sysfs_stat_u64(const char *name, uint64_t *value)
     fprintf(stderr, "stat %s not found in /sys/kernel/polaris/stats\n", name);
     fclose(f);
     return -1;
+}
+
+static void hold_registered_worker_signal(int sig)
+{
+    (void)sig;
+    g_hold_registered_worker_stop = 1;
+}
+
+static int write_hold_ready_marker(const char *path,
+                                   uint64_t block_id,
+                                   uint64_t base)
+{
+    if (!path || path[0] == '\0')
+        return 0;
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr,
+                "open hold-ready marker %s failed: errno=%d (%s)\n",
+                path,
+                errno,
+                strerror(errno));
+        return -1;
+    }
+
+    fprintf(f,
+            "pid=%ld block=%llu base=0x%llx\n",
+            (long)getpid(),
+            (unsigned long long)block_id,
+            (unsigned long long)base);
+    fclose(f);
+    return 0;
+}
+
+static int hold_registered_worker(uint64_t block_id, uint64_t base)
+{
+    struct sigaction sa = {
+        .sa_handler = hold_registered_worker_signal,
+    };
+    const char *ready_path = getenv("POLARIS_HOLD_READY_PATH");
+    uint64_t v4_va_spaces = 0;
+    uint64_t block_mappings = 0;
+    uint64_t static_blocks = 0;
+
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGTERM, &sa, NULL) != 0 ||
+        sigaction(SIGINT, &sa, NULL) != 0) {
+        fprintf(stderr,
+                "install hold signal handlers failed: errno=%d (%s)\n",
+                errno,
+                strerror(errno));
+        return -1;
+    }
+
+    if (read_sysfs_stat_u64("v4_va_spaces", &v4_va_spaces) != 0 ||
+        read_sysfs_stat_u64("block_mappings", &block_mappings) != 0 ||
+        read_sysfs_stat_u64("static_blocks", &static_blocks) != 0)
+        return -1;
+
+    if (v4_va_spaces == 0 || block_mappings == 0 || static_blocks != 0) {
+        fprintf(stderr,
+                "hold-registered-worker unexpected stats: v4_va_spaces=%llu block_mappings=%llu static_blocks=%llu\n",
+                (unsigned long long)v4_va_spaces,
+                (unsigned long long)block_mappings,
+                (unsigned long long)static_blocks);
+        return -1;
+    }
+
+    if (write_hold_ready_marker(ready_path, block_id, base) != 0)
+        return -1;
+
+    printf("POLARIS holding registered worker: pid=%ld block=%llu base=0x%llx v4_va_spaces=%llu block_mappings=%llu\n",
+           (long)getpid(),
+           (unsigned long long)block_id,
+           (unsigned long long)base,
+           (unsigned long long)v4_va_spaces,
+           (unsigned long long)block_mappings);
+    fflush(stdout);
+
+    while (!g_hold_registered_worker_stop)
+        pause();
+
+    printf("POLARIS registered worker hold exiting\n");
+    return 0;
 }
 
 static int wait_for_sysfs_stat_u64(const char *name,
@@ -4547,6 +4634,7 @@ int main(int argc, char **argv)
     bool daemon_rm_alloc_oom_pressure_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
+    bool hold_registered_worker_mode = false;
     uint64_t block_id = 0;
     struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
     struct daemon_rm_stress_block daemon_oversized_block = {0};
@@ -4652,6 +4740,10 @@ int main(int argc, char **argv)
             daemon_rm_cow_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--hold-registered-worker") == 0) {
+            hold_registered_worker_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             complete_backed_refault = true;
@@ -4695,7 +4787,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -4722,7 +4814,8 @@ int main(int argc, char **argv)
                      !daemon_rm_near_capacity_soak_mode &&
                      !daemon_rm_host_pool_oom_pressure_mode &&
                      !daemon_rm_alloc_oom_pressure_mode &&
-                     !daemon_rm_cow_roundtrip_mode) != 0)
+                     !daemon_rm_cow_roundtrip_mode &&
+                     !hold_registered_worker_mode) != 0)
         goto out;
     uint64_t managed_length = daemon_rm_alloc_oom_pressure_mode
         ? POLARIS_DAEMON_RM_ALLOC_OOM_BYTES
@@ -4745,10 +4838,11 @@ int main(int argc, char **argv)
                   base,
                   managed_length,
                   !dispatch_fault && !daemon_rm_multi_block_stress_mode &&
-                      !daemon_rm_dynamic_fragmentation_stress_mode &&
-                      !daemon_rm_near_capacity_soak_mode &&
-                      !daemon_rm_host_pool_oom_pressure_mode &&
-                      !daemon_rm_alloc_oom_pressure_mode) != 0)
+                  !daemon_rm_dynamic_fragmentation_stress_mode &&
+                  !daemon_rm_near_capacity_soak_mode &&
+                  !daemon_rm_host_pool_oom_pressure_mode &&
+                  !daemon_rm_alloc_oom_pressure_mode &&
+                  !hold_registered_worker_mode) != 0)
         goto out;
     polaris_va_space_token = s.h_vaspace;
     if (probe_uvm_dispatch_key(&s,
@@ -4769,7 +4863,8 @@ int main(int argc, char **argv)
                           !daemon_rm_dynamic_fragmentation_stress_mode &&
                           !daemon_rm_near_capacity_soak_mode &&
                           !daemon_rm_host_pool_oom_pressure_mode &&
-                          !daemon_rm_alloc_oom_pressure_mode,
+                          !daemon_rm_alloc_oom_pressure_mode &&
+                          !hold_registered_worker_mode,
                       daemon_rm_spill_reload_roundtrip_mode ||
                           daemon_rm_spill_reload_stress_mode ||
                           daemon_rm_multi_block_stress_mode ||
@@ -4779,6 +4874,24 @@ int main(int argc, char **argv)
                           daemon_rm_alloc_oom_pressure_mode ||
                           daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
+
+    if (hold_registered_worker_mode) {
+        if (register_logical_block_mapping(&s,
+                                           polaris_gpu_id,
+                                           polaris_rm_client_token,
+                                           polaris_va_space_token,
+                                           base,
+                                           managed_length,
+                                           POLARIS_BLOCK_SIZE,
+                                           true,
+                                           &block_id) != 0)
+            goto out;
+        if (hold_registered_worker(block_id, base) != 0)
+            goto out;
+        puts("M6 Polaris registered worker hold completed.");
+        rc = 0;
+        goto out;
+    }
 
     if (daemon_rm_alloc_oom_pressure_mode) {
         if (setup_oversized_deferred_daemon_block(&s,
@@ -5067,6 +5180,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM host-pool OOM pressure passed.");
     else if (daemon_rm_alloc_oom_pressure_mode)
         puts("M6 Polaris daemon-backed RM allocation OOM pressure passed.");
+    else if (hold_registered_worker_mode)
+        puts("M6 Polaris registered worker hold completed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)
@@ -5087,7 +5202,8 @@ int main(int argc, char **argv)
         !daemon_rm_dynamic_fragmentation_stress_mode &&
         !daemon_rm_near_capacity_soak_mode &&
         !daemon_rm_host_pool_oom_pressure_mode &&
-        !daemon_rm_alloc_oom_pressure_mode)
+        !daemon_rm_alloc_oom_pressure_mode &&
+        !hold_registered_worker_mode)
         puts("Next step: add an RM GPFIFO channel bound to this VA-space and submit a write to the unmapped block.");
     rc = 0;
 
