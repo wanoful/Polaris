@@ -314,9 +314,14 @@ fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
 still uses a bounded managed-window allocator model. The current M5 regression
 now runs against a real `polarisd` with `POLARISD_RM_BACKING=1`, so llama.cpp
 KV allocations are materialized through daemon-owned RM backing rather than
-the shim's static RM diagnostic backend. Remaining production work is focused
-on replacing this bounded window with workload-driven VA growth/reclamation,
-broader stress coverage, and permission-based write-fault COW.
+the shim's static RM diagnostic backend. Set
+`POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1` on
+`tests/llama_cpp/run_llama_shim_e2e.sh` to add a strict live llama probe that
+starts with `POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1`, grows the registered
+fault window under real KV allocation pressure, and verifies grow/shrink stats
+on cleanup. Remaining production work is focused on replacing this bounded
+capacity with broader workload-driven VA rebalancing, broader stress coverage,
+and permission-based write-fault COW.
 
 ## Why this is not a Cargo crate
 

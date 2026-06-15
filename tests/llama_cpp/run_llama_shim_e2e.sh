@@ -131,6 +131,7 @@ device_log="$tmpdir/list-devices.log"
 polaris_log="$tmpdir/llama-polaris-backend.log"
 shim_log="$tmpdir/llama-shim-probe.log"
 managed_shim_log="$tmpdir/llama-shim-managed-probe.log"
+dynamic_shim_log="$tmpdir/llama-shim-dynamic-window.log"
 polarisd_log="$tmpdir/polarisd.log"
 stats_before="$tmpdir/stats.before"
 stats_after="$tmpdir/stats.after"
@@ -216,6 +217,7 @@ fi
 
 run_shim_probe() {
     local unified_memory="$1"
+    local dynamic_window="${2:-0}"
     local probe_env=(
         GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
         GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}"
@@ -233,6 +235,14 @@ run_shim_probe() {
         POLARIS_SHIM_MAX_MANAGED_ALLOC="${POLARIS_SHIM_MAX_MANAGED_ALLOC:-0}"
         LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}"
     )
+
+    if [[ "$dynamic_window" == "1" ]]; then
+        probe_env+=(
+            POLARIS_SHIM_MANAGED_BLOCKS="${POLARIS_LLAMA_DYNAMIC_MANAGED_BLOCKS:-256}"
+            POLARIS_SHIM_MANAGED_INITIAL_BLOCKS="${POLARIS_LLAMA_DYNAMIC_INITIAL_BLOCKS:-1}"
+            POLARIS_SHIM_MANAGED_GROW_BLOCKS="${POLARIS_LLAMA_DYNAMIC_GROW_BLOCKS:-1}"
+        )
+    fi
 
     if [[ "$unified_memory" == "1" ]]; then
         probe_env+=(GGML_CUDA_ENABLE_UNIFIED_MEMORY=1)
@@ -252,6 +262,7 @@ verify_shim_probe() {
     local expected_selected_key="$7"
     local rc="$8"
     local before_blocks="$9"
+    local require_dynamic="${10:-0}"
     local after_hook
     local after_handled
     local after_no_pte
@@ -259,6 +270,8 @@ verify_shim_probe() {
     local managed_success
     local strict_failures
     local expected_selected
+    local grow_calls
+    local shrink_calls
     local blocks_before
     local blocks_after
 
@@ -303,9 +316,13 @@ verify_shim_probe() {
     managed_success="$(extract_last_metric managed_success_calls "$log")"
     strict_failures="$(extract_last_metric strict_failure_calls "$log")"
     expected_selected="$(extract_last_metric "$expected_selected_key" "$log")"
+    grow_calls="$(extract_last_metric managed_window_grow_calls "$log")"
+    shrink_calls="$(extract_last_metric managed_window_shrink_calls "$log")"
     managed_success="${managed_success:-0}"
     strict_failures="${strict_failures:-0}"
     expected_selected="${expected_selected:-0}"
+    grow_calls="${grow_calls:-0}"
+    shrink_calls="${shrink_calls:-0}"
     if [[ "$managed_success" -le 0 ]]; then
         die "$label shim stats reported no successful managed allocations; see $log"
     fi
@@ -314,6 +331,15 @@ verify_shim_probe() {
     fi
     if [[ "$expected_selected" -le 0 ]]; then
         die "$label shim stats reported ${expected_selected_key}=0; see $log"
+    fi
+    if [[ "$require_dynamic" == "1" ]]; then
+        grep -q '\[polaris-shim\] grew registered VA-space window' "$log" ||
+            die "$label did not grow the registered v4 fault window; see $log"
+        grep -q '\[polaris-shim\] shrank registered VA-space window' "$log" ||
+            die "$label did not shrink the registered v4 fault window; see $log"
+        if [[ "$grow_calls" -le 0 || "$shrink_calls" -le 0 ]]; then
+            die "$label dynamic-window stats missing grow/shrink calls grow=$grow_calls shrink=$shrink_calls; see $log"
+        fi
     fi
 
     if [[ "$after_hook" -le "$before_hook" ]]; then
@@ -343,6 +369,10 @@ verify_shim_probe() {
     note "PASS: $label llama.cpp shim allocation and GPU fault path reached Polaris"
     note "managed_success_calls=$managed_success"
     note "$expected_selected_key=$expected_selected"
+    if [[ "$grow_calls" -gt 0 || "$shrink_calls" -gt 0 ]]; then
+        note "managed_window_grow_calls=$grow_calls"
+        note "managed_window_shrink_calls=$shrink_calls"
+    fi
     note "uvm_hook_calls: $before_hook -> $after_hook"
     note "uvm_handled:    $before_handled -> $after_handled"
 }
@@ -355,11 +385,11 @@ before_blocks="$(stat_value blocks)"
 
 note "running LD_PRELOAD shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 set +e
-run_shim_probe "" >"$shim_log" 2>&1
+run_shim_probe "" "0" >"$shim_log" 2>&1
 rc=$?
 set -e
 verify_shim_probe "default" "$shim_log" "$before_hook_calls" "$before_handled" \
-    "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks"
+    "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 0
 
 before_hook_calls="$(stat_value uvm_hook_calls)"
 before_handled="$(stat_value uvm_handled)"
@@ -369,11 +399,27 @@ before_blocks="$(stat_value blocks)"
 
 note "running LD_PRELOAD unified-memory shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 set +e
-run_shim_probe "1" >"$managed_shim_log" 2>&1
+run_shim_probe "1" "0" >"$managed_shim_log" 2>&1
 rc=$?
 set -e
 verify_shim_probe "unified-memory" "$managed_shim_log" "$before_hook_calls" "$before_handled" \
-    "$before_no_pte" "$before_errors" api_runtime_managed_alloc_selected "$rc" "$before_blocks"
+    "$before_no_pte" "$before_errors" api_runtime_managed_alloc_selected "$rc" "$before_blocks" 0
+
+if [[ "${POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE:-0}" == "1" ]]; then
+    before_hook_calls="$(stat_value uvm_hook_calls)"
+    before_handled="$(stat_value uvm_handled)"
+    before_no_pte="$(stat_value uvm_no_pte)"
+    before_errors="$(stat_value uvm_errors)"
+    before_blocks="$(stat_value blocks)"
+
+    note "running LD_PRELOAD dynamic-window shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+    set +e
+    run_shim_probe "" "1" >"$dynamic_shim_log" 2>&1
+    rc=$?
+    set -e
+    verify_shim_probe "dynamic-window" "$dynamic_shim_log" "$before_hook_calls" "$before_handled" \
+        "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 1
+fi
 
 cp "$STATS_PATH" "$stats_after"
 note "logs kept in $tmpdir"

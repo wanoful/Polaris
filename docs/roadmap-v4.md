@@ -1061,6 +1061,14 @@ Still to do on the Polaris side for M1/M2:
   the deferred logical blocks, records the expected per-API selected allocation
   counter, and in strict mode increments both `uvm_hook_calls` and
   `uvm_handled` without static RM registration.
+- Dynamic-window llama.cpp regression variant added:
+  `POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1` runs an additional unmodified
+  CUDA `llama-bench` probe with a one-block initial registered v4 fault window
+  and a larger block-count capacity, requiring the shim to report both
+  `managed_window_grow_calls` and `managed_window_shrink_calls` while the
+  workload still reaches daemon-published RM backing and UVM handled faults.
+  This validates the grow/reclaim allocator policy against the real
+  no-source-change llama KV path without static RM.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed

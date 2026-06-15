@@ -926,6 +926,11 @@ launch symbols and related helper symbols resolve through the shim without
 executing kernels.
 Set `POLARIS_SHIM_TEST_LEAK=1` when running `managed_alloc` to validate the
 shim's process-exit cleanup for outstanding managed allocations.
+Set `POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1` on
+`tests/llama_cpp/run_llama_shim_e2e.sh` to run an additional live llama.cpp
+probe that starts with a one-block registered fault window, grows it under
+KV allocation pressure, and requires shrink on cleanup while still using
+daemon-owned RM backing.
 
 ## Notes
 
