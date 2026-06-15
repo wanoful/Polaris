@@ -56,9 +56,11 @@ struct UvmPolarisOps {
 
 const UVM_POLARIS_FAULT_NOT_MINE: c_int = 0;
 const UVM_POLARIS_FAULT_HANDLED: c_int = 1;
+const UVM_POLARIS_FAULT_DEFERRED: c_int = 3;
 const UVM_POLARIS_FAULT_ERROR: c_int = -1;
 const POLARIS_MAX_FAST_VASPACES: usize = 16;
 const POLARIS_MAX_FAST_STATIC_BLOCKS: usize = 16;
+const POLARIS_UVM_RECENT_FAULTS: usize = 4;
 
 static UVM_POLARIS_OPS: UvmPolarisOps = UvmPolarisOps {
     owner: core::ptr::addr_of_mut!(bindings::__this_module),
@@ -66,6 +68,47 @@ static UVM_POLARIS_OPS: UvmPolarisOps = UvmPolarisOps {
 };
 
 unsafe impl Sync for UvmPolarisOps {}
+
+fn polaris_record_uvm_fault_result(
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    fault_address: u64,
+    access_type: u32,
+    result: c_int,
+) {
+    POLARIS_UVM_LAST_RESULT.store(result, Relaxed);
+    let cursor = POLARIS_UVM_RECENT_CURSOR.fetch_add(1, Relaxed);
+    let slot = (cursor as usize) & (POLARIS_UVM_RECENT_FAULTS - 1);
+    POLARIS_UVM_RECENT_GPU_ID[slot].store(gpu_id, Relaxed);
+    POLARIS_UVM_RECENT_RM_CLIENT_TOKEN[slot].store(rm_client_token, Relaxed);
+    POLARIS_UVM_RECENT_VA_SPACE_TOKEN[slot].store(va_space_token, Relaxed);
+    POLARIS_UVM_RECENT_FAULT_ADDRESS[slot].store(fault_address, Relaxed);
+    POLARIS_UVM_RECENT_ACCESS_TYPE[slot].store(access_type, Relaxed);
+    POLARIS_UVM_RECENT_RESULT[slot].store(result, Relaxed);
+}
+
+fn polaris_return_uvm_fault(
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    fault_address: u64,
+    access_type: u32,
+    result: c_int,
+) -> c_int {
+    if result == UVM_POLARIS_FAULT_DEFERRED {
+        POLARIS_UVM_FAULT_DEFERRED.fetch_add(1, Relaxed);
+    }
+    polaris_record_uvm_fault_result(
+        gpu_id,
+        rm_client_token,
+        va_space_token,
+        fault_address,
+        access_type,
+        result,
+    );
+    result
+}
 
 struct PolarisFastVaSpaceSlot {
     gpu_id: Atomic<u32>,
@@ -102,6 +145,7 @@ static POLARIS_UVM_FAULT_FAST_MATCHES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_FAST_MISSES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_HANDLED: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_FAULT_DEFERRED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_ERRORS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
@@ -118,6 +162,20 @@ static POLARIS_UVM_BRIDGE_MAP_ERRORS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_BRIDGE_MAP_RETRIES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_BRIDGE_MAP_LAST_NS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_BRIDGE_MAP_TOTAL_NS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_ZERO_FAULTS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_RECENT_CURSOR: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_RECENT_FAULT_ADDRESS: [Atomic<u64>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
+static POLARIS_UVM_RECENT_RESULT: [Atomic<i32>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
+static POLARIS_UVM_RECENT_GPU_ID: [Atomic<u32>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
+static POLARIS_UVM_RECENT_ACCESS_TYPE: [Atomic<u32>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
+static POLARIS_UVM_RECENT_RM_CLIENT_TOKEN: [Atomic<u64>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
+static POLARIS_UVM_RECENT_VA_SPACE_TOKEN: [Atomic<u64>; POLARIS_UVM_RECENT_FAULTS] =
+    [const { Atomic::new(0) }; POLARIS_UVM_RECENT_FAULTS];
 
 struct PolarisFastStaticBlockSlot {
     gpu_id: Atomic<u32>,
@@ -390,6 +448,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
     access_type: u32,
 ) -> c_int {
     POLARIS_UVM_FAULT_HOOK_CALLS.fetch_add(1, Relaxed);
+    if fault_address == 0 {
+        POLARIS_UVM_ZERO_FAULTS.fetch_add(1, Relaxed);
+    }
     POLARIS_UVM_LAST_GPU_ID.store(gpu_id, Relaxed);
     POLARIS_UVM_LAST_RM_CLIENT_TOKEN.store(rm_client_token, Relaxed);
     POLARIS_UVM_LAST_VA_SPACE_TOKEN.store(va_space_token, Relaxed);
@@ -458,13 +519,25 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                         gpu_va_space_ptr,
                     );
                     POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                    return UVM_POLARIS_FAULT_HANDLED;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_HANDLED,
+                    );
                 }
                 Err(()) => {
                     POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                    return UVM_POLARIS_FAULT_ERROR;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_ERROR,
+                    );
                 }
             }
         }
@@ -483,13 +556,25 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                         gpu_va_space_ptr,
                     );
                     POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                    return UVM_POLARIS_FAULT_HANDLED;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_HANDLED,
+                    );
                 }
                 Err(()) => {
                     POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                    return UVM_POLARIS_FAULT_ERROR;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_ERROR,
+                    );
                 }
             }
         }
@@ -523,40 +608,81 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                                     gpu_va_space_ptr,
                                 );
                                 POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                                return UVM_POLARIS_FAULT_HANDLED;
+                                return polaris_return_uvm_fault(
+                                    gpu_id,
+                                    rm_client_token,
+                                    va_space_token,
+                                    fault_address,
+                                    access_type,
+                                    UVM_POLARIS_FAULT_HANDLED,
+                                );
                             }
                             Err(()) => {
                                 POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                                return UVM_POLARIS_FAULT_ERROR;
+                                return polaris_return_uvm_fault(
+                                    gpu_id,
+                                    rm_client_token,
+                                    va_space_token,
+                                    fault_address,
+                                    access_type,
+                                    UVM_POLARIS_FAULT_ERROR,
+                                );
                             }
                         }
                     }
                     POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-                    return UVM_POLARIS_FAULT_NOT_MINE;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_NOT_MINE,
+                    );
                 }
                 Ok(PolarisUvmFaultResult::NotMine) => {
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-                    return UVM_POLARIS_FAULT_NOT_MINE;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_NOT_MINE,
+                    );
                 }
                 Ok(PolarisUvmFaultResult::Queued) => {
-                    POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                    return UVM_POLARIS_FAULT_HANDLED;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_DEFERRED,
+                    );
                 }
                 Ok(PolarisUvmFaultResult::Error) | Err(_) => {
                     POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                    return UVM_POLARIS_FAULT_ERROR;
+                    return polaris_return_uvm_fault(
+                        gpu_id,
+                        rm_client_token,
+                        va_space_token,
+                        fault_address,
+                        access_type,
+                        UVM_POLARIS_FAULT_ERROR,
+                    );
                 }
             }
         }
 
         POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
-        POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-        return UVM_POLARIS_FAULT_NOT_MINE;
+        return polaris_return_uvm_fault(
+            gpu_id,
+            rm_client_token,
+            va_space_token,
+            fault_address,
+            access_type,
+            UVM_POLARIS_FAULT_NOT_MINE,
+        );
     }
 
     if let Some(mapping) = polaris_find_single_observed_fault_mapping(
@@ -571,13 +697,25 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                     gpu_va_space_ptr,
                 );
                 POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                return UVM_POLARIS_FAULT_HANDLED;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_HANDLED,
+                );
             }
             Err(()) => {
                 POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                return UVM_POLARIS_FAULT_ERROR;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_ERROR,
+                );
             }
         }
     }
@@ -609,40 +747,81 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                                 gpu_va_space_ptr,
                             );
                             POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                            POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                            return UVM_POLARIS_FAULT_HANDLED;
+                            return polaris_return_uvm_fault(
+                                gpu_id,
+                                rm_client_token,
+                                va_space_token,
+                                fault_address,
+                                access_type,
+                                UVM_POLARIS_FAULT_HANDLED,
+                            );
                         }
                         Err(()) => {
                             POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                            POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                            return UVM_POLARIS_FAULT_ERROR;
+                            return polaris_return_uvm_fault(
+                                gpu_id,
+                                rm_client_token,
+                                va_space_token,
+                                fault_address,
+                                access_type,
+                                UVM_POLARIS_FAULT_ERROR,
+                            );
                         }
                     }
                 }
                 POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-                return UVM_POLARIS_FAULT_NOT_MINE;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_NOT_MINE,
+                );
             }
             Ok(PolarisUvmFaultResult::NotMine) => {
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-                return UVM_POLARIS_FAULT_NOT_MINE;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_NOT_MINE,
+                );
             }
             Ok(PolarisUvmFaultResult::Queued) => {
-                POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
-                return UVM_POLARIS_FAULT_HANDLED;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_DEFERRED,
+                );
             }
             Ok(PolarisUvmFaultResult::Error) | Err(_) => {
                 POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
-                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
-                return UVM_POLARIS_FAULT_ERROR;
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_ERROR,
+                );
             }
         }
     }
 
     POLARIS_UVM_FAULT_FAST_MISSES.fetch_add(1, Relaxed);
-    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
-    UVM_POLARIS_FAULT_NOT_MINE
+    polaris_return_uvm_fault(
+        gpu_id,
+        rm_client_token,
+        va_space_token,
+        fault_address,
+        access_type,
+        UVM_POLARIS_FAULT_NOT_MINE,
+    )
 }
 
 fn polaris_timed_uvm_map_external_allocation(
@@ -788,6 +967,13 @@ struct PolarisMappingUnmap {
 }
 
 #[derive(Clone, Copy)]
+struct PolarisPreparedOffload {
+    decision: PolarisDecision,
+    block_id: u64,
+    decision_id: u64,
+}
+
+#[derive(Clone, Copy)]
 struct PolarisRmPhysProbeTarget {
     block_id: u64,
     gpu_id: u32,
@@ -861,6 +1047,7 @@ fn polaris_find_logical_fault_mapping(
 
         let block = inner.blocks.iter().find(|b| b.block_id == mapping.block_id)?;
         if block.home_gpu != gpu_id
+            || block.state != PolarisBlockState::Resident
             || block.rm_h_memory == 0
             || block.rm_h_client == 0
             || block.rm_backing_length < mapping.length
@@ -912,7 +1099,12 @@ fn polaris_can_materialize_logical_fault_mapping(
                     block.state,
                     PolarisBlockState::Unmapped
                         | PolarisBlockState::CpuOffloaded
+                        | PolarisBlockState::AllocPending
+                        | PolarisBlockState::OffloadPending
+                        | PolarisBlockState::ReloadPending
                         | PolarisBlockState::CowPending
+                        | PolarisBlockState::FreePending
+                        | PolarisBlockState::Evicted
                 )
         })
     })
@@ -938,6 +1130,7 @@ fn polaris_find_single_observed_fault_mapping(
             continue;
         };
         if block.home_gpu != gpu_id
+            || block.state != PolarisBlockState::Resident
             || block.rm_h_memory == 0
             || block.rm_h_client == 0
             || block.rm_backing_length < mapping.length
@@ -990,7 +1183,12 @@ fn polaris_find_single_materializable_fault_mapping(
                 block.state,
                 PolarisBlockState::Unmapped
                     | PolarisBlockState::CpuOffloaded
+                    | PolarisBlockState::AllocPending
+                    | PolarisBlockState::OffloadPending
+                    | PolarisBlockState::ReloadPending
                     | PolarisBlockState::CowPending
+                    | PolarisBlockState::FreePending
+                    | PolarisBlockState::Evicted
             )
         {
             continue;
@@ -1350,18 +1548,14 @@ fn polaris_unmap_observed_block_mappings(block_id: u64) -> Result<u32> {
     Ok(unmapped)
 }
 
-fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) -> Result<u64> {
+fn polaris_prepare_offload_decision(
+    inner: &mut PolarisInner,
+    block_idx: usize,
+) -> Result<PolarisPreparedOffload> {
     if block_idx >= inner.blocks.len() {
         return Err(ENOENT);
     }
-    if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
-        return Err(ENOMEM);
-    }
-
-    let decision_id = inner.next_decision_id;
-    inner.next_decision_id += 1;
-
-    let block = &inner.blocks[block_idx];
+    let block = &mut inner.blocks[block_idx];
     if block.state != PolarisBlockState::Resident {
         return Err(ENOENT);
     }
@@ -1369,6 +1563,8 @@ fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) ->
         return Err(ENOENT);
     }
 
+    let decision_id = inner.next_decision_id;
+    inner.next_decision_id += 1;
     let decision = PolarisDecision {
         decision_id,
         fault_id: 0,
@@ -1388,15 +1584,106 @@ fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) ->
         _reserved: [0u64; 4],
     };
 
-    inner.pending_decisions.push(decision, GFP_KERNEL)?;
-
-    let block = &mut inner.blocks[block_idx];
     block.state = PolarisBlockState::OffloadPending;
     block.pending_decision_id = decision_id;
     block.pending_fault_id = 0;
     block.pending_generation = 0;
 
-    Ok(decision_id)
+    Ok(PolarisPreparedOffload {
+        decision,
+        block_id: block.block_id,
+        decision_id,
+    })
+}
+
+fn polaris_publish_prepared_offload(
+    inner: &mut PolarisInner,
+    prepared: PolarisPreparedOffload,
+) -> Result<()> {
+    if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+        if let Some(block) = inner
+            .blocks
+            .iter_mut()
+            .find(|b| b.block_id == prepared.block_id
+                && b.pending_decision_id == prepared.decision_id
+                && b.state == PolarisBlockState::OffloadPending)
+        {
+            block.state = PolarisBlockState::Resident;
+            block.pending_decision_id = 0;
+        }
+        return Err(ENOMEM);
+    }
+
+    match inner.pending_decisions.push(prepared.decision, GFP_KERNEL) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            polaris_cancel_prepared_offload(inner, prepared);
+            Err(err.into())
+        }
+    }
+}
+
+fn polaris_cancel_prepared_offload(inner: &mut PolarisInner, prepared: PolarisPreparedOffload) {
+    if let Some(block) = inner
+        .blocks
+        .iter_mut()
+        .find(|b| b.block_id == prepared.block_id
+            && b.pending_decision_id == prepared.decision_id
+            && b.state == PolarisBlockState::OffloadPending)
+    {
+        block.state = PolarisBlockState::Resident;
+        block.pending_decision_id = 0;
+        block.pending_fault_id = 0;
+        block.pending_generation = 0;
+    }
+}
+
+fn polaris_prepare_unmap_publish_offload(
+    block_id: u64,
+) -> Result<(u64, u32)> {
+    if block_id == 0 {
+        return Err(EINVAL);
+    }
+
+    let prepared = {
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+        let block_idx = inner
+            .blocks
+            .iter()
+            .position(|b| b.block_id == block_id)
+            .ok_or(ENOENT)?;
+
+        match inner.blocks[block_idx].state {
+            PolarisBlockState::CpuOffloaded => return Ok((0, 0)),
+            PolarisBlockState::Resident => polaris_prepare_offload_decision(inner, block_idx)?,
+            PolarisBlockState::AllocPending
+            | PolarisBlockState::OffloadPending
+            | PolarisBlockState::ReloadPending
+            | PolarisBlockState::CowPending
+            | PolarisBlockState::FreePending => return Err(EBUSY),
+            PolarisBlockState::Unmapped | PolarisBlockState::Evicted => return Err(ENOENT),
+        }
+    };
+
+    let unmapped_count = match polaris_unmap_observed_block_mappings(block_id) {
+        Ok(count) => count,
+        Err(err) => {
+            let mut guard = POLARIS_STATE.lock();
+            if let Some(inner) = guard.as_mut() {
+                polaris_cancel_prepared_offload(inner, prepared);
+            }
+            return Err(err);
+        }
+    };
+
+    {
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+        polaris_publish_prepared_offload(inner, prepared)?;
+    }
+
+    Ok((prepared.decision_id, unmapped_count))
 }
 
 fn polaris_queue_free_decision(inner: &mut PolarisInner, block_idx: usize) -> Result<u64> {
@@ -1445,12 +1732,12 @@ fn polaris_queue_free_decision(inner: &mut PolarisInner, block_idx: usize) -> Re
     Ok(decision_id)
 }
 
-fn polaris_schedule_post_residency_budget_victims(
-    inner: &mut PolarisInner,
+fn polaris_select_post_residency_budget_victim(
+    inner: &PolarisInner,
     requesting_session_id: u64,
     target_gpu: u32,
     protected_block_id: u64,
-) {
+) -> Option<u64> {
     let (used_bytes, budget_bytes, cpu_pool_used, cpu_pool_total) = match inner
         .gpus
         .iter()
@@ -1462,11 +1749,11 @@ fn polaris_schedule_post_residency_budget_victims(
             gpu.cpu_pool_used_bytes,
             gpu.cpu_pool_total_bytes,
         ),
-        None => return,
+        None => return None,
     };
 
     if budget_bytes == 0 || used_bytes <= budget_bytes {
-        return;
+        return None;
     }
 
     let mut cpu_pool_reserved = cpu_pool_used;
@@ -1476,37 +1763,63 @@ fn polaris_schedule_post_residency_budget_victims(
         }
     }
 
-    let mut deficit = used_bytes.saturating_sub(budget_bytes);
-    while deficit > 0 {
-        if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
-            return;
-        }
+    let pending_offload_bytes = inner
+        .blocks
+        .iter()
+        .filter(|block| block.home_gpu == target_gpu && block.state == PolarisBlockState::OffloadPending)
+        .fold(0u64, |acc, block| acc.saturating_add(block.size_bytes));
+    let deficit = used_bytes
+        .saturating_sub(pending_offload_bytes)
+        .saturating_sub(budget_bytes);
+    if deficit == 0 || inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+        return None;
+    }
 
-        let Some((victim_idx, _victim_id, victim_size, _victim_gpu)) =
-            polaris_policy::select_victim(
+    let Some((_victim_idx, victim_id, victim_size, _victim_gpu)) =
+        polaris_policy::select_victim(
+            inner,
+            requesting_session_id,
+            target_gpu,
+            0,
+            protected_block_id,
+        )
+    else {
+        return None;
+    };
+
+    if victim_size == 0 || cpu_pool_reserved.saturating_add(victim_size) > cpu_pool_total {
+        return None;
+    }
+
+    Some(victim_id)
+}
+
+fn polaris_schedule_post_residency_budget_victims(
+    requesting_session_id: u64,
+    target_gpu: u32,
+    protected_block_id: u64,
+) {
+    loop {
+        let victim_id = {
+            let guard = POLARIS_STATE.lock();
+            let Some(inner) = guard.as_ref() else {
+                return;
+            };
+            polaris_select_post_residency_budget_victim(
                 inner,
                 requesting_session_id,
                 target_gpu,
-                0,
                 protected_block_id,
             )
-        else {
+        };
+
+        let Some(victim_id) = victim_id else {
             return;
         };
 
-        if victim_size == 0 {
+        if polaris_prepare_unmap_publish_offload(victim_id).is_err() {
             return;
         }
-        if cpu_pool_reserved.saturating_add(victim_size) > cpu_pool_total {
-            return;
-        }
-
-        if polaris_queue_offload_decision(inner, victim_idx).is_err() {
-            return;
-        }
-
-        cpu_pool_reserved = cpu_pool_reserved.saturating_add(victim_size);
-        deficit = deficit.saturating_sub(victim_size);
     }
 }
 
@@ -1788,7 +2101,11 @@ fn polaris_resolve_gpu_fault(
         PolarisBlockState::Unmapped => PolarisDecisionOp::Alloc,
         PolarisBlockState::CpuOffloaded => PolarisDecisionOp::Reload,
         PolarisBlockState::CowPending => PolarisDecisionOp::CowBreak,
-        PolarisBlockState::Resident => PolarisDecisionOp::MapExisting,
+        PolarisBlockState::Resident => {
+            let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+            inner.blocks[block_idx].last_touch_ns = now;
+            return Ok(PolarisUvmFaultResult::Handled);
+        }
         PolarisBlockState::AllocPending
         | PolarisBlockState::ReloadPending
         | PolarisBlockState::OffloadPending
@@ -1857,8 +2174,7 @@ fn polaris_resolve_gpu_fault(
         GFP_KERNEL,
     )?;
 
-    let should_wait = mode == PolarisFaultResolveMode::ProcessWait
-        || !matches!(op, PolarisDecisionOp::Reload);
+    let should_wait = mode == PolarisFaultResolveMode::ProcessWait;
     inner.pending_decisions.push(
         PolarisDecision {
             decision_id,
@@ -2048,7 +2364,9 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_fast_misses = POLARIS_UVM_FAULT_FAST_MISSES.load(Relaxed);
     let uvm_unserviceable = POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.load(Relaxed);
     let uvm_handled = POLARIS_UVM_FAULT_HANDLED.load(Relaxed);
+    let uvm_deferred = POLARIS_UVM_FAULT_DEFERRED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
+    let uvm_zero_faults = POLARIS_UVM_ZERO_FAULTS.load(Relaxed);
     let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
     let uvm_last_client = POLARIS_UVM_LAST_RM_CLIENT_TOKEN.load(Relaxed);
     let uvm_last_token = POLARIS_UVM_LAST_VA_SPACE_TOKEN.load(Relaxed);
@@ -2069,6 +2387,23 @@ unsafe extern "C" fn polaris_stats_show(
     } else {
         uvm_bridge_map_total_ns / uvm_bridge_map_calls
     };
+    let recent_cursor = POLARIS_UVM_RECENT_CURSOR.load(Relaxed);
+    let recent0_idx = recent_cursor.wrapping_sub(1) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
+    let recent1_idx = recent_cursor.wrapping_sub(2) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
+    let recent2_idx = recent_cursor.wrapping_sub(3) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
+    let recent3_idx = recent_cursor.wrapping_sub(4) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
+    let recent0_fault = POLARIS_UVM_RECENT_FAULT_ADDRESS[recent0_idx].load(Relaxed);
+    let recent1_fault = POLARIS_UVM_RECENT_FAULT_ADDRESS[recent1_idx].load(Relaxed);
+    let recent2_fault = POLARIS_UVM_RECENT_FAULT_ADDRESS[recent2_idx].load(Relaxed);
+    let recent3_fault = POLARIS_UVM_RECENT_FAULT_ADDRESS[recent3_idx].load(Relaxed);
+    let recent0_result = POLARIS_UVM_RECENT_RESULT[recent0_idx].load(Relaxed);
+    let recent1_result = POLARIS_UVM_RECENT_RESULT[recent1_idx].load(Relaxed);
+    let recent2_result = POLARIS_UVM_RECENT_RESULT[recent2_idx].load(Relaxed);
+    let recent3_result = POLARIS_UVM_RECENT_RESULT[recent3_idx].load(Relaxed);
+    let recent0_access = POLARIS_UVM_RECENT_ACCESS_TYPE[recent0_idx].load(Relaxed);
+    let recent1_access = POLARIS_UVM_RECENT_ACCESS_TYPE[recent1_idx].load(Relaxed);
+    let recent2_access = POLARIS_UVM_RECENT_ACCESS_TYPE[recent2_idx].load(Relaxed);
+    let recent3_access = POLARIS_UVM_RECENT_ACCESS_TYPE[recent3_idx].load(Relaxed);
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -2113,7 +2448,9 @@ uvm_fast_hits:  {uvm_fast_matches}
 uvm_fast_miss:  {uvm_fast_misses}
 uvm_no_pte:     {uvm_unserviceable}
 uvm_handled:    {uvm_handled}
+uvm_deferred:   {uvm_deferred}
 uvm_errors:     {uvm_errors}
+uvm_zero_faults:{uvm_zero_faults}
 uvm_last_gpu:   {uvm_last_gpu}
 uvm_last_client:0x{uvm_last_client:x}
 uvm_last_token: 0x{uvm_last_token:x}
@@ -2129,6 +2466,10 @@ uvm_bridge_map_err:{uvm_bridge_map_errors}
 uvm_bridge_map_retry:{uvm_bridge_map_retries}
 uvm_bridge_map_last_ns:{uvm_bridge_map_last_ns}
 uvm_bridge_map_avg_ns:{uvm_bridge_map_avg_ns}
+uvm_recent0:    fault=0x{recent0_fault:x} result={recent0_result} access={recent0_access}
+uvm_recent1:    fault=0x{recent1_fault:x} result={recent1_result} access={recent1_access}
+uvm_recent2:    fault=0x{recent2_fault:x} result={recent2_result} access={recent2_access}
+uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent3_access}
 ",
                 sessions = sessions,
                 blocks = blocks,
@@ -2163,7 +2504,9 @@ uvm_bridge_map_avg_ns:{uvm_bridge_map_avg_ns}
                 uvm_fast_misses = uvm_fast_misses,
                 uvm_unserviceable = uvm_unserviceable,
                 uvm_handled = uvm_handled,
+                uvm_deferred = uvm_deferred,
                 uvm_errors = uvm_errors,
+                uvm_zero_faults = uvm_zero_faults,
                 uvm_last_gpu = uvm_last_gpu,
                 uvm_last_client = uvm_last_client,
                 uvm_last_token = uvm_last_token,
@@ -2179,6 +2522,18 @@ uvm_bridge_map_avg_ns:{uvm_bridge_map_avg_ns}
                 uvm_bridge_map_retries = uvm_bridge_map_retries,
                 uvm_bridge_map_last_ns = uvm_bridge_map_last_ns,
                 uvm_bridge_map_avg_ns = uvm_bridge_map_avg_ns,
+                recent0_fault = recent0_fault,
+                recent1_fault = recent1_fault,
+                recent2_fault = recent2_fault,
+                recent3_fault = recent3_fault,
+                recent0_result = recent0_result,
+                recent1_result = recent1_result,
+                recent2_result = recent2_result,
+                recent3_result = recent3_result,
+                recent0_access = recent0_access,
+                recent1_access = recent1_access,
+                recent2_access = recent2_access,
+                recent3_access = recent3_access,
             ),
         );
         w.pos
@@ -3575,6 +3930,7 @@ impl PolarisDevice {
             let was_cpu_offloaded: bool;
             let completed_session_id: u64;
             let completed_block_id: u64;
+            let mut schedule_budget_after_unlock = false;
             {
                 let block = &mut inner.blocks[block_idx];
                 block.retry_count = 0;
@@ -3683,12 +4039,7 @@ impl PolarisDevice {
                     | PolarisBlockState::ReloadPending
                     | PolarisBlockState::CowPending
             ) {
-                polaris_schedule_post_residency_budget_victims(
-                    inner,
-                    completed_session_id,
-                    gpu_id,
-                    completed_block_id,
-                );
+                schedule_budget_after_unlock = true;
             }
 
             if should_remove {
@@ -3705,6 +4056,14 @@ impl PolarisDevice {
                 arg.decision_id,
                 arg.output_handle
             );
+            drop(guard);
+            if schedule_budget_after_unlock {
+                polaris_schedule_post_residency_budget_victims(
+                    completed_session_id,
+                    gpu_id,
+                    completed_block_id,
+                );
+            }
             return Ok(0);
         }
 
@@ -3873,24 +4232,34 @@ impl PolarisDevice {
             PolarisBlockState::ReloadPending => block.cpu_buf_addr,
             _ => 0,
         };
+        let src_vaddr = match block.state {
+            PolarisBlockState::OffloadPending => block.gpu_vaddr,
+            _ => 0,
+        };
+        let dst_vaddr = match block.state {
+            PolarisBlockState::AllocPending
+            | PolarisBlockState::ReloadPending
+            | PolarisBlockState::CowPending => block.gpu_vaddr,
+            _ => 0,
+        };
 
         let _ = inner.pending_decisions.push(
             PolarisDecision {
                 decision_id: dec_id,
-                fault_id: 0,
-                generation: 0,
+                fault_id: block.pending_fault_id,
+                generation: block.pending_generation,
                 op,
                 gpu_id: block.home_gpu,
                 block_id: block.block_id,
                 session_id: block.session_id,
                 src_handle,
                 dst_handle: 0,
-                src_vaddr: 0,
-                dst_vaddr: 0,
+                src_vaddr,
+                dst_vaddr,
                 size_bytes: block.size_bytes,
                 cpu_addr,
                 access_flags: 0,
-                timeout_ms: 0,
+                timeout_ms: block.fault_timeout_ms,
                 _reserved: if src_block_id != 0 {
                     [
                         src_block_id,
@@ -4747,37 +5116,7 @@ impl PolarisDevice {
             return Err(EINVAL);
         }
 
-        let decision_id = {
-            let mut guard = POLARIS_STATE.lock();
-            let inner = guard.as_mut().ok_or(ENODEV)?;
-
-            let block_idx = inner
-                .blocks
-                .iter()
-                .position(|b| b.block_id == arg.block_id)
-                .ok_or(ENOENT)?;
-
-            match inner.blocks[block_idx].state {
-                PolarisBlockState::CpuOffloaded => {
-                    0
-                }
-                PolarisBlockState::Resident => {
-                    polaris_queue_offload_decision(inner, block_idx)?
-                }
-                PolarisBlockState::AllocPending
-                | PolarisBlockState::OffloadPending
-                | PolarisBlockState::ReloadPending
-                | PolarisBlockState::CowPending
-                | PolarisBlockState::FreePending => {
-                    return Err(EBUSY);
-                }
-                PolarisBlockState::Unmapped | PolarisBlockState::Evicted => {
-                    return Err(ENOENT);
-                }
-            }
-        };
-
-        let unmapped_count = polaris_unmap_observed_block_mappings(arg.block_id)?;
+        let (decision_id, unmapped_count) = polaris_prepare_unmap_publish_offload(arg.block_id)?;
 
         arg.unmapped_count = unmapped_count;
         arg.decision_id = decision_id;

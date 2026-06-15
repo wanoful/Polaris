@@ -643,8 +643,8 @@ Still to do on the Polaris side for M1/M2:
   completion-backed RM residency contract.
 - UVM-hook reload hardening wired: when a replayable UVM fault hits a
   `CpuOffloaded` daemon-backed RM block, polaris.ko now queues one real daemon
-  `RELOAD` decision and returns `HANDLED`/retry instead of waiting inside the
-  hook for the daemon copy/allocation to finish. Replayed faults that arrive
+  `RELOAD` decision and returns `DEFERRED` instead of waiting inside the
+  hook or reporting the fault serviced before a PTE exists. Replayed faults that arrive
   while the block is already `ReloadPending` / `AllocPending` /
   `OffloadPending` / `FreePending` are also treated as queued rather than
   enqueueing duplicate decisions or reporting a fatal error. Process-context
@@ -762,9 +762,10 @@ Still to do on the Polaris side for M1/M2:
   `POLARIS_RM_COPY`, and verifies the two-block/4 MiB resident-set cap via
   `resident=2`, `gpu_used_mib=4`, and `offloaded=2`. The reload/refault phase
   exercises the async UVM-hook reload path: the first fault on a CPU-offloaded
-  block queues daemon `RELOAD` and returns handled for replay, the harness waits
-  for daemon completion to publish fresh RM backing, and a second refault maps
-  the daemon-owned backing before byte-integrity verification. Cleanup checks
+  block queues daemon `RELOAD` and returns `DEFERRED`, the harness waits for
+  daemon completion to publish fresh RM backing, and a second refault returns
+  `HANDLED` after mapping the daemon-owned backing before byte-integrity
+  verification. Cleanup checks
   `pending_decs=0`, `blocks=0`, and `static_blocks=0`. The gate now also
   validates M6 bridge telemetry by checking `uvm_bridge_map_calls`,
   `uvm_bridge_map_ok`, `uvm_bridge_map_err`, `uvm_bridge_map_last_ns`, and
@@ -797,11 +798,21 @@ Still to do on the Polaris side for M1/M2:
   VA.
 - Reload on fault: process-context callers still wait for fresh RM backing,
   copy host → device, bridge-map, and return `HANDLED`; UVM-hook callers queue
-  daemon `RELOAD`, return `HANDLED` for replay, and map on a later refault once
-  daemon-published backing is resident.
-- Single-worker microbenchmark: register external range larger than the
-  block pool, drive a deref pattern that forces spill/reload, validate
-  data integrity.
+  daemon `RELOAD`, return `DEFERRED` while no PTE has been installed, and map
+  on a later refault once daemon-published backing is resident.
+- Single-worker microbenchmark wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-single-worker-microbench` runs
+  against a real `polarisd` started with
+  `POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304`, registers a
+  six-block external range over deferred logical blocks, drives a real CUDA
+  one-thread write kernel in a strided pattern over a two-block resident
+  budget, and validates the final bytes through `POLARIS_RM_COPY`. The gate
+  requires daemon offload/reload counters and UVM bridge-map counters to move,
+  `uvm_errors` to remain stable, `static_blocks=0`, and cleanup through
+  daemon `FREE`. This closes the M3 single-worker microbenchmark item without
+  using static RM or fake errors. Local focused validation on 2026-06-15 used
+  the patched NVIDIA module, real `polaris.ko`, and real daemon-backed
+  `polarisd`; the composed reduced soak below also exercises this gate.
 
 ### M4: Multi-worker block sharing + COW
 
@@ -1150,15 +1161,20 @@ Still to do on the Polaris side for M1/M2:
   `tests/m2/run_daemon_rm_soak.sh` reloads real `polaris.ko`, runs repeated
   normal-budget daemon-backed single-block spill/reload, multi-block,
   dynamic-fragmentation, and overwrite-COW gates against a real `polarisd` with
-  `POLARISD_RM_BACKING=1`, then reloads the module again and runs the
-  near-capacity budget soak with `POLARISD_GPU_BUDGET_BYTES=4194304`. Each phase
+  `POLARISD_RM_BACKING=1`, then reloads the module for the CUDA-kernel
+  single-worker microbench and near-capacity budget soak with
+  `POLARISD_GPU_BUDGET_BYTES=4194304`. Each phase
   requires `uvm_errors` to remain stable, `uvm_bridge_map_calls` to increase,
   and cleanup to drain `sessions`, `blocks`, `pending_decs`, `static_blocks`,
   `block_mappings`, and `v4_va_spaces`. Static RM registration and fake error
   injection are not used. Local validation used the Makefile target with the
-  patched NVIDIA tree at `/home/wano/workspace/open-gpu-kernel-modules` and
-  completed the default `POLARIS_SOAK_ITERS=2` plus
-  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1` run.
+  patched NVIDIA tree at `/home/wano/workspace/open-gpu-kernel-modules`. After
+  the UVM `DEFERRED` contract change, local validation completed a reduced
+  live run with `POLARIS_SOAK_ITERS=1`,
+  `POLARIS_SOAK_MICROBENCH_ITERS=1`, and
+  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1`; the earlier pre-microbench default run
+  completed `POLARIS_SOAK_ITERS=2` plus
+  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1`.
 
 ### M7: PyTorch / vLLM integration
 

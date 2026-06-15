@@ -622,10 +622,11 @@ zero.
 
 The reload phase intentionally exercises the UVM-hook async reload behavior. If
 a block is `CpuOffloaded`, the first synthetic fault queues a real daemon
-`RELOAD` and returns handled for replay; the harness waits for the block to
-become `Resident`, then dispatches a second fault to map the daemon-published RM
-backing and verifies byte integrity with `POLARIS_RM_COPY_TO_CPU`. Cleanup
-releases all blocks through daemon `FREE` and checks the decision queue drains.
+`RELOAD` and returns `DEFERRED` while no PTE has been installed; the harness
+waits for the block to become `Resident`, then dispatches a second fault that
+must return `HANDLED` after mapping the daemon-published RM backing, and
+verifies byte integrity with `POLARIS_RM_COPY_TO_CPU`. Cleanup releases all
+blocks through daemon `FREE` and checks the decision queue drains.
 The same gate samples `/sys/kernel/polaris/stats` before and after the run and
 requires bridge map telemetry to move on the live path:
 `uvm_bridge_map_calls`, `uvm_bridge_map_ok`, `uvm_bridge_map_err`,
@@ -641,6 +642,36 @@ Passing this gate proves the focused near-capacity resident-set cap and
 reload/refault path on the live daemon-backed RM route without static RM or fake
 test errors. It also covers the first M6 bridge latency telemetry assertion for
 real UVM bridge map calls.
+
+## Daemon-Backed RM Single-Worker Microbenchmark
+
+This closes the M3 single-worker microbenchmark item on the production-shaped
+daemon RM path. Start `polarisd` with daemon-owned RM backing and a two-block GPU
+budget:
+
+```sh
+POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-single-worker-microbench
+```
+
+The mode registers a six-block UVM external range backed by deferred logical
+blocks, then launches a real one-thread CUDA kernel that writes into those
+Polaris VAs in a strided order over several passes. The two-block resident
+budget forces daemon-backed `OFFLOAD` / `RELOAD` while the real GPU kernel
+generates replayable UVM faults. After the touch pattern, the harness refaults
+each block if needed and reads the first word back through `POLARIS_RM_COPY` to
+verify the final bytes. The gate requires `uvm_errors` to stay stable, bridge
+map counters to move, daemon offload/reload counters to move, `pending_decs` to
+drain, and `static_blocks` to stay zero.
+
+Expected success ends with:
+
+```text
+M3 Polaris daemon-backed RM single-worker microbenchmark passed.
+```
+
+This is a focused live-path microbenchmark. It deliberately does not use the
+shim static RM backend, harness-owned logical backing, or fake daemon errors.
 
 ## Daemon-Backed RM Soak Runner
 
@@ -659,19 +690,26 @@ make -C tests/m2 daemon-rm-soak
 The runner reloads real `polaris.ko`, starts a real `polarisd` with
 `POLARISD_RM_BACKING=1`, and repeats the focused daemon-backed stress gates:
 single-block spill/reload stress, multi-block stress, dynamic fragmentation
-stress, and daemon-backed overwrite COW. It then reloads `polaris.ko` again,
-starts `polarisd` with
-`POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304`, and runs the
-near-capacity soak. Each phase checks that `uvm_errors` does not move, bridge
+stress, and daemon-backed overwrite COW. It then reloads `polaris.ko` for the
+single-worker microbenchmark and the near-capacity soak, starting `polarisd`
+with `POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304` for each
+budget-pressure phase. Each phase checks that `uvm_errors` does not move, bridge
 map calls increase, and cleanup drains `sessions`, `blocks`, `pending_decs`,
 `static_blocks`, `block_mappings`, and `v4_va_spaces`.
 
-The default run uses `POLARIS_SOAK_ITERS=2` for the normal-budget phase and
-`POLARIS_SOAK_NEAR_CAPACITY_ITERS=1` for the budget-pressure phase. For a faster
+The daemon-backed synthetic fault gates are DEFERRED-aware: first faults that
+only queue daemon `ALLOC` / `RELOAD` work may return `DEFERRED`, and the harness
+then waits for daemon-published `Resident` state before issuing a second fault
+that must return `HANDLED`.
+
+The default run uses `POLARIS_SOAK_ITERS=2` for the normal-budget phase,
+`POLARIS_SOAK_MICROBENCH_ITERS=1` for the real-kernel microbench phase, and
+`POLARIS_SOAK_NEAR_CAPACITY_ITERS=1` for the near-capacity phase. For a faster
 bring-up pass, override the counters:
 
 ```sh
-sudo env POLARIS_SOAK_ITERS=1 POLARIS_SOAK_NEAR_CAPACITY_ITERS=1 \
+sudo env POLARIS_SOAK_ITERS=1 POLARIS_SOAK_MICROBENCH_ITERS=1 \
+  POLARIS_SOAK_NEAR_CAPACITY_ITERS=1 \
   tests/m2/run_daemon_rm_soak.sh
 ```
 

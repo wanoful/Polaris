@@ -16,8 +16,10 @@ POLARISD_BIN="${POLARISD_BIN:-$ROOT_DIR/target/debug/polarisd}"
 STATS_PATH="${STATS_PATH:-/sys/kernel/polaris/stats}"
 POLARIS_SOAK_ITERS="${POLARIS_SOAK_ITERS:-2}"
 POLARIS_SOAK_NEAR_CAPACITY_ITERS="${POLARIS_SOAK_NEAR_CAPACITY_ITERS:-1}"
+POLARIS_SOAK_MICROBENCH_ITERS="${POLARIS_SOAK_MICROBENCH_ITERS:-1}"
 POLARIS_SOAK_RELOAD_MODULE="${POLARIS_SOAK_RELOAD_MODULE:-1}"
 POLARIS_NEAR_CAPACITY_BUDGET_BYTES="${POLARIS_NEAR_CAPACITY_BUDGET_BYTES:-4194304}"
+POLARIS_MICROBENCH_BUDGET_BYTES="${POLARIS_MICROBENCH_BUDGET_BYTES:-4194304}"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/polaris-daemon-rm-soak.XXXXXX")"
 polarisd_pid=""
@@ -201,6 +203,9 @@ fi
 if [[ "$POLARIS_SOAK_NEAR_CAPACITY_ITERS" -lt 0 ]]; then
     die "POLARIS_SOAK_NEAR_CAPACITY_ITERS must be >= 0"
 fi
+if [[ "$POLARIS_SOAK_MICROBENCH_ITERS" -lt 0 ]]; then
+    die "POLARIS_SOAK_MICROBENCH_ITERS must be >= 0"
+fi
 
 if [[ "$POLARIS_SOAK_RELOAD_MODULE" != "0" ]]; then
     note "reloading polaris.ko for daemon-backed RM soak"
@@ -217,6 +222,19 @@ for iter in $(seq 1 "$POLARIS_SOAK_ITERS"); do
 done
 stop_polarisd
 wait_for_stat_eq daemon 0 "normal-budget daemon stop"
+
+if [[ "$POLARIS_SOAK_MICROBENCH_ITERS" -gt 0 ]]; then
+    note "reloading polaris.ko for single-worker microbench"
+    reload_module
+    start_polarisd "microbench" "$POLARIS_MICROBENCH_BUDGET_BYTES"
+    wait_for_stat_at_least gpu_budget_mib 4 "microbench daemon budget"
+    for iter in $(seq 1 "$POLARIS_SOAK_MICROBENCH_ITERS"); do
+        note "single-worker microbench iteration $iter/$POLARIS_SOAK_MICROBENCH_ITERS"
+        run_gate "single-worker microbench iter $iter" --daemon-rm-single-worker-microbench
+    done
+    stop_polarisd
+    wait_for_stat_eq daemon 0 "microbench daemon stop"
+fi
 
 if [[ "$POLARIS_SOAK_NEAR_CAPACITY_ITERS" -gt 0 ]]; then
     note "reloading polaris.ko for near-capacity budget soak"

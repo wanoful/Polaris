@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -54,14 +55,40 @@
 #define POLARIS_DAEMON_RM_STRESS_ITERS 4U
 #define POLARIS_DAEMON_RM_MULTI_BLOCKS 3U
 #define POLARIS_DAEMON_RM_MULTI_ITERS 2U
+#define POLARIS_DAEMON_RM_MICROBENCH_BLOCKS 6U
+#define POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BLOCKS 2U
+#define POLARIS_DAEMON_RM_MICROBENCH_PASSES 3U
 #define POLARIS_DAEMON_RM_DYNAMIC_BLOCKS 5U
 #define POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS 4U
 #define POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BLOCKS 2U
 #define POLARIS_DAEMON_RM_HOST_OOM_BLOCKS 2U
 #define POLARIS_DAEMON_RM_ALLOC_OOM_BYTES (32ULL * 1024ULL * 1024ULL * 1024ULL)
 #define POLARIS_DAEMON_RM_ALLOC_OOM_BUDGET_BYTES (64ULL * 1024ULL * 1024ULL * 1024ULL)
+#define POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BYTES \
+    ((uint64_t)POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BLOCKS * POLARIS_BLOCK_SIZE)
 #define POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BYTES \
     ((uint64_t)POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BLOCKS * POLARIS_BLOCK_SIZE)
+#define POLARIS_DAEMON_RM_MAX_BLOCKS \
+    ((POLARIS_DAEMON_RM_MICROBENCH_BLOCKS > POLARIS_DAEMON_RM_DYNAMIC_BLOCKS) ? \
+         POLARIS_DAEMON_RM_MICROBENCH_BLOCKS : POLARIS_DAEMON_RM_DYNAMIC_BLOCKS)
+
+static const char polaris_touch_ptx[] =
+    ".version 7.0\n"
+    ".target sm_80\n"
+    ".address_size 64\n"
+    "\n"
+    ".visible .entry polaris_touch_kernel(\n"
+    "    .param .u64 ptr,\n"
+    "    .param .u32 value\n"
+    ")\n"
+    "{\n"
+    "    .reg .u64 %rd1;\n"
+    "    .reg .u32 %r1;\n"
+    "    ld.param.u64 %rd1, [ptr];\n"
+    "    ld.param.u32 %r1, [value];\n"
+    "    st.global.u32 [%rd1], %r1;\n"
+    "    ret;\n"
+    "}\n";
 
 static volatile sig_atomic_t g_hold_registered_worker_stop;
 
@@ -69,6 +96,7 @@ enum {
     POLARIS_UVM_FAULT_ERROR = -1,
     POLARIS_UVM_FAULT_NOT_MINE = 0,
     POLARIS_UVM_FAULT_HANDLED = 1,
+    POLARIS_UVM_FAULT_DEFERRED = 3,
 };
 
 struct polaris_register_gpu_arg {
@@ -473,6 +501,14 @@ struct daemon_rm_stress_block {
     uint64_t vaddr;
 };
 
+struct cuda_touch_state {
+    CUdevice device;
+    CUcontext context;
+    CUmodule module;
+    CUfunction function;
+    bool context_pushed;
+};
+
 static void cleanup(struct m2_state *s,
                     uint32_t gpu_id,
                     uint64_t rm_client_token,
@@ -480,6 +516,7 @@ static void cleanup(struct m2_state *s,
 static int wait_for_sysfs_stat_u64(const char *name,
                                    uint64_t expected,
                                    const char *what);
+static int read_sysfs_stat_u64(const char *name, uint64_t *value);
 
 static int nv_ioctl_checked(int fd, unsigned int esc, void *arg, size_t size, const char *what)
 {
@@ -838,6 +875,116 @@ static void print_cuda_result(const char *what, CUresult res)
             str ? str : "");
 }
 
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts = {0};
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return ((uint64_t)ts.tv_sec * 1000000000ULL) + (uint64_t)ts.tv_nsec;
+}
+
+static int cuda_touch_init(struct cuda_touch_state *touch, int ordinal)
+{
+    CUresult res;
+    const char *kernel_name = "polaris_touch_kernel";
+
+    memset(touch, 0, sizeof(*touch));
+    res = cuInit(0);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuInit", res);
+        return -1;
+    }
+
+    res = cuDeviceGet(&touch->device, ordinal);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuDeviceGet touch", res);
+        return -1;
+    }
+
+    res = cuDevicePrimaryCtxRetain(&touch->context, touch->device);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuDevicePrimaryCtxRetain touch", res);
+        return -1;
+    }
+
+    res = cuCtxPushCurrent(touch->context);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuCtxPushCurrent touch", res);
+        cuDevicePrimaryCtxRelease(touch->device);
+        touch->context = NULL;
+        return -1;
+    }
+    touch->context_pushed = true;
+
+    res = cuModuleLoadData(&touch->module, polaris_touch_ptx);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuModuleLoadData touch", res);
+        return -1;
+    }
+
+    res = cuModuleGetFunction(&touch->function, touch->module, kernel_name);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuModuleGetFunction touch", res);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void cuda_touch_destroy(struct cuda_touch_state *touch)
+{
+    if (!touch)
+        return;
+    if (touch->module)
+        (void)cuModuleUnload(touch->module);
+    if (touch->context_pushed) {
+        CUcontext popped = NULL;
+        (void)cuCtxPopCurrent(&popped);
+        touch->context_pushed = false;
+    }
+    if (touch->context)
+        (void)cuDevicePrimaryCtxRelease(touch->device);
+    memset(touch, 0, sizeof(*touch));
+}
+
+static int cuda_touch_va(struct cuda_touch_state *touch,
+                         uint64_t vaddr,
+                         uint32_t value,
+                         uint64_t *latency_ns_out)
+{
+    CUdeviceptr ptr = (CUdeviceptr)vaddr;
+    uint32_t kernel_value = value;
+    void *params[] = {
+        &ptr,
+        &kernel_value,
+    };
+    uint64_t start_ns = monotonic_ns();
+    CUresult res;
+
+    res = cuLaunchKernel(touch->function,
+                         1, 1, 1,
+                         1, 1, 1,
+                         0,
+                         NULL,
+                         params,
+                         NULL);
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuLaunchKernel touch", res);
+        return -1;
+    }
+    res = cuCtxSynchronize();
+    if (res != CUDA_SUCCESS) {
+        print_cuda_result("cuCtxSynchronize touch", res);
+        return -1;
+    }
+    if (latency_ns_out) {
+        uint64_t end_ns = monotonic_ns();
+        *latency_ns_out = (start_ns != 0 && end_ns >= start_ns) ? end_ns - start_ns : 0;
+    }
+    return 0;
+}
+
 static int run_cuda_copy_probe(struct m2_state *s, int ordinal, uint64_t base, size_t length)
 {
     CUdevice dev;
@@ -1138,10 +1285,9 @@ static int run_rm_cpu_map_probe_isolated(int ordinal)
     return 0;
 }
 
-static int dispatch_test_fault_expect(struct m2_state *s,
+static int dispatch_test_fault_status(struct m2_state *s,
                                       uint64_t fault_address,
-                                      int expected_status,
-                                      const char *expected_name)
+                                      int *status_out)
 {
     struct uvm_test_polaris_dispatch_fault_params fault = {
         .gpu_uuid = s->gpu_uuid,
@@ -1163,10 +1309,24 @@ static int dispatch_test_fault_expect(struct m2_state *s,
            (unsigned long long)fault.observed_rm_client_token,
            (unsigned long long)fault.observed_va_space_token,
            fault.polaris_status);
-    if (fault.polaris_status != expected_status) {
+    if (status_out)
+        *status_out = fault.polaris_status;
+    return 0;
+}
+
+static int dispatch_test_fault_expect(struct m2_state *s,
+                                      uint64_t fault_address,
+                                      int expected_status,
+                                      const char *expected_name)
+{
+    int polaris_status = 0;
+
+    if (dispatch_test_fault_status(s, fault_address, &polaris_status) != 0)
+        return -1;
+    if (polaris_status != expected_status) {
         fprintf(stderr,
                 "Polaris dispatch result=%d, expected %s(%d)\n",
-                fault.polaris_status,
+                polaris_status,
                 expected_name,
                 expected_status);
         return -1;
@@ -1760,6 +1920,39 @@ static int wait_for_block_state(struct m2_state *s,
     return -1;
 }
 
+static int dispatch_test_fault_materialize_resident(struct m2_state *s,
+                                                    uint64_t fault_address,
+                                                    uint64_t session_id,
+                                                    uint32_t token_start,
+                                                    uint32_t token_count,
+                                                    const char *what)
+{
+    int polaris_status = 0;
+
+    if (dispatch_test_fault_status(s, fault_address, &polaris_status) != 0)
+        return -1;
+    if (polaris_status != POLARIS_UVM_FAULT_HANDLED &&
+        polaris_status != POLARIS_UVM_FAULT_DEFERRED) {
+        fprintf(stderr,
+                "%s dispatch result=%d, expected HANDLED or DEFERRED\n",
+                what,
+                polaris_status);
+        return -1;
+    }
+    if (wait_for_block_state(s,
+                             session_id,
+                             token_start,
+                             token_count,
+                             POLARIS_BLOCK_STATE_RESIDENT,
+                             what,
+                             NULL) != 0)
+        return -1;
+    if (polaris_status == POLARIS_UVM_FAULT_DEFERRED &&
+        dispatch_test_fault(s, fault_address) != 0)
+        return -1;
+    return 0;
+}
+
 static int read_sysfs_stat_u64(const char *name, uint64_t *value)
 {
     FILE *f = fopen("/sys/kernel/polaris/stats", "r");
@@ -2115,6 +2308,14 @@ static uint8_t rm_copy_roundtrip_pattern(uint64_t seed, uint64_t offset)
     x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 32;
     return (uint8_t)x;
+}
+
+static void store_le32(uint8_t *buf, uint32_t value)
+{
+    buf[0] = (uint8_t)(value & 0xffU);
+    buf[1] = (uint8_t)((value >> 8) & 0xffU);
+    buf[2] = (uint8_t)((value >> 16) & 0xffU);
+    buf[3] = (uint8_t)((value >> 24) & 0xffU);
 }
 
 static int rm_copy_roundtrip(struct m2_state *s, uint64_t block_id)
@@ -3117,15 +3318,12 @@ static int daemon_rm_multi_block_stress(struct m2_state *s,
     }
 
     for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
-        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
-            goto out;
-        if (wait_for_block_state(s,
-                                 session_id,
-                                 blocks[block_idx].token_start,
-                                 blocks[block_idx].token_count,
-                                 POLARIS_BLOCK_STATE_RESIDENT,
-                                 "daemon multi initial ALLOC",
-                                 NULL) != 0)
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     blocks[block_idx].vaddr,
+                                                     session_id,
+                                                     blocks[block_idx].token_start,
+                                                     blocks[block_idx].token_count,
+                                                     "daemon multi initial ALLOC") != 0)
             goto out;
     }
 
@@ -3303,6 +3501,293 @@ out:
     return rc;
 }
 
+static int daemon_rm_single_worker_microbench(struct m2_state *s,
+                                              int ordinal,
+                                              uint64_t session_id,
+                                              const struct daemon_rm_stress_block *blocks,
+                                              uint32_t block_count,
+                                              uint32_t passes)
+{
+    struct cuda_touch_state touch = {0};
+    uint8_t *dst = NULL;
+    uint32_t expected_values[POLARIS_DAEMON_RM_MICROBENCH_BLOCKS] = {0};
+    uint64_t total_touch_ns = 0;
+    uint64_t max_touch_ns = 0;
+    uint64_t touch_count = 0;
+    uint64_t budget_mib = 0;
+    uint64_t gpus = 0;
+    uint64_t offloads_before = 0;
+    uint64_t reloads_before = 0;
+    uint64_t offloads_after = 0;
+    uint64_t reloads_after = 0;
+    uint64_t errors_before = 0;
+    uint64_t errors_after = 0;
+    uint64_t bridge_calls_before = 0;
+    uint64_t bridge_ok_before = 0;
+    uint64_t bridge_calls_after = 0;
+    uint64_t bridge_ok_after = 0;
+    uint64_t bridge_avg_ns_after = 0;
+    uint32_t initial_final_states[POLARIS_DAEMON_RM_MICROBENCH_BLOCKS] = {0};
+    bool verified[POLARIS_DAEMON_RM_MICROBENCH_BLOCKS] = {0};
+    int rc = -1;
+
+    static const uint32_t access_order[POLARIS_DAEMON_RM_MICROBENCH_BLOCKS] = {
+        0, 2, 4, 1, 3, 5,
+    };
+
+    if (block_count != POLARIS_DAEMON_RM_MICROBENCH_BLOCKS) {
+        fprintf(stderr,
+                "daemon single-worker microbench requires %u blocks, got %u\n",
+                POLARIS_DAEMON_RM_MICROBENCH_BLOCKS,
+                block_count);
+        return -1;
+    }
+    if (passes == 0)
+        passes = POLARIS_DAEMON_RM_MICROBENCH_PASSES;
+
+    if (read_sysfs_stat_u64("gpu_budget_mib", &budget_mib) != 0 ||
+        read_sysfs_stat_u64("gpus", &gpus) != 0)
+        return -1;
+    if (gpus == 0 ||
+        budget_mib != (POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BYTES /
+                       (1024ULL * 1024ULL)) * gpus) {
+        fprintf(stderr,
+                "daemon single-worker microbench requires per-GPU gpu_budget_mib=%llu; got aggregate gpu_budget_mib=%llu across gpus=%llu. Start polarisd with POLARISD_GPU_BUDGET_BYTES=%llu.\n",
+                (unsigned long long)(POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BYTES /
+                                     (1024ULL * 1024ULL)),
+                (unsigned long long)budget_mib,
+                (unsigned long long)gpus,
+                (unsigned long long)POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BYTES);
+        return -1;
+    }
+
+    if (read_sysfs_stat_u64("offloads", &offloads_before) != 0 ||
+        read_sysfs_stat_u64("reloads", &reloads_before) != 0 ||
+        read_sysfs_stat_u64("uvm_errors", &errors_before) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_calls", &bridge_calls_before) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_ok", &bridge_ok_before) != 0)
+        return -1;
+
+    if (posix_memalign((void **)&dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon microbench dst failed\n");
+        goto out;
+    }
+
+    if (cuda_touch_init(&touch, ordinal) != 0)
+        goto out;
+
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        for (uint32_t order_idx = 0; order_idx < block_count; ++order_idx) {
+            uint32_t block_idx = access_order[order_idx];
+            uint32_t value = 0x504d0000U | ((pass + 1U) << 8) | block_idx;
+            uint64_t latency_ns = 0;
+
+            if (block_idx >= block_count) {
+                fprintf(stderr, "daemon microbench invalid access-order index %u\n", block_idx);
+                goto out;
+            }
+            printf("POLARIS daemon microbench touch pass=%u order=%u block_index=%u block=%llu vaddr=0x%llx value=0x%x\n",
+                   pass + 1,
+                   order_idx,
+                   block_idx,
+                   (unsigned long long)blocks[block_idx].block_id,
+                   (unsigned long long)blocks[block_idx].vaddr,
+                   value);
+            if (cuda_touch_va(&touch,
+                              blocks[block_idx].vaddr,
+                              value,
+                              &latency_ns) != 0)
+                goto out;
+            if (wait_for_block_state(s,
+                                     session_id,
+                                     blocks[block_idx].token_start,
+                                     blocks[block_idx].token_count,
+                                     POLARIS_BLOCK_STATE_RESIDENT,
+                                     "daemon microbench touch materialize/reload",
+                                     NULL) != 0)
+                goto out;
+            expected_values[block_idx] = value;
+            total_touch_ns += latency_ns;
+            if (latency_ns > max_touch_ns)
+                max_touch_ns = latency_ns;
+            touch_count++;
+        }
+
+        if (wait_for_sysfs_stat_u64("pending_decs",
+                                    0,
+                                    "daemon microbench decision drain") != 0)
+            goto out;
+        if (wait_for_sysfs_stat_u64("pending",
+                                    0,
+                                    "daemon microbench pending-state drain") != 0)
+            goto out;
+        if (wait_for_sysfs_stat_u64("resident",
+                                    POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BLOCKS,
+                                    "daemon microbench resident cap") != 0)
+            goto out;
+        if (wait_for_sysfs_stat_u64("static_blocks",
+                                    0,
+                                    "daemon microbench static-block guard") != 0)
+            goto out;
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        struct polaris_block_get_state_arg current = {0};
+
+        if (get_block_state(s,
+                            session_id,
+                            blocks[block_idx].token_start,
+                            blocks[block_idx].token_count,
+                            &current) != 0)
+            goto out;
+        initial_final_states[block_idx] = current.state;
+        if (current.state != POLARIS_BLOCK_STATE_RESIDENT &&
+            current.state != POLARIS_BLOCK_STATE_CPU_OFFLOADED) {
+            fprintf(stderr,
+                    "daemon microbench final state block=%u unexpected state=%u\n",
+                    block_idx,
+                    current.state);
+            goto out;
+        }
+    }
+
+    for (uint32_t phase = 0; phase < 2; ++phase) {
+        for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+            if ((phase == 0 &&
+                 initial_final_states[block_idx] != POLARIS_BLOCK_STATE_RESIDENT) ||
+                (phase == 1 &&
+                 initial_final_states[block_idx] != POLARIS_BLOCK_STATE_CPU_OFFLOADED))
+                continue;
+            if (phase == 1) {
+                int polaris_status = 0;
+
+                if (dispatch_test_fault_status(s,
+                                               blocks[block_idx].vaddr,
+                                               &polaris_status) != 0)
+                    goto out;
+                if (polaris_status != POLARIS_UVM_FAULT_HANDLED &&
+                    polaris_status != POLARIS_UVM_FAULT_DEFERRED) {
+                    fprintf(stderr,
+                            "daemon microbench final reload dispatch result=%d, expected HANDLED or DEFERRED block=%u\n",
+                            polaris_status,
+                            block_idx);
+                    goto out;
+                }
+                if (wait_for_block_state(s,
+                                         session_id,
+                                         blocks[block_idx].token_start,
+                                         blocks[block_idx].token_count,
+                                         POLARIS_BLOCK_STATE_RESIDENT,
+                                         "daemon microbench final reload",
+                                         NULL) != 0)
+                    goto out;
+                if (polaris_status == POLARIS_UVM_FAULT_DEFERRED &&
+                    dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+                    goto out;
+            }
+
+            memset(dst, 0, POLARIS_BLOCK_SIZE);
+            struct polaris_rm_copy_arg read_back = {
+                .block_id = blocks[block_idx].block_id,
+                .length = POLARIS_BLOCK_SIZE,
+                .user_cpu_addr = (uint64_t)(uintptr_t)dst,
+                .direction = POLARIS_RM_COPY_TO_CPU,
+            };
+            if (polaris_ioctl_checked(s->polaris_fd,
+                                      POLARIS_RM_COPY,
+                                      &read_back,
+                                      "POLARIS_RM_COPY daemon microbench TO_CPU") != 0)
+                goto out;
+            if (read_back.bytes_copied != POLARIS_BLOCK_SIZE) {
+                fprintf(stderr,
+                        "daemon microbench read bytes=0x%llx expected=0x%llx block=%u\n",
+                        (unsigned long long)read_back.bytes_copied,
+                        (unsigned long long)POLARIS_BLOCK_SIZE,
+                        block_idx);
+                goto out;
+            }
+            uint8_t expected_prefix[4] = {0};
+            store_le32(expected_prefix, expected_values[block_idx]);
+            if (memcmp(dst, expected_prefix, sizeof(expected_prefix)) != 0) {
+                fprintf(stderr,
+                        "daemon microbench mismatch block=%u expected_le32=%02x%02x%02x%02x actual=%02x%02x%02x%02x\n",
+                        block_idx,
+                        expected_prefix[0], expected_prefix[1],
+                        expected_prefix[2], expected_prefix[3],
+                        dst[0], dst[1], dst[2], dst[3]);
+                goto out;
+            }
+            verified[block_idx] = true;
+        }
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        if (!verified[block_idx]) {
+            fprintf(stderr, "daemon microbench did not verify block=%u\n", block_idx);
+            goto out;
+        }
+    }
+
+    if (read_sysfs_stat_u64("offloads", &offloads_after) != 0 ||
+        read_sysfs_stat_u64("reloads", &reloads_after) != 0 ||
+        read_sysfs_stat_u64("uvm_errors", &errors_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_calls", &bridge_calls_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_ok", &bridge_ok_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_avg_ns", &bridge_avg_ns_after) != 0)
+        goto out;
+
+    if (errors_after != errors_before) {
+        fprintf(stderr,
+                "daemon microbench changed uvm_errors: %llu->%llu\n",
+                (unsigned long long)errors_before,
+                (unsigned long long)errors_after);
+        goto out;
+    }
+    if (offloads_after <= offloads_before ||
+        reloads_after <= reloads_before ||
+        bridge_calls_after <= bridge_calls_before ||
+        bridge_ok_after <= bridge_ok_before ||
+        bridge_avg_ns_after == 0) {
+        fprintf(stderr,
+                "daemon microbench telemetry did not move enough: offloads %llu->%llu reloads %llu->%llu bridge calls %llu->%llu ok %llu->%llu avg_ns=%llu\n",
+                (unsigned long long)offloads_before,
+                (unsigned long long)offloads_after,
+                (unsigned long long)reloads_before,
+                (unsigned long long)reloads_after,
+                (unsigned long long)bridge_calls_before,
+                (unsigned long long)bridge_calls_after,
+                (unsigned long long)bridge_ok_before,
+                (unsigned long long)bridge_ok_after,
+                (unsigned long long)bridge_avg_ns_after);
+        goto out;
+    }
+    if (touch_count == 0) {
+        fprintf(stderr, "daemon microbench recorded zero CUDA touches\n");
+        goto out;
+    }
+
+    printf("POLARIS daemon RM single-worker microbench complete: blocks=%u budget_blocks=%u passes=%u touches=%llu avg_touch_ns=%llu max_touch_ns=%llu offloads=%llu->%llu reloads=%llu->%llu bridge_maps=%llu->%llu avg_bridge_ns=%llu\n",
+           block_count,
+           POLARIS_DAEMON_RM_MICROBENCH_BUDGET_BLOCKS,
+           passes,
+           (unsigned long long)touch_count,
+           (unsigned long long)(total_touch_ns / touch_count),
+           (unsigned long long)max_touch_ns,
+           (unsigned long long)offloads_before,
+           (unsigned long long)offloads_after,
+           (unsigned long long)reloads_before,
+           (unsigned long long)reloads_after,
+           (unsigned long long)bridge_calls_before,
+           (unsigned long long)bridge_calls_after,
+           (unsigned long long)bridge_avg_ns_after);
+    rc = 0;
+
+out:
+    cuda_touch_destroy(&touch);
+    free(dst);
+    return rc;
+}
+
 static int daemon_rm_dynamic_fragmentation_stress(struct m2_state *s,
                                                   uint32_t gpu_id,
                                                   uint64_t rm_client_token,
@@ -3338,15 +3823,12 @@ static int daemon_rm_dynamic_fragmentation_stress(struct m2_state *s,
     }
 
     for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
-        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
-            goto out;
-        if (wait_for_block_state(s,
-                                 session_id,
-                                 blocks[block_idx].token_start,
-                                 blocks[block_idx].token_count,
-                                 POLARIS_BLOCK_STATE_RESIDENT,
-                                 "daemon dynamic initial ALLOC",
-                                 NULL) != 0)
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     blocks[block_idx].vaddr,
+                                                     session_id,
+                                                     blocks[block_idx].token_start,
+                                                     blocks[block_idx].token_count,
+                                                     "daemon dynamic initial ALLOC") != 0)
             goto out;
 
         expected_seeds[block_idx] = seed ^
@@ -3424,15 +3906,12 @@ static int daemon_rm_dynamic_fragmentation_stress(struct m2_state *s,
         }
 
         blocks[block_idx] = regrown;
-        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
-            goto out;
-        if (wait_for_block_state(s,
-                                 session_id,
-                                 blocks[block_idx].token_start,
-                                 blocks[block_idx].token_count,
-                                 POLARIS_BLOCK_STATE_RESIDENT,
-                                 "daemon dynamic regrow ALLOC",
-                                 NULL) != 0)
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     blocks[block_idx].vaddr,
+                                                     session_id,
+                                                     blocks[block_idx].token_start,
+                                                     blocks[block_idx].token_count,
+                                                     "daemon dynamic regrow ALLOC") != 0)
             goto out;
 
         expected_seeds[block_idx] = seed ^
@@ -3664,15 +4143,12 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
     }
 
     for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
-        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
-            goto out;
-        if (wait_for_block_state(s,
-                                 session_id,
-                                 blocks[block_idx].token_start,
-                                 blocks[block_idx].token_count,
-                                 POLARIS_BLOCK_STATE_RESIDENT,
-                                 "daemon near-capacity materialize",
-                                 NULL) != 0)
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     blocks[block_idx].vaddr,
+                                                     session_id,
+                                                     blocks[block_idx].token_start,
+                                                     blocks[block_idx].token_count,
+                                                     "daemon near-capacity materialize") != 0)
             goto out;
 
         expected_seeds[block_idx] = seed ^
@@ -3732,8 +4208,20 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
                             &current) != 0)
             goto out;
         if (current.state == POLARIS_BLOCK_STATE_CPU_OFFLOADED) {
-            if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+            int polaris_status = 0;
+
+            if (dispatch_test_fault_status(s,
+                                           blocks[block_idx].vaddr,
+                                           &polaris_status) != 0)
                 goto out;
+            if (polaris_status != POLARIS_UVM_FAULT_HANDLED &&
+                polaris_status != POLARIS_UVM_FAULT_DEFERRED) {
+                fprintf(stderr,
+                        "daemon near-capacity async reload dispatch result=%d, expected HANDLED or DEFERRED block=%u\n",
+                        polaris_status,
+                        block_idx);
+                goto out;
+            }
             if (wait_for_block_state(s,
                                      session_id,
                                      blocks[block_idx].token_start,
@@ -3741,6 +4229,9 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
                                      POLARIS_BLOCK_STATE_RESIDENT,
                                      "daemon near-capacity async reload completion",
                                      NULL) != 0)
+                goto out;
+            if (polaris_status == POLARIS_UVM_FAULT_DEFERRED &&
+                dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
                 goto out;
         } else if (current.state != POLARIS_BLOCK_STATE_RESIDENT) {
             fprintf(stderr,
@@ -3895,15 +4386,12 @@ static int daemon_rm_host_pool_oom_pressure(struct m2_state *s,
     }
 
     for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
-        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
-            goto out;
-        if (wait_for_block_state(s,
-                                 session_id,
-                                 blocks[block_idx].token_start,
-                                 blocks[block_idx].token_count,
-                                 POLARIS_BLOCK_STATE_RESIDENT,
-                                 "daemon host OOM initial ALLOC",
-                                 NULL) != 0)
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     blocks[block_idx].vaddr,
+                                                     session_id,
+                                                     blocks[block_idx].token_start,
+                                                     blocks[block_idx].token_count,
+                                                     "daemon host OOM initial ALLOC") != 0)
             goto out;
 
         uint64_t block_seed = seed ^ ((uint64_t)(block_idx + 1) * 0x9e3779b97f4a7c15ULL);
@@ -4043,8 +4531,8 @@ static int daemon_rm_alloc_oom_pressure(struct m2_state *s,
 
     if (dispatch_test_fault_expect(s,
                                    block->vaddr,
-                                   POLARIS_UVM_FAULT_ERROR,
-                                   "ERROR") != 0)
+                                   POLARIS_UVM_FAULT_DEFERRED,
+                                   "DEFERRED") != 0)
         return -1;
 
     if (wait_for_block_state(s,
@@ -4070,6 +4558,12 @@ static int daemon_rm_alloc_oom_pressure(struct m2_state *s,
     if (wait_for_sysfs_stat_u64("static_blocks",
                                 0,
                                 "daemon RM allocation OOM static-block guard") != 0)
+        return -1;
+
+    if (dispatch_test_fault_expect(s,
+                                   block->vaddr,
+                                   POLARIS_UVM_FAULT_ERROR,
+                                   "ERROR after daemon allocation failure") != 0)
         return -1;
 
     if (read_sysfs_stat_u64("uvm_hook_calls", &hooks_after) != 0 ||
@@ -4628,6 +5122,7 @@ int main(int argc, char **argv)
     bool daemon_rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_stress_mode = false;
     bool daemon_rm_multi_block_stress_mode = false;
+    bool daemon_rm_single_worker_microbench_mode = false;
     bool daemon_rm_dynamic_fragmentation_stress_mode = false;
     bool daemon_rm_near_capacity_soak_mode = false;
     bool daemon_rm_host_pool_oom_pressure_mode = false;
@@ -4636,7 +5131,7 @@ int main(int argc, char **argv)
     bool daemon_rm_cow_roundtrip_mode = false;
     bool hold_registered_worker_mode = false;
     uint64_t block_id = 0;
-    struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
+    struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_MAX_BLOCKS] = {0};
     struct daemon_rm_stress_block daemon_oversized_block = {0};
     bool daemon_oversized_block_setup = false;
     bool daemon_multi_blocks_setup = false;
@@ -4718,6 +5213,10 @@ int main(int argc, char **argv)
             daemon_rm_multi_block_stress_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-single-worker-microbench") == 0) {
+            daemon_rm_single_worker_microbench_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--daemon-rm-dynamic-fragmentation-stress") == 0) {
             daemon_rm_dynamic_fragmentation_stress_mode = true;
             continue;
@@ -4787,7 +5286,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-single-worker-microbench|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -4810,6 +5309,7 @@ int main(int argc, char **argv)
                  !daemon_rm_spill_reload_roundtrip_mode &&
                      !daemon_rm_spill_reload_stress_mode &&
                      !daemon_rm_multi_block_stress_mode &&
+                     !daemon_rm_single_worker_microbench_mode &&
                      !daemon_rm_dynamic_fragmentation_stress_mode &&
                      !daemon_rm_near_capacity_soak_mode &&
                      !daemon_rm_host_pool_oom_pressure_mode &&
@@ -4820,16 +5320,19 @@ int main(int argc, char **argv)
     uint64_t managed_length = daemon_rm_alloc_oom_pressure_mode
         ? POLARIS_DAEMON_RM_ALLOC_OOM_BYTES
         : ((daemon_rm_multi_block_stress_mode ||
+            daemon_rm_single_worker_microbench_mode ||
             daemon_rm_dynamic_fragmentation_stress_mode ||
             daemon_rm_near_capacity_soak_mode ||
             daemon_rm_host_pool_oom_pressure_mode)
                ? ((uint64_t)(daemon_rm_dynamic_fragmentation_stress_mode
                                  ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
-                                 : (daemon_rm_near_capacity_soak_mode
-                                        ? POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS
-                                        : (daemon_rm_host_pool_oom_pressure_mode
-                                               ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
-                                               : POLARIS_DAEMON_RM_MULTI_BLOCKS))) *
+                                 : (daemon_rm_single_worker_microbench_mode
+                                        ? POLARIS_DAEMON_RM_MICROBENCH_BLOCKS
+                                        : (daemon_rm_near_capacity_soak_mode
+                                               ? POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS
+                                               : (daemon_rm_host_pool_oom_pressure_mode
+                                                      ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
+                                                      : POLARIS_DAEMON_RM_MULTI_BLOCKS)))) *
                   POLARIS_BLOCK_SIZE)
                : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
                       ? (2 * POLARIS_MANAGED_SIZE)
@@ -4838,6 +5341,7 @@ int main(int argc, char **argv)
                   base,
                   managed_length,
                   !dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+                  !daemon_rm_single_worker_microbench_mode &&
                   !daemon_rm_dynamic_fragmentation_stress_mode &&
                   !daemon_rm_near_capacity_soak_mode &&
                   !daemon_rm_host_pool_oom_pressure_mode &&
@@ -4860,6 +5364,7 @@ int main(int argc, char **argv)
                       !logical_backed_refault && !complete_backed_refault &&
                           !deferred_complete_fault &&
                           !daemon_rm_multi_block_stress_mode &&
+                          !daemon_rm_single_worker_microbench_mode &&
                           !daemon_rm_dynamic_fragmentation_stress_mode &&
                           !daemon_rm_near_capacity_soak_mode &&
                           !daemon_rm_host_pool_oom_pressure_mode &&
@@ -4868,6 +5373,7 @@ int main(int argc, char **argv)
                       daemon_rm_spill_reload_roundtrip_mode ||
                           daemon_rm_spill_reload_stress_mode ||
                           daemon_rm_multi_block_stress_mode ||
+                          daemon_rm_single_worker_microbench_mode ||
                           daemon_rm_dynamic_fragmentation_stress_mode ||
                           daemon_rm_near_capacity_soak_mode ||
                           daemon_rm_host_pool_oom_pressure_mode ||
@@ -4918,16 +5424,19 @@ int main(int argc, char **argv)
         daemon_oversized_block_setup = false;
     }
     if (daemon_rm_multi_block_stress_mode ||
+        daemon_rm_single_worker_microbench_mode ||
         daemon_rm_dynamic_fragmentation_stress_mode ||
         daemon_rm_near_capacity_soak_mode ||
         daemon_rm_host_pool_oom_pressure_mode) {
         uint32_t daemon_block_count = daemon_rm_dynamic_fragmentation_stress_mode
             ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
-            : (daemon_rm_near_capacity_soak_mode
-                   ? POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS
-                   : (daemon_rm_host_pool_oom_pressure_mode
-                          ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
-                          : POLARIS_DAEMON_RM_MULTI_BLOCKS));
+            : (daemon_rm_single_worker_microbench_mode
+                   ? POLARIS_DAEMON_RM_MICROBENCH_BLOCKS
+                   : (daemon_rm_near_capacity_soak_mode
+                          ? POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS
+                          : (daemon_rm_host_pool_oom_pressure_mode
+                                 ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
+                                 : POLARIS_DAEMON_RM_MULTI_BLOCKS)));
 
         if (setup_multi_deferred_blocks(&s,
                                         polaris_gpu_id,
@@ -4956,6 +5465,14 @@ int main(int argc, char **argv)
                                              s.polaris_session_id,
                                              daemon_multi_blocks,
                                              daemon_block_count) != 0)
+                goto out;
+        } else if (daemon_rm_single_worker_microbench_mode) {
+            if (daemon_rm_single_worker_microbench(&s,
+                                                   ordinal,
+                                                   s.polaris_session_id,
+                                                   daemon_multi_blocks,
+                                                   daemon_block_count,
+                                                   POLARIS_DAEMON_RM_MICROBENCH_PASSES) != 0)
                 goto out;
         } else if (daemon_rm_host_pool_oom_pressure_mode) {
             if (daemon_rm_host_pool_oom_pressure(&s,
@@ -5052,8 +5569,19 @@ int main(int argc, char **argv)
             goto out;
     }
     if (dispatch_fault) {
-        if (dispatch_test_fault(&s, base) != 0)
+        if (daemon_rm_spill_reload_roundtrip_mode ||
+            daemon_rm_spill_reload_stress_mode ||
+            daemon_rm_cow_roundtrip_mode) {
+            if (dispatch_test_fault_materialize_resident(&s,
+                                                         base,
+                                                         s.polaris_session_id,
+                                                         s.polaris_block_token_start,
+                                                         s.polaris_block_token_count,
+                                                         "daemon RM initial ALLOC") != 0)
+                goto out;
+        } else if (dispatch_test_fault(&s, base) != 0) {
             goto out;
+        }
         if (deferred_complete_fault &&
             !daemon_rm_spill_reload_roundtrip_mode &&
             !daemon_rm_spill_reload_stress_mode &&
@@ -5172,6 +5700,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM spill/reload stress passed.");
     else if (daemon_rm_multi_block_stress_mode)
         puts("M6 Polaris daemon-backed RM multi-block stress passed.");
+    else if (daemon_rm_single_worker_microbench_mode)
+        puts("M3 Polaris daemon-backed RM single-worker microbenchmark passed.");
     else if (daemon_rm_dynamic_fragmentation_stress_mode)
         puts("M6 Polaris daemon-backed RM dynamic fragmentation stress passed.");
     else if (daemon_rm_near_capacity_soak_mode)
@@ -5199,6 +5729,7 @@ int main(int argc, char **argv)
     else
         puts(dispatch_fault ? "M2 Polaris fault-dispatch test passed." : "M2 static-block setup passed.");
     if (!dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+        !daemon_rm_single_worker_microbench_mode &&
         !daemon_rm_dynamic_fragmentation_stress_mode &&
         !daemon_rm_near_capacity_soak_mode &&
         !daemon_rm_host_pool_oom_pressure_mode &&
