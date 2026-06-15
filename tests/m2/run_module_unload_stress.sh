@@ -102,6 +102,25 @@ wait_for_stat_eq() {
     die "timeout waiting for $label: $key=$expected"
 }
 
+assert_clean_kernel_state() {
+    local label="$1"
+    wait_for_stat_eq sessions 0 "$label cleanup"
+    wait_for_stat_eq blocks 0 "$label cleanup"
+    wait_for_stat_eq pending_decs 0 "$label cleanup"
+    wait_for_stat_eq static_blocks 0 "$label cleanup"
+    wait_for_stat_eq block_mappings 0 "$label cleanup"
+    wait_for_stat_eq v4_va_spaces 0 "$label cleanup"
+}
+
+assert_no_gpu_accounting() {
+    local label="$1"
+    wait_for_stat_eq daemon 0 "$label daemon stop"
+    wait_for_stat_eq gpus 0 "$label GPU cleanup"
+    wait_for_stat_eq gpu_total_mib 0 "$label GPU total cleanup"
+    wait_for_stat_eq gpu_budget_mib 0 "$label GPU budget cleanup"
+    wait_for_stat_eq cpu_pool_mib 0 "$label CPU pool cleanup"
+}
+
 start_polarisd() {
     rm -f "$polarisd_log"
     sudo env POLARISD_RM_BACKING=1 "$POLARISD_BIN" >"$polarisd_log" 2>&1 &
@@ -177,6 +196,7 @@ wait "$holder_pid"
 holder_pid=""
 wait_for_stat_eq v4_va_spaces 0 "registered worker cleanup"
 wait_for_stat_eq block_mappings 0 "registered worker cleanup"
+assert_no_gpu_accounting "registered worker cleanup"
 
 note "unloading module after worker cleanup"
 sudo rmmod polaris
@@ -187,19 +207,14 @@ fi
 note "reloading module after unload"
 sudo insmod "$POLARIS_KO"
 [[ -r "$STATS_PATH" ]] || die "$STATS_PATH not readable after reload"
-wait_for_stat_eq sessions 0 "post-reload clean state"
-wait_for_stat_eq blocks 0 "post-reload clean state"
-wait_for_stat_eq static_blocks 0 "post-reload clean state"
-wait_for_stat_eq block_mappings 0 "post-reload clean state"
+assert_clean_kernel_state "post-reload"
+assert_no_gpu_accounting "post-reload"
 
 note "running daemon-backed RM spill/reload on reloaded module"
 start_polarisd
 sudo "$M2_BIN" --daemon-rm-spill-reload-roundtrip
 stop_polarisd
-wait_for_stat_eq sessions 0 "post-regression cleanup"
-wait_for_stat_eq blocks 0 "post-regression cleanup"
-wait_for_stat_eq pending_decs 0 "post-regression cleanup"
-wait_for_stat_eq static_blocks 0 "post-regression cleanup"
-wait_for_stat_eq block_mappings 0 "post-regression cleanup"
+assert_clean_kernel_state "post-regression"
+assert_no_gpu_accounting "post-regression"
 
 note "M6 module unload/reload stress passed"
