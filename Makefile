@@ -46,7 +46,7 @@ endif
 # Fallback: search PATH
 POLARIS_RUSTC ?= $(shell command -v rustc 2>/dev/null || echo rustc)
 
-.PHONY: all kernel userspace clean help rust-analyzer rust-toolchain setup-pacman-rustc llama-e2e
+.PHONY: all kernel userspace clean help rust-analyzer rust-toolchain setup-pacman-rustc llama-e2e m6-daemon-rm-soak m6-module-unload-stress
 
 help:
 	@echo "POLARIS Build System"
@@ -54,7 +54,10 @@ help:
 	@echo "Targets:"
 	@echo "  make kernel              Build the kernel module (polaris.ko)"
 	@echo "  make userspace           Build all Rust userspace programs"
-	@echo "  make llama-e2e           Run the root/GPU llama.cpp integration regression"
+	@echo "  make llama-e2e           Run the strict root/GPU llama.cpp shim regression"
+	@echo "  make m6-daemon-rm-soak   Run the daemon-backed RM soak with patched UVM"
+	@echo "  make m6-module-unload-stress"
+	@echo "                            Run module unload/reload stress with patched UVM"
 	@echo "  make all                 Build everything"
 	@echo "  make clean               Clean all build artifacts"
 	@echo "  make setup-pacman-rustc  Download pacman rustc locally (Arch Linux)"
@@ -77,9 +80,28 @@ userspace:
 	cargo build --release
 
 llama-e2e:
+	$(MAKE) kernel NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
 	$(MAKE) -C libpolaris-shim all tests NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
 	cargo build -p polarisd
-	NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" bash tests/llama_cpp/run_llama_shim_e2e.sh
+	sudo env \
+		POLARIS_LLAMA_LOAD_MODULE=1 \
+		POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1 \
+		POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1 \
+		NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" \
+		LLAMA_CPP_DIR="$${LLAMA_CPP_DIR:-/home/wano/workspace/llama.cpp}" \
+		bash tests/llama_cpp/run_llama_shim_e2e.sh
+
+m6-daemon-rm-soak:
+	$(MAKE) kernel NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	cargo build -p polarisd
+	$(MAKE) -C tests/m2 NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	sudo env NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" tests/m2/run_daemon_rm_soak.sh
+
+m6-module-unload-stress:
+	$(MAKE) kernel NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	cargo build -p polarisd
+	$(MAKE) -C tests/m2 NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	sudo env NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" tests/m2/run_module_unload_stress.sh
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD)/kernel clean 2>/dev/null || true
