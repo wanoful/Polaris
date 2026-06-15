@@ -1000,11 +1000,11 @@ Still to do on the Polaris side for M1/M2:
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
   allocation, registers them with `POLARIS_REGISTER_STATIC_BLOCK`, and also
   attaches the same RM tuple to the logical block with
-  `POLARIS_REGISTER_BLOCK_BACKING`. The static registration preserves the
-  existing strict llama gate, while the logical backing registration exercises
-  the newer block-mapping bridge path. This is not the daemon-backed
-  production spill/reload path, and it does not make CUDA runtime host copies
-  into Polaris external VA safe.
+  `POLARIS_REGISTER_BLOCK_BACKING`. The static registration is now diagnostic
+  and integration-only; the strict llama gate below uses daemon-published RM
+  backing instead. Static RM remains outside the daemon-backed production
+  spill/reload path, and it does not make CUDA runtime host copies into Polaris
+  external VA safe.
 - KV-only selection slice wired and validated against the local llama.cpp
   binary: `POLARIS_SHIM_REQUIRE_KV_SCOPE=1` uses the ggml allocation-scope hook
   to leave the copied model-buffer allocation on real CUDA memory while routing
@@ -1015,21 +1015,21 @@ Still to do on the Polaris side for M1/M2:
   UVM-map-plus-CUDA-copy experiment was rejected after `cuMemcpyHtoD_v2`
   returned `CUDA_ERROR_INVALID_CONTEXT` without a current context and segfaulted
   inside `libcuda` with a current runtime context.
-- Strict daemon-backed shim fault-path gate is the current target for the local
-  SmolLM2
-  `llama-bench` run for both llama.cpp allocator branches: the default probe
-  selects KV allocations through runtime `cudaMalloc`, and the
-  `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` probe selects KV allocations through
-  runtime `cudaMallocManaged`. In both cases the shim passes copied model/init
-  allocations through to real CUDA, accepts KV zero-fill initialization,
-  disables CUDA Graph capture and CUDA PDL launch selection for the shim probe,
-  and must complete with `uvm_hook_calls` and `uvm_handled` increasing and no
-  `uvm_no_pte` or `uvm_errors` increments. This validates the no-source-change
-  KV-only path through daemon-published RM backing.
+- Strict daemon-backed shim fault-path gate verified on 2026-06-15 with the
+  local SmolLM2 `llama-bench` run for both llama.cpp allocator branches. The
+  default probe selected KV allocations through runtime `cudaMalloc`; the
+  `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` probe selected KV allocations through
+  runtime `cudaMallocManaged`. In both cases the shim passed copied model/init
+  allocations through to real CUDA, accepted KV zero-fill initialization,
+  disabled CUDA Graph capture and CUDA PDL launch selection for the shim probe,
+  used daemon-published RM backing (`polarisd: RM ALLOC block` / `RM FREE`
+  observed), and completed with `uvm_hook_calls` and `uvm_handled` increasing
+  and no `uvm_no_pte` or `uvm_errors` increments. This validates the
+  no-source-change KV-only llama.cpp path through daemon-published RM backing
+  without static RM registration for the strict gate.
 - Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management, broaden daemon-backed stress
-  into VRAM/RM allocation pressure, and document or disable CUDA Graph
-  interactions.
+  model with workload-appropriate VA management, add longer near-capacity
+  daemon-backed soak coverage, and document or disable CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

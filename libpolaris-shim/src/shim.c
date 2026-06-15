@@ -181,7 +181,7 @@ static struct polaris_shim_alloc_stats g_alloc_stats;
 static void announce(void)
 {
     // One-shot banner so users can tell the shim is actually loaded.
-    fprintf(stderr, "[polaris-shim] active (v4-M2 scaffolding)\n");
+    fprintf(stderr, "[polaris-shim] active (v4 daemon-backed RM path)\n");
 }
 
 static int parse_u32_env(const char *name, uint32_t *out)
