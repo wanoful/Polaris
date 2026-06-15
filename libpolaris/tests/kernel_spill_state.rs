@@ -653,6 +653,26 @@ fn polarisd_rm_backing_alloc_and_free_decision_flow() {
 
 #[test]
 #[ignore = "requires root, freshly loaded polaris.ko, target/debug/polarisd, and a live NVIDIA RM stack"]
+fn clean_polarisd_shutdown_reaps_inserted_gpu() {
+    assert!(
+        polarisd_bin().exists(),
+        "build polarisd first: cargo build -p polarisd"
+    );
+
+    {
+        let _daemon = start_polarisd_rm_backing();
+        wait_for_stat_at_least("gpus", 1, "polarisd GPU registration");
+    }
+
+    wait_for_stat("daemon", 0, "polarisd shutdown");
+    wait_for_stat("gpus", 0, "polarisd GPU cleanup");
+    assert_stat("gpu_total_mib", 0);
+    assert_stat("gpu_budget_mib", 0);
+    assert_stat("cpu_pool_mib", 0);
+}
+
+#[test]
+#[ignore = "requires root, freshly loaded polaris.ko, target/debug/polarisd, and a live NVIDIA RM stack"]
 fn transient_gpu_reregister_does_not_reap_daemon_gpu() {
     assert!(
         polarisd_bin().exists(),

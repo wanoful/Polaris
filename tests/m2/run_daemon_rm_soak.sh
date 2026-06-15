@@ -166,6 +166,15 @@ assert_clean_kernel_state() {
     wait_for_stat_eq v4_va_spaces 0 "$label cleanup"
 }
 
+assert_no_gpu_accounting() {
+    local label="$1"
+    wait_for_stat_eq daemon 0 "$label daemon stop"
+    wait_for_stat_eq gpus 0 "$label GPU cleanup"
+    wait_for_stat_eq gpu_total_mib 0 "$label GPU total cleanup"
+    wait_for_stat_eq gpu_budget_mib 0 "$label GPU budget cleanup"
+    wait_for_stat_eq cpu_pool_mib 0 "$label CPU pool cleanup"
+}
+
 run_gate() {
     local label="$1"
     shift
@@ -221,7 +230,7 @@ for iter in $(seq 1 "$POLARIS_SOAK_ITERS"); do
     run_gate "overwrite COW roundtrip iter $iter" --daemon-rm-cow-roundtrip
 done
 stop_polarisd
-wait_for_stat_eq daemon 0 "normal-budget daemon stop"
+assert_no_gpu_accounting "normal-budget"
 
 if [[ "$POLARIS_SOAK_MICROBENCH_ITERS" -gt 0 ]]; then
     note "reloading polaris.ko for single-worker microbench"
@@ -233,7 +242,7 @@ if [[ "$POLARIS_SOAK_MICROBENCH_ITERS" -gt 0 ]]; then
         run_gate "single-worker microbench iter $iter" --daemon-rm-single-worker-microbench
     done
     stop_polarisd
-    wait_for_stat_eq daemon 0 "microbench daemon stop"
+    assert_no_gpu_accounting "microbench"
 fi
 
 if [[ "$POLARIS_SOAK_NEAR_CAPACITY_ITERS" -gt 0 ]]; then
@@ -246,9 +255,10 @@ if [[ "$POLARIS_SOAK_NEAR_CAPACITY_ITERS" -gt 0 ]]; then
         run_gate "near-capacity soak iter $iter" --daemon-rm-near-capacity-soak
     done
     stop_polarisd
-    wait_for_stat_eq daemon 0 "near-capacity daemon stop"
+    assert_no_gpu_accounting "near-capacity"
 fi
 
 assert_clean_kernel_state "daemon RM soak final"
+assert_no_gpu_accounting "daemon RM soak final"
 wait_for_stat_at_least uvm_bridge_map_calls 1 "daemon RM soak bridge telemetry"
 note "M6 daemon-backed RM soak passed"

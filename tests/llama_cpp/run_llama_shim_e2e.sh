@@ -141,7 +141,7 @@ stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
 
 polarisd_pid=""
-daemon_gpu_count=0
+baseline_gpu_count="$(stat_value gpus)"
 
 cleanup() {
     if [[ -n "$polarisd_pid" ]]; then
@@ -217,7 +217,6 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
         tail -n 160 "$polarisd_log" >&2 || true
         die "polarisd did not register with polaris.ko; see $polarisd_log"
     fi
-    daemon_gpu_count="$(stat_value gpus)"
 fi
 
 run_shim_probe() {
@@ -441,7 +440,7 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
               "$(stat_value static_blocks)" == "0" &&
               "$(stat_value block_mappings)" == "0" &&
               "$(stat_value v4_va_spaces)" == "0" &&
-              "$(stat_value gpus)" == "$daemon_gpu_count" ]]; then
+              "$(stat_value gpus)" == "$baseline_gpu_count" ]]; then
             break
         fi
         sleep 0.05
@@ -454,9 +453,9 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
           "$(stat_value static_blocks)" != "0" ||
           "$(stat_value block_mappings)" != "0" ||
           "$(stat_value v4_va_spaces)" != "0" ||
-          "$(stat_value gpus)" != "$daemon_gpu_count" ]]; then
+          "$(stat_value gpus)" != "$baseline_gpu_count" ]]; then
         sed -n '1,140p' "$STATS_PATH" >&2 || true
-        die "llama shim cleanup did not return to daemon baseline gpus=$daemon_gpu_count"
+        die "llama shim cleanup did not return to baseline gpus=$baseline_gpu_count"
     fi
 fi
 

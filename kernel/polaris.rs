@@ -2713,6 +2713,8 @@ struct PolarisDevice {
     dev: ARef<Device>,
     /// Whether this fd registered as an executor.
     registered_gpu: Atomic<u32>,
+    registered_gpu_id: Atomic<u32>,
+    registered_gpu_inserted: Atomic<u32>,
     /// Whether this fd inserted a transient GPU entry it may reap on close.
     registered_transient_gpu: Atomic<u32>,
     registered_transient_gpu_id: Atomic<u32>,
@@ -2736,6 +2738,8 @@ impl MiscDevice for PolarisDevice {
                 PolarisDevice {
                     dev: dev,
                     registered_gpu: Atomic::new(0),
+                    registered_gpu_id: Atomic::new(0),
+                    registered_gpu_inserted: Atomic::new(0),
                     registered_transient_gpu: Atomic::new(0),
                     registered_transient_gpu_id: Atomic::new(0),
                     registered_va_gpu: Atomic::new(0),
@@ -2885,15 +2889,16 @@ impl PinnedDrop for PolarisDevice {
             polaris_fast_static_blocks_unregister_va_space(v4_gpu, v4_client, v4_token);
         }
 
-        if self.registered_transient_gpu.load(Relaxed) != 0 {
-            let transient_gpu_id = self.registered_transient_gpu_id.load(Relaxed);
+        if self.registered_gpu_inserted.load(Relaxed) != 0 {
+            let inserted_gpu_id = self.registered_gpu_id.load(Relaxed);
+            let transient_gpu = self.registered_transient_gpu.load(Relaxed) != 0;
             let mut guard = POLARIS_STATE.lock();
             if let Some(inner) = guard.as_mut() {
-                let still_referenced = inner.va_spaces.iter().any(|v| v.gpu_id == transient_gpu_id)
-                    || inner.blocks.iter().any(|b| b.home_gpu == transient_gpu_id)
-                    || inner.sessions.iter().any(|s| s.home_gpu == transient_gpu_id);
-                if !still_referenced {
-                    inner.gpus.retain(|g| g.gpu_id != transient_gpu_id);
+                let still_referenced = inner.va_spaces.iter().any(|v| v.gpu_id == inserted_gpu_id)
+                    || inner.blocks.iter().any(|b| b.home_gpu == inserted_gpu_id)
+                    || inner.sessions.iter().any(|s| s.home_gpu == inserted_gpu_id);
+                if !still_referenced && (transient_gpu || inner.daemon_attached == 0) {
+                    inner.gpus.retain(|g| g.gpu_id != inserted_gpu_id);
                 }
             }
         }
@@ -2975,6 +2980,10 @@ impl PolarisDevice {
 
         if self.registered_gpu.load(Relaxed) == 0 {
             self.registered_gpu.store(1, Relaxed);
+            self.registered_gpu_id.store(arg.gpu_id, Relaxed);
+            if inserted_gpu {
+                self.registered_gpu_inserted.store(1, Relaxed);
+            }
             if transient && inserted_gpu {
                 self.registered_transient_gpu.store(1, Relaxed);
                 self.registered_transient_gpu_id.store(arg.gpu_id, Relaxed);
