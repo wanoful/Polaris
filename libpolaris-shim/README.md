@@ -42,7 +42,11 @@ length default to the RM-reported fault-capable VA-space window. To avoid
 registering an unexpectedly huge range during bring-up, the default
 bootstrapped managed window is capped at 1 TiB; set
 `POLARIS_SHIM_MANAGED_LENGTH_CAP=<bytes>` to change that cap or `0` to use the
-full RM-reported length. `POLARIS_SHIM_MANAGED_BASE` and
+full RM-reported length. Set `POLARIS_SHIM_MANAGED_BLOCKS=<count>` to cap the
+bootstrapped window by Polaris block count (`count * POLARIS_SHIM_BLOCK_SIZE`),
+which is often easier to tune for KV experiments than a raw byte length. The
+byte cap and block-count cap are both applied when present, and
+`POLARIS_SHIM_MANAGED_BASE` and
 `POLARIS_SHIM_MANAGED_LENGTH` still override the derived window explicitly.
 
 The older harness mode is still supported. A harness can provide the exact UVM
@@ -191,6 +195,11 @@ Set `POLARIS_SHIM_TEST_LARGE_WINDOW=1` to make the harness request three
 managed blocks in one allocation. In bootstrapped mode, this validates that the
 shim is using the derived RM/UVM managed window instead of the old 4 MiB smoke
 window.
+Set `POLARIS_SHIM_TEST_BLOCK_WINDOW=1` with
+`POLARIS_SHIM_MANAGED_BLOCKS=2` and strict allocation mode to validate that the
+bootstrapped managed window is capped to two allocator blocks: the first two
+one-block allocations succeed and the third fails before falling through to
+CUDA.
 Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate runtime setup, memory/error
 query, and stream/event pass-throughs before the managed allocation smoke.
 Set `POLARIS_SHIM_REPORT_STATS=1` to print an exit-time allocator summary.
@@ -284,12 +293,12 @@ mode implicitly; harness mode should set `POLARIS_SHIM_MANAGE_ALLOCATIONS=1`:
 
 This is not yet the full production shim for llama.cpp: it creates the
 fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
-still uses a fixed managed-window allocator model. The current M5 regression
+still uses a bounded managed-window allocator model. The current M5 regression
 now runs against a real `polarisd` with `POLARISD_RM_BACKING=1`, so llama.cpp
 KV allocations are materialized through daemon-owned RM backing rather than
 the shim's static RM diagnostic backend. Remaining production work is focused
-on workload-appropriate VA/window management, broader stress coverage, and
-permission-based write-fault COW.
+on replacing this bounded window with workload-driven VA growth/reclamation,
+broader stress coverage, and permission-based write-fault COW.
 
 ## Why this is not a Cargo crate
 

@@ -932,6 +932,13 @@ Still to do on the Polaris side for M1/M2:
   the default bring-up window. Explicit `POLARIS_SHIM_MANAGED_BASE` /
   `POLARIS_SHIM_MANAGED_LENGTH` overrides still work for targeted smoke
   tests.
+- Block-count managed-window cap wired: `POLARIS_SHIM_MANAGED_BLOCKS=<count>`
+  caps the bootstrapped managed window to `count * POLARIS_SHIM_BLOCK_SIZE`
+  when no explicit `POLARIS_SHIM_MANAGED_LENGTH` override is present. The
+  existing byte cap still applies, so M5 workload runs can bound the registered
+  external-range VA by either bytes or logical KV block count. The
+  `managed_alloc` harness covers this with `POLARIS_SHIM_TEST_BLOCK_WINDOW=1`,
+  which admits two one-block allocations and rejects the third in strict mode.
 - Runtime setup compatibility slice wired: the shim forwards common runtime
   setup calls (`cudaSetDevice`, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,
   `cudaGetDevice`, `cudaGetDeviceCount`, `cudaGetDeviceProperties`,
@@ -1069,10 +1076,10 @@ Still to do on the Polaris side for M1/M2:
   without static RM registration for the strict gate. If a workload enables PDL
   while Polaris allocations are live, the shim now rejects the PDL-specific
   extended launch attributes instead of allowing an unaudited launch ordering.
-- Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management and, if needed for performance,
-  explicitly validate and enable CUDA PDL launch behavior with live Polaris
-  allocations.
+- Remaining production shim work: replace the bounded managed-window reservation
+  model with workload-appropriate VA growth/reclamation and, if needed for
+  performance, explicitly validate and enable CUDA PDL launch behavior with live
+  Polaris allocations.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

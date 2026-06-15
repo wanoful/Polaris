@@ -840,6 +840,11 @@ Set `POLARIS_SHIM_TEST_LARGE_WINDOW=1` in bootstrapped mode to request three
 managed blocks in one allocation. This validates that the shim derived a
 managed window from the RM/UVM VA-space instead of using the old 4 MiB harness
 window.
+Set `POLARIS_SHIM_TEST_BLOCK_WINDOW=1` with
+`POLARIS_SHIM_MANAGED_BLOCKS=2` and strict allocation mode to validate the
+bootstrapped managed window can be capped by Polaris block count. The harness
+allocates two one-block Polaris ranges and requires the third selected
+allocation to fail without falling back to CUDA.
 Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate common CUDA runtime setup
 pass-throughs (`cudaSetDevice`, `cudaGetDevice`, version queries, device
 count, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,

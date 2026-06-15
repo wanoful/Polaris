@@ -1503,6 +1503,80 @@ int main(void)
                            primary_alloc_size))
         return 1;
 
+    if (env_enabled("POLARIS_SHIM_TEST_BLOCK_WINDOW")) {
+        uint64_t managed_blocks = 0;
+        CUdeviceptr ptr2 = 0;
+        CUdeviceptr ptr3 = 0;
+
+        if (parse_u64_env("POLARIS_SHIM_MANAGED_BLOCKS", &managed_blocks) <= 0 ||
+            managed_blocks != 2 ||
+            expected_range_size != (size_t)block_size) {
+            fprintf(stderr,
+                    "managed_alloc: block-window test requires "
+                    "POLARIS_SHIM_MANAGED_BLOCKS=2 and a one-block primary allocation\n");
+            return 1;
+        }
+
+        if (alloc_test_pointer(use_runtime,
+                               use_async,
+                               use_managed_alloc,
+                               alloc_async_fn,
+                               alloc_fn,
+                               runtime_alloc_fn,
+                               runtime_alloc_managed_fn,
+                               runtime_alloc_async_fn,
+                               &ptr2,
+                               primary_alloc_size))
+            return 1;
+
+        if (use_runtime) {
+            void *runtime_ptr3 = NULL;
+            cudaError_t cr = use_async
+                ? runtime_alloc_async_fn(&runtime_ptr3, primary_alloc_size, NULL)
+                : (use_managed_alloc
+                       ? runtime_alloc_managed_fn(&runtime_ptr3,
+                                                  primary_alloc_size,
+                                                  cudaMemAttachGlobal)
+                       : runtime_alloc_fn(&runtime_ptr3, primary_alloc_size));
+
+            ptr3 = (CUdeviceptr)(uintptr_t)runtime_ptr3;
+            if (cr == 0 || runtime_ptr3 != NULL) {
+                fprintf(stderr,
+                        "managed_alloc: block-window exhaustion unexpectedly "
+                        "returned %d ptr=%p\n",
+                        cr,
+                        runtime_ptr3);
+                if (runtime_ptr3)
+                    (void)runtime_free_fn(runtime_ptr3);
+                return 1;
+            }
+        } else {
+            r = use_async
+                ? alloc_async_fn(&ptr3, primary_alloc_size, NULL)
+                : alloc_fn(&ptr3, primary_alloc_size);
+            if (r == 0 || ptr3 != 0) {
+                fprintf(stderr,
+                        "managed_alloc: block-window exhaustion unexpectedly "
+                        "returned %d ptr=0x%llx\n",
+                        r,
+                        ptr3);
+                if (ptr3 != 0)
+                    (void)free_fn(ptr3);
+                return 1;
+            }
+        }
+
+        if (free_test_pointer(use_runtime,
+                              use_async,
+                              free_async_fn,
+                              free_fn,
+                              runtime_free_fn,
+                              runtime_free_async_fn,
+                              ptr2,
+                              "block-window second free"))
+            return 1;
+    }
+
     if (env_enabled("POLARIS_SHIM_TEST_ATTRS")) {
         unsigned int memory_type = 0;
         CUdeviceptr device_ptr = 0;

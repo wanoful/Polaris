@@ -396,22 +396,59 @@ static uint64_t default_bootstrap_window_cap(void)
     return 1ULL << 40;
 }
 
-static void choose_bootstrap_managed_window(uint64_t *base, uint64_t *length)
+static void choose_bootstrap_managed_window(uint64_t *base,
+                                            uint64_t *length,
+                                            uint64_t block_size)
 {
     uint64_t cap = default_bootstrap_window_cap();
+    uint64_t block_count = 0;
+    uint64_t block_cap = 0;
     int have_base;
     int have_length;
+    int have_block_count;
 
     have_base = parse_u64_env("POLARIS_SHIM_MANAGED_BASE", base);
     have_length = parse_u64_env("POLARIS_SHIM_MANAGED_LENGTH", length);
     (void)parse_u64_env("POLARIS_SHIM_MANAGED_LENGTH_CAP", &cap);
+    have_block_count = parse_u64_env("POLARIS_SHIM_MANAGED_BLOCKS", &block_count);
 
     if (have_base <= 0 && g_bootstrap_state.vaspace_base != 0)
         *base = g_bootstrap_state.vaspace_base;
     if (have_length <= 0 && g_bootstrap_state.vaspace_size != 0)
         *length = g_bootstrap_state.vaspace_size;
-    if (have_length <= 0 && cap != 0 && *length > cap)
+    if (have_length > 0)
+        return;
+
+    if (cap != 0 && *length > cap)
         *length = cap;
+
+    if (have_block_count <= 0 || block_count == 0)
+        return;
+    if (block_size == 0) {
+        fprintf(stderr,
+                "[polaris-shim] ignoring POLARIS_SHIM_MANAGED_BLOCKS without "
+                "a valid POLARIS_SHIM_BLOCK_SIZE\n");
+        return;
+    }
+    if (block_count > UINT32_MAX) {
+        fprintf(stderr,
+                "[polaris-shim] clamping POLARIS_SHIM_MANAGED_BLOCKS=%" PRIu64
+                " to %" PRIu32 "\n",
+                block_count,
+                UINT32_MAX);
+        block_count = UINT32_MAX;
+    }
+    if (block_count > UINT64_MAX / block_size) {
+        fprintf(stderr,
+                "[polaris-shim] ignoring oversized POLARIS_SHIM_MANAGED_BLOCKS=%"
+                PRIu64 " block_size=0x%" PRIx64 "\n",
+                block_count,
+                block_size);
+        return;
+    }
+    block_cap = block_count * block_size;
+    if (block_cap != 0 && *length > block_cap)
+        *length = block_cap;
 }
 
 static struct polaris_shim_api_alloc_stats *
@@ -852,6 +889,7 @@ static void bootstrap_vaspace(void)
     uint64_t total_bytes = 0;
     uint64_t budget_bytes = 0;
     uint64_t cpu_pool_bytes = 0;
+    int invalid_block_size = 0;
     int ret;
 
     g_bootstrap_rm_uvm = env_enabled("POLARIS_SHIM_BOOTSTRAP_RM_UVM");
@@ -864,6 +902,13 @@ static void bootstrap_vaspace(void)
      */
     if (parse_u32_env("POLARIS_SHIM_GPU_ID", &gpu_id) <= 0)
         gpu_id = 0;
+    if (parse_u64_env("POLARIS_SHIM_BLOCK_SIZE", &block_size) > 0 && block_size == 0)
+        invalid_block_size = 1;
+    if (g_bootstrap_rm_uvm && invalid_block_size) {
+        fprintf(stderr, "[polaris-shim] invalid POLARIS_SHIM_BLOCK_SIZE=0\n");
+        cleanup_bootstrap_after_failure();
+        return;
+    }
 
     if (g_bootstrap_rm_uvm) {
         if (parse_u32_env("POLARIS_SHIM_CUDA_ORDINAL", &cuda_ordinal) <= 0 &&
@@ -886,7 +931,7 @@ static void bootstrap_vaspace(void)
             rm_client_token = g_bootstrap_state.observed_rm_client_token;
             token = g_bootstrap_state.observed_va_space_token;
         }
-        choose_bootstrap_managed_window(&base, &length);
+        choose_bootstrap_managed_window(&base, &length, block_size);
         g_create_external_ranges = 1;
         ret = polaris_shim_uvm_adopt_fd(g_bootstrap_state.uvm_fd);
         if (ret != 0) {
@@ -935,16 +980,15 @@ static void bootstrap_vaspace(void)
     }
 
     if (g_manage_allocations) {
-        (void)parse_u64_env("POLARIS_SHIM_BLOCK_SIZE", &block_size);
-        (void)parse_u64_env("POLARIS_SHIM_MIN_MANAGED_ALLOC", &g_min_managed_alloc);
-        (void)parse_u64_env("POLARIS_SHIM_MAX_MANAGED_ALLOC", &g_max_managed_alloc);
-        (void)parse_u64_env("POLARIS_SHIM_SELECTED_ALLOC_SKIP", &g_selected_alloc_skip);
-        if (block_size == 0) {
+        if (invalid_block_size) {
             fprintf(stderr, "[polaris-shim] invalid POLARIS_SHIM_BLOCK_SIZE=0\n");
             g_manage_allocations = 0;
             cleanup_bootstrap_after_failure();
             return;
         }
+        (void)parse_u64_env("POLARIS_SHIM_MIN_MANAGED_ALLOC", &g_min_managed_alloc);
+        (void)parse_u64_env("POLARIS_SHIM_MAX_MANAGED_ALLOC", &g_max_managed_alloc);
+        (void)parse_u64_env("POLARIS_SHIM_SELECTED_ALLOC_SKIP", &g_selected_alloc_skip);
         length = align_up_u64(length, block_size);
         if (g_max_managed_alloc != 0 && g_max_managed_alloc < g_min_managed_alloc) {
             fprintf(stderr,
