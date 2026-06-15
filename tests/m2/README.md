@@ -849,6 +849,9 @@ Set `POLARIS_SHIM_TEST_GROW_WINDOW=1` with
 `POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1`, `POLARIS_SHIM_MANAGED_BLOCKS>=3`, and
 strict allocation mode to validate in-place growth of the same registered
 v4 fault window before later one-block allocations are returned.
+Set `POLARIS_SHIM_TEST_RECLAIM_WINDOW=1` with the same initial/capacity
+settings to validate tail registered-window shrink after frees and a later
+reallocation/regrow cycle.
 Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate common CUDA runtime setup
 pass-throughs (`cudaSetDevice`, `cudaGetDevice`, version queries, device
 count, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,

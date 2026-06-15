@@ -4066,16 +4066,37 @@ impl PolarisDevice {
                 && v.rm_client_token == arg.rm_client_token
                 && v.va_space_token == arg.va_space_token
         }) {
+            let old_base = inner.va_spaces[idx].managed_base;
+            let old_length = inner.va_spaces[idx].managed_length;
+            let pid = inner.va_spaces[idx].pid;
+            let Some(new_end) = arg.managed_base.checked_add(arg.managed_length) else {
+                return Err(EINVAL);
+            };
+
             if !same_fd_vaspace {
                 return Err(EEXIST);
             }
-            let va_space = &mut inner.va_spaces[idx];
-            if arg.managed_base != va_space.managed_base
-                || arg.managed_length < va_space.managed_length
-            {
+            if arg.managed_base != old_base {
                 return Err(EINVAL);
             }
-            va_space.managed_length = arg.managed_length;
+            if arg.managed_length < old_length {
+                let mapping_past_new_end = inner.block_mappings.iter().any(|m| {
+                    m.gpu_id == arg.gpu_id
+                        && m.rm_client_token == arg.rm_client_token
+                        && m.va_space_token == arg.va_space_token
+                        && m.base.saturating_add(m.length) > new_end
+                });
+                let static_past_new_end = inner.static_blocks.iter().any(|b| {
+                    b.gpu_id == arg.gpu_id
+                        && b.rm_client_token == arg.rm_client_token
+                        && b.va_space_token == arg.va_space_token
+                        && b.base.saturating_add(b.length) > new_end
+                });
+                if mapping_past_new_end || static_past_new_end {
+                    return Err(EBUSY);
+                }
+            }
+            inner.va_spaces[idx].managed_length = arg.managed_length;
             polaris_fast_vaspace_register(
                 arg.gpu_id,
                 arg.rm_client_token,
@@ -4086,12 +4107,13 @@ impl PolarisDevice {
 
             dev_info!(
                 self.dev,
-                "POLARIS: grew v4 VA-space gpu={} pid={} client=0x{:x} token=0x{:x} base=0x{:x} len=0x{:x}\n",
+                "POLARIS: updated v4 VA-space gpu={} pid={} client=0x{:x} token=0x{:x} base=0x{:x} old_len=0x{:x} new_len=0x{:x}\n",
                 arg.gpu_id,
-                va_space.pid,
+                pid,
                 arg.rm_client_token,
                 arg.va_space_token,
                 arg.managed_base,
+                old_length,
                 arg.managed_length
             );
             return Ok(0);

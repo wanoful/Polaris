@@ -949,6 +949,15 @@ Still to do on the Polaris side for M1/M2:
   `POLARIS_SHIM_TEST_GROW_WINDOW=1` covers three one-block allocations through
   an initially one-block window without static RM. This narrows the fixed
   window gap, but full workload-specific VA reclamation is still future work.
+- Tail registered-window reclamation wired: successful frees return token
+  spans, collapse contiguous free spans at the allocation high-water mark, and
+  shrink the same v4 `POLARIS_REGISTER_VASPACE` registration back to the
+  highest live token. The kernel permits same-key shrink only after no block or
+  static mapping remains beyond the new end, so live fault coverage cannot be
+  truncated under an existing allocation. `POLARIS_SHIM_TEST_RECLAIM_WINDOW=1`
+  covers grow to three one-block allocations, tail free/shrink, and a later
+  reallocation that regrows the registered window without static RM. Interior
+  holes are still reused but do not compact the bounded capacity.
 - Runtime setup compatibility slice wired: the shim forwards common runtime
   setup calls (`cudaSetDevice`, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,
   `cudaGetDevice`, `cudaGetDeviceCount`, `cudaGetDeviceProperties`,

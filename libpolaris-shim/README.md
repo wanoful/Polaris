@@ -56,7 +56,10 @@ same v4 VA-space registration in place before handing out addresses beyond the
 current registered prefix. `POLARIS_SHIM_MANAGED_GROW_BLOCKS=<count>` controls
 the minimum growth step when the next allocation needs more tokens. This does
 not enable static RM; pages are still materialized through the daemon-backed RM
-fault path.
+fault path. On successful frees, the shim also reclaims contiguous free spans at
+the token high-water mark and shrinks the registered v4 fault window back to the
+highest live token. Interior holes stay available for reuse but do not compact
+the bounded capacity.
 
 The older harness mode is still supported. A harness can provide the exact UVM
 token and managed window through environment variables:
@@ -213,6 +216,8 @@ Set `POLARIS_SHIM_TEST_GROW_WINDOW=1` with
 `POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1`, `POLARIS_SHIM_MANAGED_BLOCKS>=3`, and
 strict allocation mode to validate that the shim grows the same registered
 v4 fault window before admitting the second and third one-block allocations.
+Set `POLARIS_SHIM_TEST_RECLAIM_WINDOW=1` with the same initial/capacity
+settings to validate tail free/shrink and a later reallocation/regrow cycle.
 Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate runtime setup, memory/error
 query, and stream/event pass-throughs before the managed allocation smoke.
 Set `POLARIS_SHIM_REPORT_STATS=1` to print an exit-time allocator summary.
