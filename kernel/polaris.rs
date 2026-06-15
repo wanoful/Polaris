@@ -4792,6 +4792,24 @@ impl PolarisDevice {
             return Err(EINVAL);
         }
 
+        for mapping in &inner.block_mappings {
+            if mapping.gpu_id != arg.gpu_id
+                || mapping.rm_client_token != arg.rm_client_token
+                || mapping.va_space_token != arg.va_space_token
+            {
+                continue;
+            }
+
+            if mapping.block_id == arg.block_id && mapping.base == arg.base {
+                continue;
+            }
+
+            let existing_end = mapping.base.checked_add(mapping.length).ok_or(EINVAL)?;
+            if arg.base < existing_end && mapping.base < mapping_end {
+                return Err(EEXIST);
+            }
+        }
+
         if let Some(mapping) = inner.block_mappings.iter_mut().find(|m| {
             m.block_id == arg.block_id
                 && m.gpu_id == arg.gpu_id

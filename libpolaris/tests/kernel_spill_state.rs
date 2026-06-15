@@ -468,7 +468,7 @@ fn block_release_queues_free_for_resident_block() {
 
     let mut session = PolarisSessionCreateArg {
         home_gpu: 0,
-        gpu_vas_bytes: BLOCK_SIZE,
+        gpu_vas_bytes: 2 * BLOCK_SIZE,
         bytes_per_token: BLOCK_SIZE,
         priority: 5,
         ..Default::default()
@@ -1046,7 +1046,7 @@ fn unregister_vaspace_reaps_only_that_workers_block_mappings() {
         rm_client_token: 0xabc0_0001,
         va_space_token: 0xdef0_0001,
         managed_base: 0x4100_0000_0000,
-        managed_length: BLOCK_SIZE,
+        managed_length: 2 * BLOCK_SIZE,
         ..Default::default()
     };
     ioctl::register_vaspace(worker_a_fd, &vas_a).expect("POLARIS_REGISTER_VASPACE A");
@@ -1073,6 +1073,36 @@ fn unregister_vaspace_reaps_only_that_workers_block_mappings() {
         ioctl::register_block_mapping(control_fd, &mapping)
             .expect("POLARIS_REGISTER_BLOCK_MAPPING");
     }
+
+    let mut overlap_reserve = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 1,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        flags: POLARIS_RESERVE_FLAG_DEFER_FAULT,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(
+        control_fd,
+        ioctl::POLARIS_BLOCK_RESERVE,
+        &mut overlap_reserve,
+    )
+    .expect("POLARIS_BLOCK_RESERVE overlap block");
+    assert_ne!(overlap_reserve.block_id, 0);
+
+    let overlapping_same_worker = PolarisRegisterBlockMappingArg {
+        block_id: overlap_reserve.block_id,
+        gpu_id: vas_a.gpu_id,
+        rm_client_token: vas_a.rm_client_token,
+        va_space_token: vas_a.va_space_token,
+        base: vas_a.managed_base,
+        length: BLOCK_SIZE,
+        ..Default::default()
+    };
+    let err = ioctl::register_block_mapping(control_fd, &overlapping_same_worker)
+        .expect_err("overlapping block mapping in one worker VA-space must fail");
+    assert_eq!(err, libc::EEXIST);
+    assert_stat("block_mappings", 2);
 
     assert_stat("v4_va_spaces", 2);
     assert_stat("v4_worker_pids", 2);
