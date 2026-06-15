@@ -652,6 +652,53 @@ fn polarisd_rm_backing_alloc_and_free_decision_flow() {
 }
 
 #[test]
+#[ignore = "requires root, freshly loaded polaris.ko, target/debug/polarisd, and a live NVIDIA RM stack"]
+fn transient_gpu_reregister_does_not_reap_daemon_gpu() {
+    assert!(
+        polarisd_bin().exists(),
+        "build polarisd first: cargo build -p polarisd"
+    );
+
+    let _daemon = start_polarisd_rm_backing();
+    let before = sysfs_stats();
+    let daemon_gpus = before
+        .get("gpus")
+        .copied()
+        .expect("gpus stat after polarisd start");
+    assert!(daemon_gpus >= 1, "daemon did not register a GPU; stats={before:?}");
+    let daemon_total_mib = before.get("gpu_total_mib").copied();
+    let daemon_budget_mib = before.get("gpu_budget_mib").copied();
+    let daemon_cpu_pool_mib = before.get("cpu_pool_mib").copied();
+
+    {
+        let shim = open_polaris();
+        let shim_fd = shim.as_raw_fd();
+        let gpu = PolarisRegisterGpuArg {
+            gpu_id: 0,
+            total_bytes: 16 * 1024 * MIB,
+            budget_bytes: 512 * MIB,
+            cpu_pool_bytes: 64 * MIB,
+            _reserved: POLARIS_REGISTER_GPU_FLAG_TRANSIENT,
+            ..Default::default()
+        };
+        ioctl::ioctl_write(shim_fd, ioctl::POLARIS_REGISTER_GPU, &gpu)
+            .expect("transient POLARIS_REGISTER_GPU re-register");
+        assert_stat("gpus", daemon_gpus);
+        let during = sysfs_stats();
+        assert_eq!(during.get("gpu_total_mib").copied(), daemon_total_mib);
+        assert_eq!(during.get("gpu_budget_mib").copied(), daemon_budget_mib);
+        assert_eq!(during.get("cpu_pool_mib").copied(), daemon_cpu_pool_mib);
+    }
+
+    wait_for_stat("daemon", 1, "daemon still attached after transient fd close");
+    assert_stat("gpus", daemon_gpus);
+    let after = sysfs_stats();
+    assert_eq!(after.get("gpu_total_mib").copied(), daemon_total_mib);
+    assert_eq!(after.get("gpu_budget_mib").copied(), daemon_budget_mib);
+    assert_eq!(after.get("cpu_pool_mib").copied(), daemon_cpu_pool_mib);
+}
+
+#[test]
 #[ignore = "requires root and freshly loaded polaris.ko; exercises RM-backed SESSION_DESTROY FREE queueing without CUDA"]
 fn session_destroy_queues_free_for_rm_backed_block_without_phys_handle() {
     let dev = open_polaris();

@@ -141,6 +141,7 @@ stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
 
 polarisd_pid=""
+daemon_gpu_count=0
 
 cleanup() {
     if [[ -n "$polarisd_pid" ]]; then
@@ -216,6 +217,7 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
         tail -n 160 "$polarisd_log" >&2 || true
         die "polarisd did not register with polaris.ko; see $polarisd_log"
     fi
+    daemon_gpu_count="$(stat_value gpus)"
 fi
 
 run_shim_probe() {
@@ -229,7 +231,7 @@ run_shim_probe() {
         POLARIS_SHIM_REPORT_STATS=1
         POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}"
         POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}"
-        POLARIS_SHIM_TRANSIENT_GPU="${POLARIS_SHIM_TRANSIENT_GPU:-0}"
+        POLARIS_SHIM_TRANSIENT_GPU="${POLARIS_SHIM_TRANSIENT_GPU:-1}"
         POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}"
         POLARIS_SHIM_CUDA_ORDINAL="${POLARIS_SHIM_CUDA_ORDINAL:-0}"
         POLARIS_SHIM_BLOCK_SIZE="${POLARIS_SHIM_BLOCK_SIZE:-0x200000}"
@@ -422,6 +424,40 @@ if [[ "${POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE:-0}" == "1" ]]; then
     set -e
     verify_shim_probe "dynamic-window" "$dynamic_shim_log" "$before_hook_calls" "$before_handled" \
         "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 1
+fi
+
+if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
+    if [[ -n "$polarisd_pid" ]]; then
+        kill "$polarisd_pid" 2>/dev/null || true
+        wait "$polarisd_pid" 2>/dev/null || true
+        polarisd_pid=""
+    fi
+
+    for _ in $(seq 1 100); do
+        if [[ "$(stat_value daemon)" == "0" &&
+              "$(stat_value sessions)" == "0" &&
+              "$(stat_value blocks)" == "0" &&
+              "$(stat_value pending_decs)" == "0" &&
+              "$(stat_value static_blocks)" == "0" &&
+              "$(stat_value block_mappings)" == "0" &&
+              "$(stat_value v4_va_spaces)" == "0" &&
+              "$(stat_value gpus)" == "$daemon_gpu_count" ]]; then
+            break
+        fi
+        sleep 0.05
+    done
+
+    if [[ "$(stat_value daemon)" != "0" ||
+          "$(stat_value sessions)" != "0" ||
+          "$(stat_value blocks)" != "0" ||
+          "$(stat_value pending_decs)" != "0" ||
+          "$(stat_value static_blocks)" != "0" ||
+          "$(stat_value block_mappings)" != "0" ||
+          "$(stat_value v4_va_spaces)" != "0" ||
+          "$(stat_value gpus)" != "$daemon_gpu_count" ]]; then
+        sed -n '1,140p' "$STATS_PATH" >&2 || true
+        die "llama shim cleanup did not return to daemon baseline gpus=$daemon_gpu_count"
+    fi
 fi
 
 cp "$STATS_PATH" "$stats_after"

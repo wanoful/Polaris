@@ -2713,6 +2713,7 @@ struct PolarisDevice {
     dev: ARef<Device>,
     /// Whether this fd registered as an executor.
     registered_gpu: Atomic<u32>,
+    /// Whether this fd inserted a transient GPU entry it may reap on close.
     registered_transient_gpu: Atomic<u32>,
     registered_transient_gpu_id: Atomic<u32>,
     registered_va_gpu: Atomic<u32>,
@@ -2832,15 +2833,6 @@ impl PinnedDrop for PolarisDevice {
 
                 dev_info!(self.dev, "POLARIS: executor disconnected, evicting pending blocks\n");
                 inner.daemon_attached = inner.daemon_attached.saturating_sub(1);
-                if self.registered_transient_gpu.load(Relaxed) != 0 {
-                    let transient_gpu_id = self.registered_transient_gpu_id.load(Relaxed);
-                    let still_referenced = inner.va_spaces.iter().any(|v| v.gpu_id == transient_gpu_id)
-                        || inner.blocks.iter().any(|b| b.home_gpu == transient_gpu_id)
-                        || inner.sessions.iter().any(|s| s.home_gpu == transient_gpu_id);
-                    if !still_referenced {
-                        inner.gpus.retain(|g| g.gpu_id != transient_gpu_id);
-                    }
-                }
                 for block in inner.blocks.iter_mut() {
                     match block.state {
                         PolarisBlockState::AllocPending
@@ -2893,6 +2885,19 @@ impl PinnedDrop for PolarisDevice {
             polaris_fast_static_blocks_unregister_va_space(v4_gpu, v4_client, v4_token);
         }
 
+        if self.registered_transient_gpu.load(Relaxed) != 0 {
+            let transient_gpu_id = self.registered_transient_gpu_id.load(Relaxed);
+            let mut guard = POLARIS_STATE.lock();
+            if let Some(inner) = guard.as_mut() {
+                let still_referenced = inner.va_spaces.iter().any(|v| v.gpu_id == transient_gpu_id)
+                    || inner.blocks.iter().any(|b| b.home_gpu == transient_gpu_id)
+                    || inner.sessions.iter().any(|s| s.home_gpu == transient_gpu_id);
+                if !still_referenced {
+                    inner.gpus.retain(|g| g.gpu_id != transient_gpu_id);
+                }
+            }
+        }
+
         dev_info!(self.dev, "POLARIS: device closed\n");
 
         // Release the module reference taken in open().  Skip during
@@ -2924,15 +2929,18 @@ impl PolarisDevice {
         // non-zero parameters. In-process runtimes attach with zero capacity
         // fields so they do not overwrite the control-plane daemon's global
         // GPU accounting.
+        let mut inserted_gpu = false;
         if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == arg.gpu_id) {
-            if arg.total_bytes != 0 {
-                gpu.total_bytes = arg.total_bytes;
-            }
-            if arg.budget_bytes != 0 {
-                gpu.budget_bytes = arg.budget_bytes;
-            }
-            if arg.cpu_pool_bytes != 0 {
-                gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+            if !transient {
+                if arg.total_bytes != 0 {
+                    gpu.total_bytes = arg.total_bytes;
+                }
+                if arg.budget_bytes != 0 {
+                    gpu.budget_bytes = arg.budget_bytes;
+                }
+                if arg.cpu_pool_bytes != 0 {
+                    gpu.cpu_pool_total_bytes = arg.cpu_pool_bytes;
+                }
             }
             gpu.healthy = true;
             dev_info!(self.dev, "POLARIS: GPU {} re-registered\n", arg.gpu_id);
@@ -2961,12 +2969,13 @@ impl PolarisDevice {
                 },
                 GFP_KERNEL,
             )?;
+            inserted_gpu = true;
             dev_info!(self.dev, "POLARIS: GPU {} registered\n", arg.gpu_id);
         }
 
         if self.registered_gpu.load(Relaxed) == 0 {
             self.registered_gpu.store(1, Relaxed);
-            if transient {
+            if transient && inserted_gpu {
                 self.registered_transient_gpu.store(1, Relaxed);
                 self.registered_transient_gpu_id.store(arg.gpu_id, Relaxed);
             }
