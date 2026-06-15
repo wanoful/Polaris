@@ -939,6 +939,16 @@ Still to do on the Polaris side for M1/M2:
   external-range VA by either bytes or logical KV block count. The
   `managed_alloc` harness covers this with `POLARIS_SHIM_TEST_BLOCK_WINDOW=1`,
   which admits two one-block allocations and rejects the third in strict mode.
+- In-place registered-window growth wired: the shim can start with an initial
+  v4 fault window (`POLARIS_SHIM_MANAGED_INITIAL_BLOCKS` or
+  `POLARIS_SHIM_MANAGED_INITIAL_LENGTH`) smaller than the allocator capacity
+  and grow the same `POLARIS_REGISTER_VASPACE` registration before handing out
+  later token spans. The kernel treats same-fd/same-key
+  `POLARIS_REGISTER_VASPACE` calls as monotonic managed-length updates and
+  refreshes the fast UVM-hook lookup entry; different keys remain rejected.
+  `POLARIS_SHIM_TEST_GROW_WINDOW=1` covers three one-block allocations through
+  an initially one-block window without static RM. This narrows the fixed
+  window gap, but full workload-specific VA reclamation is still future work.
 - Runtime setup compatibility slice wired: the shim forwards common runtime
   setup calls (`cudaSetDevice`, `cudaSetDeviceFlags`, `cudaGetDeviceFlags`,
   `cudaGetDevice`, `cudaGetDeviceCount`, `cudaGetDeviceProperties`,
@@ -1076,8 +1086,8 @@ Still to do on the Polaris side for M1/M2:
   without static RM registration for the strict gate. If a workload enables PDL
   while Polaris allocations are live, the shim now rejects the PDL-specific
   extended launch attributes instead of allowing an unaudited launch ordering.
-- Remaining production shim work: replace the bounded managed-window reservation
-  model with workload-appropriate VA growth/reclamation and, if needed for
+- Remaining production shim work: replace the bounded managed-window capacity
+  model with workload-appropriate VA reclamation/rebalancing and, if needed for
   performance, explicitly validate and enable CUDA PDL launch behavior with live
   Polaris allocations.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.

@@ -73,6 +73,8 @@ static uint64_t g_registered_rm_client_token;
 static uint64_t g_registered_va_space_token;
 static uint64_t g_managed_base;
 static uint64_t g_managed_length;
+static uint64_t g_registered_managed_length;
+static uint64_t g_managed_grow_blocks;
 static uint64_t g_block_size;
 static uint64_t g_min_managed_alloc;
 static uint64_t g_max_managed_alloc;
@@ -126,6 +128,7 @@ struct polaris_shim_cuda_pointer_attributes {
 };
 
 static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_window_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct polaris_shim_allocation *g_allocations;
 static struct polaris_shim_free_span *g_free_spans;
 static size_t g_live_managed_allocations;
@@ -170,6 +173,9 @@ struct polaris_shim_alloc_stats {
     uint64_t fallback_free_calls;
     uint64_t fallback_free_success_calls;
     uint64_t fallback_free_failure_calls;
+    uint64_t managed_window_grow_calls;
+    uint64_t managed_window_grow_failure_calls;
+    uint64_t managed_window_grow_bytes;
     uint64_t live_requested_bytes;
     uint64_t live_rounded_bytes;
     uint64_t peak_live_requested_bytes;
@@ -449,6 +455,54 @@ static void choose_bootstrap_managed_window(uint64_t *base,
     block_cap = block_count * block_size;
     if (block_cap != 0 && *length > block_cap)
         *length = block_cap;
+}
+
+static uint64_t choose_initial_managed_window_length(uint64_t capacity,
+                                                     uint64_t block_size)
+{
+    uint64_t initial_length = capacity;
+    uint64_t initial_blocks = 0;
+    uint64_t block_length = 0;
+    int have_initial_length;
+    int have_initial_blocks;
+
+    have_initial_length =
+        parse_u64_env("POLARIS_SHIM_MANAGED_INITIAL_LENGTH", &initial_length);
+    have_initial_blocks =
+        parse_u64_env("POLARIS_SHIM_MANAGED_INITIAL_BLOCKS", &initial_blocks);
+    (void)parse_u64_env("POLARIS_SHIM_MANAGED_GROW_BLOCKS",
+                        &g_managed_grow_blocks);
+
+    if (capacity == 0 || block_size == 0)
+        return capacity;
+
+    if (have_initial_length <= 0)
+        initial_length = capacity;
+    else if (initial_length == 0)
+        initial_length = block_size;
+
+    if (have_initial_blocks > 0 && initial_blocks != 0) {
+        if (initial_blocks > UINT64_MAX / block_size) {
+            fprintf(stderr,
+                    "[polaris-shim] ignoring oversized "
+                    "POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=%" PRIu64
+                    " block_size=0x%" PRIx64 "\n",
+                    initial_blocks,
+                    block_size);
+        } else {
+            block_length = initial_blocks * block_size;
+            if (have_initial_length > 0 && initial_length < block_length)
+                block_length = initial_length;
+            initial_length = block_length;
+        }
+    }
+
+    initial_length = align_up_u64(initial_length, block_size);
+    if (initial_length == 0)
+        initial_length = block_size;
+    if (initial_length > capacity)
+        initial_length = capacity;
+    return initial_length;
 }
 
 static struct polaris_shim_api_alloc_stats *
@@ -739,7 +793,10 @@ static void report_stats_at_exit(void)
             " managed_free_calls=%" PRIu64
             " fallback_free_calls=%" PRIu64
             " fallback_free_success_calls=%" PRIu64
-            " fallback_free_failure_calls=%" PRIu64 "\n",
+            " fallback_free_failure_calls=%" PRIu64
+            " managed_window_grow_calls=%" PRIu64
+            " managed_window_grow_failure_calls=%" PRIu64
+            " managed_window_grow_bytes=%" PRIu64 "\n",
             stats.fallback_alloc_calls,
             stats.fallback_alloc_bytes,
             stats.fallback_alloc_success_calls,
@@ -748,7 +805,10 @@ static void report_stats_at_exit(void)
             stats.managed_free_calls,
             stats.fallback_free_calls,
             stats.fallback_free_success_calls,
-            stats.fallback_free_failure_calls);
+            stats.fallback_free_failure_calls,
+            stats.managed_window_grow_calls,
+            stats.managed_window_grow_failure_calls,
+            stats.managed_window_grow_bytes);
     fprintf(stderr,
             "[polaris-shim] stats live_allocations=%zu"
             " live_requested_bytes=%" PRIu64
@@ -885,6 +945,7 @@ static void bootstrap_vaspace(void)
     uint64_t token = 0;
     uint64_t base = 0;
     uint64_t length = 0;
+    uint64_t registered_length = 0;
     uint64_t block_size = 2ULL * 1024ULL * 1024ULL;
     uint64_t total_bytes = 0;
     uint64_t budget_bytes = 0;
@@ -997,6 +1058,7 @@ static void bootstrap_vaspace(void)
                     g_min_managed_alloc,
                     g_max_managed_alloc);
         }
+        registered_length = choose_initial_managed_window_length(length, block_size);
         if (!g_bootstrap_rm_uvm)
             g_create_external_ranges = env_enabled("POLARIS_SHIM_CREATE_EXTERNAL_RANGES");
         if (g_create_external_ranges) {
@@ -1015,6 +1077,8 @@ static void bootstrap_vaspace(void)
             }
         }
     }
+    if (registered_length == 0)
+        registered_length = length;
 
     if (g_manage_allocations || env_enabled("POLARIS_SHIM_REGISTER_GPU")) {
         (void)parse_u64_env("POLARIS_SHIM_GPU_TOTAL_BYTES", &total_bytes);
@@ -1039,13 +1103,18 @@ static void bootstrap_vaspace(void)
         }
     }
 
-    if (polaris_shim_register_vaspace(gpu_id, rm_client_token, token, base, length) == 0) {
+    if (polaris_shim_register_vaspace(gpu_id,
+                                      rm_client_token,
+                                      token,
+                                      base,
+                                      registered_length) == 0) {
         g_registered_gpu_id = gpu_id;
         g_registered_cuda_ordinal = cuda_ordinal;
         g_registered_rm_client_token = rm_client_token;
         g_registered_va_space_token = token;
         g_managed_base = base;
         g_managed_length = length;
+        g_registered_managed_length = registered_length;
         g_registered_vaspace = 1;
         atexit(unregister_vaspace_at_exit);
         if (g_report_stats)
@@ -1053,8 +1122,14 @@ static void bootstrap_vaspace(void)
         fprintf(stderr,
                 "[polaris-shim] registered VA-space gpu=%u client=0x%" PRIx64
                 " token=0x%" PRIx64
-                " base=0x%" PRIx64 " length=0x%" PRIx64 "\n",
-                gpu_id, rm_client_token, token, base, length);
+                " base=0x%" PRIx64 " length=0x%" PRIx64
+                " capacity=0x%" PRIx64 "\n",
+                gpu_id,
+                rm_client_token,
+                token,
+                base,
+                registered_length,
+                length);
     } else {
         cleanup_bootstrap_after_failure();
         return;
@@ -1208,6 +1283,7 @@ static int is_managed_pointer_value(const void *ptr)
 static int take_token_span_locked(uint32_t token_count, uint32_t *token_start_out)
 {
     struct polaris_shim_free_span **link = &g_free_spans;
+    uint64_t registered_tokens;
     uint64_t max_tokens;
 
     while (*link) {
@@ -1226,14 +1302,132 @@ static int take_token_span_locked(uint32_t token_count, uint32_t *token_start_ou
     }
 
     max_tokens = g_managed_length / g_block_size;
+    registered_tokens = g_registered_managed_length / g_block_size;
     if (g_next_token > UINT32_MAX ||
         g_next_token + token_count > UINT32_MAX ||
         g_next_token + token_count > max_tokens)
         return -ENOMEM;
+    if (g_next_token + token_count > registered_tokens)
+        return -EAGAIN;
 
     *token_start_out = (uint32_t)g_next_token;
     g_next_token += token_count;
     return 0;
+}
+
+static void stats_note_window_grow(uint64_t old_length,
+                                   uint64_t new_length,
+                                   int success)
+{
+    pthread_mutex_lock(&g_alloc_lock);
+    if (success) {
+        g_alloc_stats.managed_window_grow_calls++;
+        if (new_length > old_length)
+            g_alloc_stats.managed_window_grow_bytes += new_length - old_length;
+    } else {
+        g_alloc_stats.managed_window_grow_failure_calls++;
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+}
+
+static int grow_registered_managed_window(uint64_t required_tokens)
+{
+    uint64_t required_length;
+    uint64_t new_length;
+    uint64_t old_length;
+    uint64_t grow_length = 0;
+    int ret;
+
+    if (!g_registered_vaspace || g_block_size == 0)
+        return -EINVAL;
+    if (required_tokens > UINT64_MAX / g_block_size)
+        return -ENOMEM;
+
+    required_length = required_tokens * g_block_size;
+    if (required_length > g_managed_length)
+        return -ENOMEM;
+
+    pthread_mutex_lock(&g_window_lock);
+    old_length = g_registered_managed_length;
+    if (required_length <= old_length) {
+        pthread_mutex_unlock(&g_window_lock);
+        return 0;
+    }
+
+    new_length = required_length;
+    if (g_managed_grow_blocks != 0) {
+        if (g_managed_grow_blocks > UINT64_MAX / g_block_size) {
+            fprintf(stderr,
+                    "[polaris-shim] ignoring oversized "
+                    "POLARIS_SHIM_MANAGED_GROW_BLOCKS=%" PRIu64
+                    " block_size=0x%" PRIx64 "\n",
+                    g_managed_grow_blocks,
+                    g_block_size);
+        } else {
+            grow_length = g_managed_grow_blocks * g_block_size;
+            if (old_length <= UINT64_MAX - grow_length &&
+                old_length + grow_length > new_length) {
+                new_length = old_length + grow_length;
+            }
+        }
+    }
+    if (new_length > g_managed_length)
+        new_length = g_managed_length;
+
+    ret = polaris_shim_register_vaspace(g_registered_gpu_id,
+                                        g_registered_rm_client_token,
+                                        g_registered_va_space_token,
+                                        g_managed_base,
+                                        new_length);
+    if (ret == 0) {
+        pthread_mutex_lock(&g_alloc_lock);
+        g_registered_managed_length = new_length;
+        g_alloc_stats.managed_window_grow_calls++;
+        if (new_length > old_length)
+            g_alloc_stats.managed_window_grow_bytes += new_length - old_length;
+        pthread_mutex_unlock(&g_alloc_lock);
+        fprintf(stderr,
+                "[polaris-shim] grew registered VA-space window "
+                "old=0x%" PRIx64 " new=0x%" PRIx64
+                " capacity=0x%" PRIx64 "\n",
+                old_length,
+                new_length,
+                g_managed_length);
+    } else {
+        stats_note_window_grow(old_length, old_length, 0);
+        fprintf(stderr,
+                "[polaris-shim] failed to grow registered VA-space window "
+                "old=0x%" PRIx64 " required=0x%" PRIx64
+                " capacity=0x%" PRIx64 " ret=%d\n",
+                old_length,
+                required_length,
+                g_managed_length,
+                ret);
+    }
+
+    pthread_mutex_unlock(&g_window_lock);
+    return ret;
+}
+
+static int reserve_token_span(uint32_t token_count, uint32_t *token_start_out)
+{
+    int ret;
+
+    for (;;) {
+        uint64_t required_tokens;
+
+        pthread_mutex_lock(&g_alloc_lock);
+        ret = take_token_span_locked(token_count, token_start_out);
+        required_tokens = g_next_token + token_count;
+        pthread_mutex_unlock(&g_alloc_lock);
+
+        if (ret != -EAGAIN)
+            return ret;
+
+        ret = grow_registered_managed_window(required_tokens);
+        if (ret != 0)
+            return ret;
+    }
 }
 
 static void return_token_span_locked(uint32_t token_start, uint32_t token_count)
@@ -1304,8 +1498,8 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
     }
 
     token_count = (uint32_t)(rounded / g_block_size);
-    ret = take_token_span_locked(token_count, &token_start);
     pthread_mutex_unlock(&g_alloc_lock);
+    ret = reserve_token_span(token_count, &token_start);
     if (ret != 0)
         return ret;
 

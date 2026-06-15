@@ -723,6 +723,7 @@ int main(void)
     int use_managed_alloc = env_enabled("POLARIS_SHIM_TEST_MANAGED_ALLOC");
     int test_filter = env_enabled("POLARIS_SHIM_TEST_FILTER");
     int test_large_window = env_enabled("POLARIS_SHIM_TEST_LARGE_WINDOW");
+    int test_grow_window = env_enabled("POLARIS_SHIM_TEST_GROW_WINDOW");
     int test_runtime_setup = env_enabled("POLARIS_SHIM_TEST_RUNTIME_SETUP");
     int test_host_apis = env_enabled("POLARIS_SHIM_TEST_HOST_APIS");
     int allow_zero_memset = env_enabled("POLARIS_SHIM_ALLOW_ZERO_MEMSET");
@@ -1574,6 +1575,79 @@ int main(void)
                               runtime_free_async_fn,
                               ptr2,
                               "block-window second free"))
+            return 1;
+    }
+
+    if (test_grow_window) {
+        uint64_t initial_blocks = 0;
+        uint64_t managed_blocks = 0;
+        CUdeviceptr ptr2 = 0;
+        CUdeviceptr ptr3 = 0;
+
+        if (parse_u64_env("POLARIS_SHIM_MANAGED_INITIAL_BLOCKS", &initial_blocks) <= 0 ||
+            initial_blocks != 1 ||
+            parse_u64_env("POLARIS_SHIM_MANAGED_BLOCKS", &managed_blocks) <= 0 ||
+            managed_blocks < 3 ||
+            expected_range_size != (size_t)block_size) {
+            fprintf(stderr,
+                    "managed_alloc: grow-window test requires "
+                    "POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1, "
+                    "POLARIS_SHIM_MANAGED_BLOCKS>=3, and a one-block primary allocation\n");
+            return 1;
+        }
+
+        if (alloc_test_pointer(use_runtime,
+                               use_async,
+                               use_managed_alloc,
+                               alloc_async_fn,
+                               alloc_fn,
+                               runtime_alloc_fn,
+                               runtime_alloc_managed_fn,
+                               runtime_alloc_async_fn,
+                               &ptr2,
+                               primary_alloc_size))
+            return 1;
+
+        if (alloc_test_pointer(use_runtime,
+                               use_async,
+                               use_managed_alloc,
+                               alloc_async_fn,
+                               alloc_fn,
+                               runtime_alloc_fn,
+                               runtime_alloc_managed_fn,
+                               runtime_alloc_async_fn,
+                               &ptr3,
+                               primary_alloc_size))
+            return 1;
+
+        if (ptr2 == ptr || ptr3 == ptr || ptr3 == ptr2) {
+            fprintf(stderr,
+                    "managed_alloc: grow-window returned duplicate ptrs "
+                    "ptr=0x%llx ptr2=0x%llx ptr3=0x%llx\n",
+                    ptr,
+                    ptr2,
+                    ptr3);
+            return 1;
+        }
+
+        if (free_test_pointer(use_runtime,
+                              use_async,
+                              free_async_fn,
+                              free_fn,
+                              runtime_free_fn,
+                              runtime_free_async_fn,
+                              ptr3,
+                              "grow-window third free"))
+            return 1;
+
+        if (free_test_pointer(use_runtime,
+                              use_async,
+                              free_async_fn,
+                              free_fn,
+                              runtime_free_fn,
+                              runtime_free_async_fn,
+                              ptr2,
+                              "grow-window second free"))
             return 1;
     }
 

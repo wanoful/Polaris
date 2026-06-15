@@ -48,6 +48,15 @@ which is often easier to tune for KV experiments than a raw byte length. The
 byte cap and block-count cap are both applied when present, and
 `POLARIS_SHIM_MANAGED_BASE` and
 `POLARIS_SHIM_MANAGED_LENGTH` still override the derived window explicitly.
+To test incremental fault-window growth, set
+`POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=<count>` or
+`POLARIS_SHIM_MANAGED_INITIAL_LENGTH=<bytes>` to register only an initial
+prefix of that capacity with `polaris.ko`; later selected allocations grow the
+same v4 VA-space registration in place before handing out addresses beyond the
+current registered prefix. `POLARIS_SHIM_MANAGED_GROW_BLOCKS=<count>` controls
+the minimum growth step when the next allocation needs more tokens. This does
+not enable static RM; pages are still materialized through the daemon-backed RM
+fault path.
 
 The older harness mode is still supported. A harness can provide the exact UVM
 token and managed window through environment variables:
@@ -200,6 +209,10 @@ Set `POLARIS_SHIM_TEST_BLOCK_WINDOW=1` with
 bootstrapped managed window is capped to two allocator blocks: the first two
 one-block allocations succeed and the third fails before falling through to
 CUDA.
+Set `POLARIS_SHIM_TEST_GROW_WINDOW=1` with
+`POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1`, `POLARIS_SHIM_MANAGED_BLOCKS>=3`, and
+strict allocation mode to validate that the shim grows the same registered
+v4 fault window before admitting the second and third one-block allocations.
 Set `POLARIS_SHIM_TEST_RUNTIME_SETUP=1` to validate runtime setup, memory/error
 query, and stream/event pass-throughs before the managed allocation smoke.
 Set `POLARIS_SHIM_REPORT_STATS=1` to print an exit-time allocator summary.

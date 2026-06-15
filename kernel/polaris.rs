@@ -4045,22 +4045,56 @@ impl PolarisDevice {
         if arg.va_space_token == 0 || arg.managed_length == 0 {
             return Err(EINVAL);
         }
-        if self.registered_v4_token.load(Relaxed) != 0 {
-            return Err(EBUSY);
-        }
-
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
         if !inner.gpus.iter().any(|g| g.gpu_id == arg.gpu_id) {
             return Err(ENOENT);
         }
-        if inner.va_spaces.iter().any(|v| {
+
+        let fd_had_vaspace = self.registered_v4_token.load(Relaxed) != 0;
+        let same_fd_vaspace = fd_had_vaspace
+            && self.registered_v4_gpu.load(Relaxed) == arg.gpu_id
+            && self.registered_v4_client.load(Relaxed) == arg.rm_client_token
+            && self.registered_v4_token.load(Relaxed) == arg.va_space_token;
+        if fd_had_vaspace && !same_fd_vaspace {
+            return Err(EBUSY);
+        }
+
+        if let Some(idx) = inner.va_spaces.iter().position(|v| {
             v.gpu_id == arg.gpu_id
                 && v.rm_client_token == arg.rm_client_token
                 && v.va_space_token == arg.va_space_token
         }) {
-            return Err(EEXIST);
+            if !same_fd_vaspace {
+                return Err(EEXIST);
+            }
+            let va_space = &mut inner.va_spaces[idx];
+            if arg.managed_base != va_space.managed_base
+                || arg.managed_length < va_space.managed_length
+            {
+                return Err(EINVAL);
+            }
+            va_space.managed_length = arg.managed_length;
+            polaris_fast_vaspace_register(
+                arg.gpu_id,
+                arg.rm_client_token,
+                arg.va_space_token,
+                arg.managed_base,
+                arg.managed_length,
+            )?;
+
+            dev_info!(
+                self.dev,
+                "POLARIS: grew v4 VA-space gpu={} pid={} client=0x{:x} token=0x{:x} base=0x{:x} len=0x{:x}\n",
+                arg.gpu_id,
+                va_space.pid,
+                arg.rm_client_token,
+                arg.va_space_token,
+                arg.managed_base,
+                arg.managed_length
+            );
+            return Ok(0);
         }
 
         let pid = polaris_current_pid();
