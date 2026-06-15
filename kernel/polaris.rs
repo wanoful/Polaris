@@ -96,8 +96,14 @@ fn polaris_return_uvm_fault(
     access_type: u32,
     result: c_int,
 ) -> c_int {
-    if result == UVM_POLARIS_FAULT_DEFERRED {
-        POLARIS_UVM_FAULT_DEFERRED.fetch_add(1, Relaxed);
+    match result {
+        UVM_POLARIS_FAULT_NOT_MINE => {
+            POLARIS_UVM_FAULT_REJECTED.fetch_add(1, Relaxed);
+        }
+        UVM_POLARIS_FAULT_DEFERRED => {
+            POLARIS_UVM_FAULT_DEFERRED.fetch_add(1, Relaxed);
+        }
+        _ => {}
     }
     polaris_record_uvm_fault_result(
         gpu_id,
@@ -146,6 +152,7 @@ static POLARIS_UVM_FAULT_FAST_MISSES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_HANDLED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_DEFERRED: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_FAULT_REJECTED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_ERRORS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
@@ -2365,6 +2372,7 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_unserviceable = POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.load(Relaxed);
     let uvm_handled = POLARIS_UVM_FAULT_HANDLED.load(Relaxed);
     let uvm_deferred = POLARIS_UVM_FAULT_DEFERRED.load(Relaxed);
+    let uvm_rejected = POLARIS_UVM_FAULT_REJECTED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
     let uvm_zero_faults = POLARIS_UVM_ZERO_FAULTS.load(Relaxed);
     let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
@@ -2449,6 +2457,7 @@ uvm_fast_miss:  {uvm_fast_misses}
 uvm_no_pte:     {uvm_unserviceable}
 uvm_handled:    {uvm_handled}
 uvm_deferred:   {uvm_deferred}
+uvm_rejected:   {uvm_rejected}
 uvm_errors:     {uvm_errors}
 uvm_zero_faults:{uvm_zero_faults}
 uvm_last_gpu:   {uvm_last_gpu}
@@ -2505,6 +2514,7 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_unserviceable = uvm_unserviceable,
                 uvm_handled = uvm_handled,
                 uvm_deferred = uvm_deferred,
+                uvm_rejected = uvm_rejected,
                 uvm_errors = uvm_errors,
                 uvm_zero_faults = uvm_zero_faults,
                 uvm_last_gpu = uvm_last_gpu,

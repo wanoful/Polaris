@@ -209,14 +209,18 @@ run_gate() {
     local errors_after
     local bridge_before
     local bridge_after
+    local rejected_before
+    local rejected_after
 
     phase_index=$((phase_index + 1))
     errors_before="$(stat_value uvm_errors)"
     bridge_before="$(stat_value uvm_bridge_map_calls)"
+    rejected_before="$(stat_value uvm_rejected)"
     note "phase $phase_index: $label"
     sudo "$M2_BIN" "$@"
     errors_after="$(stat_value uvm_errors)"
     bridge_after="$(stat_value uvm_bridge_map_calls)"
+    rejected_after="$(stat_value uvm_rejected)"
     if [[ "$errors_after" != "$errors_before" ]]; then
         sed -n '1,220p' "$STATS_PATH" >&2 || true
         die "$label changed uvm_errors: $errors_before -> $errors_after"
@@ -224,6 +228,10 @@ run_gate() {
     if [[ "$bridge_after" -le "$bridge_before" ]]; then
         sed -n '1,220p' "$STATS_PATH" >&2 || true
         die "$label did not increase uvm_bridge_map_calls: $bridge_before -> $bridge_after"
+    fi
+    if [[ "$rejected_after" -le "$rejected_before" ]]; then
+        sed -n '1,220p' "$STATS_PATH" >&2 || true
+        die "$label did not increase uvm_rejected: $rejected_before -> $rejected_after"
     fi
     assert_clean_kernel_state "$label"
 }
