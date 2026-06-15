@@ -1100,6 +1100,54 @@ fn unregister_vaspace_reaps_only_that_workers_block_mappings() {
 }
 
 #[test]
+#[ignore = "requires root and freshly loaded polaris.ko; exercises v4 fast-table saturation cleanup"]
+fn failed_vaspace_fast_slot_registration_does_not_leave_authoritative_entry() {
+    let control = open_polaris();
+    let control_fd = control.as_raw_fd();
+    register_transient_gpu_and_range(control_fd, 0x3900_0000_0000, 8 * BLOCK_SIZE);
+
+    let mut workers = Vec::new();
+    for idx in 0..16u64 {
+        let worker = open_polaris();
+        let vas = PolarisRegisterVaSpaceArg {
+            gpu_id: 0,
+            rm_client_token: 0x3900_0000 + idx,
+            va_space_token: 0x4900_0000 + idx,
+            managed_base: 0x4a00_0000_0000 + idx * BLOCK_SIZE,
+            managed_length: BLOCK_SIZE,
+            ..Default::default()
+        };
+        ioctl::register_vaspace(worker.as_raw_fd(), &vas).expect("fill fast v4 VA-space slot");
+        workers.push(worker);
+    }
+    assert_stat("v4_va_spaces", 16);
+    assert_stat("v4_worker_pids", 16);
+
+    let overflow_worker = open_polaris();
+    let overflow = PolarisRegisterVaSpaceArg {
+        gpu_id: 0,
+        rm_client_token: 0x3900_1000,
+        va_space_token: 0x4900_1000,
+        managed_base: 0x4b00_0000_0000,
+        managed_length: BLOCK_SIZE,
+        ..Default::default()
+    };
+    let err = ioctl::register_vaspace(overflow_worker.as_raw_fd(), &overflow)
+        .expect_err("17th v4 VA-space should fail when the fast hook table is full");
+    assert_eq!(err, libc::ENOMEM);
+    assert_stat("v4_va_spaces", 16);
+    assert_stat("v4_worker_pids", 16);
+
+    drop(overflow_worker);
+    assert_stat("v4_va_spaces", 16);
+    assert_stat("v4_worker_pids", 16);
+
+    drop(workers);
+    wait_for_stat("v4_va_spaces", 0, "filled v4 worker fd cleanup");
+    wait_for_stat("v4_worker_pids", 0, "filled v4 worker pid cleanup");
+}
+
+#[test]
 #[ignore = "requires root and freshly loaded polaris.ko; exercises worker process-exit v4 cleanup without CUDA"]
 fn worker_process_exit_reaps_vaspace_and_block_mapping() {
     let control = open_polaris();

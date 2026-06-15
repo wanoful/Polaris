@@ -1680,7 +1680,7 @@ fn polaris_prepare_unmap_publish_offload(
             if let Some(inner) = guard.as_mut() {
                 polaris_cancel_prepared_offload(inner, prepared);
             }
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -4493,7 +4493,6 @@ impl PolarisDevice {
                     return Err(EBUSY);
                 }
             }
-            inner.va_spaces[idx].managed_length = arg.managed_length;
             polaris_fast_vaspace_register(
                 arg.gpu_id,
                 arg.rm_client_token,
@@ -4501,6 +4500,7 @@ impl PolarisDevice {
                 arg.managed_base,
                 arg.managed_length,
             )?;
+            inner.va_spaces[idx].managed_length = arg.managed_length;
 
             dev_info!(
                 self.dev,
@@ -4516,8 +4516,15 @@ impl PolarisDevice {
             return Ok(0);
         }
 
+        polaris_fast_vaspace_register(
+            arg.gpu_id,
+            arg.rm_client_token,
+            arg.va_space_token,
+            arg.managed_base,
+            arg.managed_length,
+        )?;
         let pid = polaris_current_pid();
-        inner.va_spaces.push(
+        if let Err(err) = inner.va_spaces.push(
             PolarisVaSpace {
                 gpu_id: arg.gpu_id,
                 pid,
@@ -4527,14 +4534,14 @@ impl PolarisDevice {
                 managed_length: arg.managed_length,
             },
             GFP_KERNEL,
-        )?;
-        polaris_fast_vaspace_register(
-            arg.gpu_id,
-            arg.rm_client_token,
-            arg.va_space_token,
-            arg.managed_base,
-            arg.managed_length,
-        )?;
+        ) {
+            polaris_fast_vaspace_unregister(
+                arg.gpu_id,
+                arg.rm_client_token,
+                arg.va_space_token,
+            );
+            return Err(err.into());
+        }
         self.registered_v4_gpu.store(arg.gpu_id, Relaxed);
         self.registered_v4_client.store(arg.rm_client_token, Relaxed);
         self.registered_v4_token.store(arg.va_space_token, Relaxed);
