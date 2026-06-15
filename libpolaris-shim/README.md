@@ -101,8 +101,13 @@ They are not used as the v4 production allocation path because raw CUDA VMM
 reservations are not UVM fault-capable.
 Runtime and driver kernel launch entry points (`cudaLaunchKernel`,
 `cudaLaunchKernelExC`, `cuLaunchKernel`, and `cuLaunchKernelEx`) are forwarded
-so ordinary CUDA kernel launches and llama.cpp's CUDA 11.8+ PDL launch path can
-run through the shim.
+so ordinary CUDA kernel launches can run through the shim. Extended launch
+configs that request CUDA Programmatic Dependent Launch through
+`cudaLaunchAttributeProgrammaticStreamSerialization`,
+`cudaLaunchAttributeProgrammaticEvent`,
+`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`, or
+`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT` are rejected with
+`cudaErrorNotSupported` while shim-managed Polaris allocations are live.
 Additional llama.cpp helper surfaces are forwarded as pass-throughs:
 `cuDeviceGet`, `cuDeviceGetAttribute`, `cuDevicePrimaryCtxRetain`,
 `cuCtxSetCurrent`, `cudaDeviceDisablePeerAccess`, `cudaDeviceGetPCIBusId`,
@@ -228,9 +233,11 @@ If capture starts before any Polaris allocation exists, selected-size
 `cudaMallocAsync` and `cuMemAllocAsync_v2` calls intentionally pass through to
 CUDA instead of returning Polaris VA. This keeps graph capture or replay from
 recording or launching work that may dereference unmapped Polaris VA.
-The llama.cpp shim regression also sets `GGML_CUDA_PDL=0` by default to keep
-programmatic dependent launch on the documented unsupported side of the M5
-contract until the launch path is audited with live Polaris allocations.
+The llama.cpp shim regression also sets `GGML_CUDA_PDL=0` by default so the
+strict KV fault-path gate stays on ordinary kernel launches; if PDL launch
+selection slips through while Polaris allocations are live, the shim rejects
+the extended launch before CUDA can run work that may dereference unmapped
+external VA.
 Set `POLARIS_SHIM_TEST_GRAPH=1` in the `managed_alloc` harness to validate
 the runtime and driver guards after Polaris allocations are live, and
 `POLARIS_SHIM_TEST_GRAPH_CAPTURE_ALLOC=1` to validate capture-before-allocation
@@ -240,6 +247,10 @@ pass-through with a safe invalid-argument probe that does not map or
 dereference memory.
 Set `POLARIS_SHIM_TEST_LAUNCH=1` to validate launch symbol coverage without
 executing kernels.
+Set `POLARIS_SHIM_TEST_PDL_GUARD=1` to validate that runtime and driver
+extended launches with PDL attributes are rejected after a Polaris allocation
+is live. The harness uses null kernel handles intentionally; the shim returns
+before forwarding those guarded calls to CUDA.
 
 For harness-created VA-spaces, the shim also has an opt-in UVM external-range
 slice when the harness can pass the already-initialized UVM VA-space fd:

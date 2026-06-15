@@ -901,6 +901,11 @@ capture/launch while shim-managed Polaris allocations are live. Set
 if capture starts before any Polaris allocation exists, selected-size
 `cudaMallocAsync` and `cuMemAllocAsync_v2` calls fall through to CUDA instead
 of returning Polaris VA.
+Set `POLARIS_SHIM_TEST_PDL_GUARD=1` to validate that runtime
+`cudaLaunchKernelExC` and driver `cuLaunchKernelEx` reject CUDA Programmatic
+Dependent Launch attributes with `cudaErrorNotSupported` after a Polaris
+allocation is live. This keeps PDL on the documented unsupported side of the
+M5 contract until the live fault path is explicitly validated for PDL ordering.
 Set `POLARIS_SHIM_TEST_VMM=1` to validate that CUDA driver VMM symbols used by
 llama.cpp resolve through the shim and reach the real driver through a safe
 invalid-argument probe.

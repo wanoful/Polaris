@@ -1002,13 +1002,16 @@ Still to do on the Polaris side for M1/M2:
 - Kernel-launch compatibility slice wired: the shim interposes and forwards
   runtime `cudaLaunchKernel` / `cudaLaunchKernelExC` and driver
   `cuLaunchKernel` / `cuLaunchKernelEx` so llama.cpp's ordinary `<<<...>>>`
-  launches and CUDA 11.8+ PDL launch path stay visible through the shim. These
-  are pass-throughs rather than guards because the production v4 path requires
-  real kernels to fault on Polaris-managed VA. The `managed_alloc` harness
-  covers symbol routing without executing kernels via
-  `POLARIS_SHIM_TEST_LAUNCH=1`; intentionally invalid launch calls are not
-  used because some CUDA runtime paths dereference launch metadata before
-  returning an error.
+  launches stay visible through the shim. Ordinary launches remain
+  pass-throughs because the production v4 path requires real kernels to fault
+  on Polaris-managed VA. CUDA Programmatic Dependent Launch remains unsupported
+  for live Polaris allocations: when `cudaLaunchKernelExC` /
+  `cuLaunchKernelEx` configs carry
+  `ProgrammaticStreamSerialization` or `ProgrammaticEvent` attributes and a
+  shim-managed allocation is live, the shim returns `cudaErrorNotSupported`
+  before forwarding to CUDA. The `managed_alloc` harness covers symbol routing
+  without executing kernels via `POLARIS_SHIM_TEST_LAUNCH=1` and covers the PDL
+  guard with `POLARIS_SHIM_TEST_PDL_GUARD=1`.
 - Remaining llama.cpp helper compatibility wired: the shim forwards driver
   device/context setup (`cuDeviceGet`, `cuDeviceGetAttribute`,
   `cuDevicePrimaryCtxRetain`, `cuCtxSetCurrent`), runtime peer/PCI helpers
@@ -1063,10 +1066,13 @@ Still to do on the Polaris side for M1/M2:
   observed), and completed with `uvm_hook_calls` and `uvm_handled` increasing
   and no `uvm_no_pte` or `uvm_errors` increments. This validates the
   no-source-change KV-only llama.cpp path through daemon-published RM backing
-  without static RM registration for the strict gate.
+  without static RM registration for the strict gate. If a workload enables PDL
+  while Polaris allocations are live, the shim now rejects the PDL-specific
+  extended launch attributes instead of allowing an unaudited launch ordering.
 - Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management and audit CUDA PDL launch
-  behavior with live Polaris allocations.
+  model with workload-appropriate VA management and, if needed for performance,
+  explicitly validate and enable CUDA PDL launch behavior with live Polaris
+  allocations.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

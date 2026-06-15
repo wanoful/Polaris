@@ -49,8 +49,54 @@ typedef struct cudaGraphExecUpdateResultInfo_st cudaGraphExecUpdateResultInfo;
 typedef struct cudaKernelNodeParams cudaKernelNodeParams;
 typedef struct CUmemAllocationProp_st CUmemAllocationProp;
 typedef struct CUmemAccessDesc_st CUmemAccessDesc;
-typedef struct CUlaunchConfig_st CUlaunchConfig;
-typedef struct cudaLaunchConfig_st cudaLaunchConfig_t;
+typedef union {
+    char pad[64];
+    int programmaticStreamSerializationAllowed;
+    struct {
+        void *event;
+        int flags;
+        int triggerAtBlockStart;
+    } programmaticEvent;
+} CUlaunchAttributeValue;
+typedef struct {
+    int id;
+    char pad[8 - sizeof(int)];
+    CUlaunchAttributeValue value;
+} CUlaunchAttribute;
+typedef struct CUlaunchConfig_st {
+    unsigned int gridDimX;
+    unsigned int gridDimY;
+    unsigned int gridDimZ;
+    unsigned int blockDimX;
+    unsigned int blockDimY;
+    unsigned int blockDimZ;
+    unsigned int sharedMemBytes;
+    CUstream hStream;
+    CUlaunchAttribute *attrs;
+    unsigned int numAttrs;
+} CUlaunchConfig;
+typedef union {
+    char pad[64];
+    int programmaticStreamSerializationAllowed;
+    struct {
+        void *event;
+        int flags;
+        int triggerAtBlockStart;
+    } programmaticEvent;
+} cudaLaunchAttributeValue;
+typedef struct {
+    int id;
+    char pad[8 - sizeof(int)];
+    cudaLaunchAttributeValue val;
+} cudaLaunchAttribute;
+typedef struct cudaLaunchConfig_st {
+    dim3 gridDim;
+    dim3 blockDim;
+    size_t dynamicSmemBytes;
+    cudaStream_t stream;
+    cudaLaunchAttribute *attrs;
+    unsigned int numAttrs;
+} cudaLaunchConfig_t;
 struct cudaMemLocation {
     int type;
     int id;

@@ -43,14 +43,60 @@ typedef void (*cudaHostFn_t)(void *userData);
 typedef int cudaStreamCaptureStatus;
 typedef void CUmemAllocationProp;
 typedef void CUmemAccessDesc;
-typedef void CUlaunchConfig;
-typedef void cudaLaunchConfig_t;
 typedef int CUmemAllocationGranularity_flags;
 typedef struct {
     unsigned int x;
     unsigned int y;
     unsigned int z;
 } dim3;
+typedef union {
+    char pad[64];
+    int programmaticStreamSerializationAllowed;
+    struct {
+        void *event;
+        int flags;
+        int triggerAtBlockStart;
+    } programmaticEvent;
+} CUlaunchAttributeValue;
+typedef struct {
+    int id;
+    char pad[8 - sizeof(int)];
+    CUlaunchAttributeValue value;
+} CUlaunchAttribute;
+typedef struct {
+    unsigned int gridDimX;
+    unsigned int gridDimY;
+    unsigned int gridDimZ;
+    unsigned int blockDimX;
+    unsigned int blockDimY;
+    unsigned int blockDimZ;
+    unsigned int sharedMemBytes;
+    void *hStream;
+    CUlaunchAttribute *attrs;
+    unsigned int numAttrs;
+} CUlaunchConfig;
+typedef union {
+    char pad[64];
+    int programmaticStreamSerializationAllowed;
+    struct {
+        void *event;
+        int flags;
+        int triggerAtBlockStart;
+    } programmaticEvent;
+} cudaLaunchAttributeValue;
+typedef struct {
+    int id;
+    char pad[8 - sizeof(int)];
+    cudaLaunchAttributeValue val;
+} cudaLaunchAttribute;
+typedef struct {
+    dim3 gridDim;
+    dim3 blockDim;
+    size_t dynamicSmemBytes;
+    void *stream;
+    cudaLaunchAttribute *attrs;
+    unsigned int numAttrs;
+} cudaLaunchConfig_t;
 struct cudaMemLocation {
     int type;
     int id;
@@ -353,6 +399,10 @@ struct cudaPointerAttributes {
 #define cudaMemAdviseSetAccessedBy 5
 #define cudaDevAttrCooperativeLaunch 95
 #define cudaDevAttrHostRegisterReadOnlySupported 113
+#define cudaLaunchAttributeProgrammaticStreamSerialization 6
+#define cudaLaunchAttributeProgrammaticEvent 7
+#define CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION 6
+#define CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT 7
 
 static void *must_resolve(const char *name)
 {
@@ -1924,6 +1974,90 @@ int main(void)
             !driver_launch_kernel_fn ||
             !driver_launch_kernel_ex_fn)
             return 1;
+    }
+
+    if (env_enabled("POLARIS_SHIM_TEST_PDL_GUARD")) {
+        cudaLaunchAttribute runtime_attrs[2];
+        cudaLaunchConfig_t runtime_config;
+        CUlaunchAttribute driver_attrs[2];
+        CUlaunchConfig driver_config;
+        cudaError_t cr;
+        CUresult driver_result;
+
+        if (!runtime_launch_kernel_ex_fn || !driver_launch_kernel_ex_fn)
+            return 1;
+
+        memset(runtime_attrs, 0, sizeof(runtime_attrs));
+        memset(&runtime_config, 0, sizeof(runtime_config));
+        runtime_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        runtime_attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        runtime_config.gridDim.x = 1;
+        runtime_config.gridDim.y = 1;
+        runtime_config.gridDim.z = 1;
+        runtime_config.blockDim.x = 1;
+        runtime_config.blockDim.y = 1;
+        runtime_config.blockDim.z = 1;
+        runtime_config.attrs = runtime_attrs;
+        runtime_config.numAttrs = 1;
+        cr = runtime_launch_kernel_ex_fn(&runtime_config, NULL, NULL);
+        if (cr != cudaErrorNotSupported) {
+            fprintf(stderr,
+                    "managed_alloc: cudaLaunchKernelExC PDL stream attr returned %d, "
+                    "expected %d\n",
+                    cr,
+                    cudaErrorNotSupported);
+            return 1;
+        }
+
+        runtime_attrs[0].id = cudaLaunchAttributeProgrammaticEvent;
+        runtime_attrs[0].val.programmaticEvent.event = (void *)(uintptr_t)0x1;
+        runtime_attrs[0].val.programmaticEvent.flags = 0;
+        runtime_attrs[0].val.programmaticEvent.triggerAtBlockStart = 0;
+        cr = runtime_launch_kernel_ex_fn(&runtime_config, NULL, NULL);
+        if (cr != cudaErrorNotSupported) {
+            fprintf(stderr,
+                    "managed_alloc: cudaLaunchKernelExC PDL event attr returned %d, "
+                    "expected %d\n",
+                    cr,
+                    cudaErrorNotSupported);
+            return 1;
+        }
+
+        memset(driver_attrs, 0, sizeof(driver_attrs));
+        memset(&driver_config, 0, sizeof(driver_config));
+        driver_attrs[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+        driver_attrs[0].value.programmaticStreamSerializationAllowed = 1;
+        driver_config.gridDimX = 1;
+        driver_config.gridDimY = 1;
+        driver_config.gridDimZ = 1;
+        driver_config.blockDimX = 1;
+        driver_config.blockDimY = 1;
+        driver_config.blockDimZ = 1;
+        driver_config.attrs = driver_attrs;
+        driver_config.numAttrs = 1;
+        driver_result = driver_launch_kernel_ex_fn(&driver_config, NULL, NULL, NULL);
+        if (driver_result != cudaErrorNotSupported) {
+            fprintf(stderr,
+                    "managed_alloc: cuLaunchKernelEx PDL stream attr returned %d, "
+                    "expected %d\n",
+                    driver_result,
+                    cudaErrorNotSupported);
+            return 1;
+        }
+
+        driver_attrs[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT;
+        driver_attrs[0].value.programmaticEvent.event = (void *)(uintptr_t)0x1;
+        driver_attrs[0].value.programmaticEvent.flags = 0;
+        driver_attrs[0].value.programmaticEvent.triggerAtBlockStart = 0;
+        driver_result = driver_launch_kernel_ex_fn(&driver_config, NULL, NULL, NULL);
+        if (driver_result != cudaErrorNotSupported) {
+            fprintf(stderr,
+                    "managed_alloc: cuLaunchKernelEx PDL event attr returned %d, "
+                    "expected %d\n",
+                    driver_result,
+                    cudaErrorNotSupported);
+            return 1;
+        }
     }
 
     if (mode && strcmp(mode, "0") != 0) {

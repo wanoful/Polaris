@@ -45,6 +45,10 @@
 #define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR 11
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE 12
 #define CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE 17
+#define CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION 6
+#define CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT 7
+#define CUDA_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION 6
+#define CUDA_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT 7
 
 struct ggml_context;
 struct ggml_tensor;
@@ -1454,6 +1458,76 @@ static int has_live_managed_allocations(void)
     return live;
 }
 
+static int cu_launch_config_uses_pdl(const CUlaunchConfig *config)
+{
+    unsigned int i;
+
+    if (!config || !config->attrs || config->numAttrs == 0)
+        return 0;
+
+    for (i = 0; i < config->numAttrs; ++i) {
+        const CUlaunchAttribute *attr = &config->attrs[i];
+
+        switch (attr->id) {
+        case CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION:
+            if (attr->value.programmaticStreamSerializationAllowed != 0)
+                return 1;
+            break;
+        case CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT:
+            if (attr->value.programmaticEvent.event != NULL ||
+                attr->value.programmaticEvent.flags != 0 ||
+                attr->value.programmaticEvent.triggerAtBlockStart != 0)
+                return 1;
+            break;
+        default:
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int cuda_launch_config_uses_pdl(const cudaLaunchConfig_t *config)
+{
+    unsigned int i;
+
+    if (!config || !config->attrs || config->numAttrs == 0)
+        return 0;
+
+    for (i = 0; i < config->numAttrs; ++i) {
+        const cudaLaunchAttribute *attr = &config->attrs[i];
+
+        switch (attr->id) {
+        case CUDA_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION:
+            if (attr->val.programmaticStreamSerializationAllowed != 0)
+                return 1;
+            break;
+        case CUDA_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT:
+            if (attr->val.programmaticEvent.event != NULL ||
+                attr->val.programmaticEvent.flags != 0 ||
+                attr->val.programmaticEvent.triggerAtBlockStart != 0)
+                return 1;
+            break;
+        default:
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static int reject_pdl_launch_if_live(const char *name, int uses_pdl)
+{
+    if (!uses_pdl || !has_live_managed_allocations())
+        return 0;
+
+    fprintf(stderr,
+            "[polaris-shim] %s with CUDA PDL attributes is unsupported while "
+            "Polaris-managed allocations are live\n",
+            name);
+    return 1;
+}
+
 static void graph_capture_started(void)
 {
     pthread_mutex_lock(&g_alloc_lock);
@@ -2715,6 +2789,10 @@ CUresult cuLaunchKernelEx(const CUlaunchConfig *config,
     pthread_once(&g_announce_once, announce);
     pthread_once(&g_bootstrap_once, bootstrap_vaspace);
 
+    if (reject_pdl_launch_if_live("cuLaunchKernelEx",
+                                  cu_launch_config_uses_pdl(config)))
+        return CUDA_ERROR_NOT_SUPPORTED;
+
     *(void **)(&real) = polaris_shim_resolve_cuda_symbol("cuLaunchKernelEx");
     if (!real) {
         fprintf(stderr, "[polaris-shim] cuLaunchKernelEx: real symbol unavailable\n");
@@ -3620,6 +3698,10 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
     cudaLaunchKernelExC_fn real;
 
     bootstrap_for_runtime_call();
+
+    if (reject_pdl_launch_if_live("cudaLaunchKernelExC",
+                                  cuda_launch_config_uses_pdl(config)))
+        return CUDA_ERROR_NOT_SUPPORTED;
 
     *(void **)(&real) = resolve_cudart_symbol("cudaLaunchKernelExC");
     if (!real) {
