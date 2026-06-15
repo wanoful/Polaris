@@ -510,6 +510,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             }
 
             let mapping = PolarisFaultMapping {
+                rm_client_token,
+                va_space_token,
                 base: block_base,
                 length: block_length,
                 offset: block.offset.load(Relaxed),
@@ -522,6 +524,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                     block.last_gpu_va_space_ptr.store(gpu_va_space_ptr, Release);
                     polaris_note_block_mapping_fault(
                         gpu_id,
+                        rm_client_token,
+                        va_space_token,
                         fault_address,
                         gpu_va_space_ptr,
                     );
@@ -559,6 +563,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                 Ok(()) => {
                     polaris_note_block_mapping_fault(
                         gpu_id,
+                        rm_client_token,
+                        va_space_token,
                         fault_address,
                         gpu_va_space_ptr,
                     );
@@ -611,6 +617,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                             Ok(()) => {
                                 polaris_note_block_mapping_fault(
                                     gpu_id,
+                                    rm_client_token,
+                                    va_space_token,
                                     fault_address,
                                     gpu_va_space_ptr,
                                 );
@@ -700,6 +708,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             Ok(()) => {
                 polaris_note_block_mapping_fault(
                     gpu_id,
+                    mapping.rm_client_token,
+                    mapping.va_space_token,
                     fault_address,
                     gpu_va_space_ptr,
                 );
@@ -750,6 +760,8 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                         Ok(()) => {
                             polaris_note_block_mapping_fault(
                                 gpu_id,
+                                materialize.rm_client_token,
+                                materialize.va_space_token,
                                 fault_address,
                                 gpu_va_space_ptr,
                             );
@@ -938,6 +950,8 @@ fn polaris_uvm_unmap_external_allocation(
 
 fn polaris_note_block_mapping_fault(
     gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
     fault_address: u64,
     gpu_va_space_ptr: u64,
 ) {
@@ -952,6 +966,8 @@ fn polaris_note_block_mapping_fault(
 
     for mapping in inner.block_mappings.iter_mut() {
         if mapping.gpu_id == gpu_id
+            && mapping.rm_client_token == rm_client_token
+            && mapping.va_space_token == va_space_token
             && fault_address >= mapping.base
             && fault_address < mapping.base.saturating_add(mapping.length)
         {
@@ -1004,6 +1020,8 @@ struct PolarisRmCopyTarget {
 
 #[derive(Clone, Copy)]
 struct PolarisFaultMapping {
+    rm_client_token: u64,
+    va_space_token: u64,
     base: u64,
     length: u64,
     offset: u64,
@@ -1063,6 +1081,8 @@ fn polaris_find_logical_fault_mapping(
         }
 
         return Some(PolarisFaultMapping {
+            rm_client_token: mapping.rm_client_token,
+            va_space_token: mapping.va_space_token,
             base: mapping.base,
             length: mapping.length,
             offset: block.rm_backing_offset,
@@ -1146,6 +1166,8 @@ fn polaris_find_single_observed_fault_mapping(
         }
 
         let candidate = PolarisFaultMapping {
+            rm_client_token: mapping.rm_client_token,
+            va_space_token: mapping.va_space_token,
             base: mapping.base,
             length: mapping.length,
             offset: block.rm_backing_offset,

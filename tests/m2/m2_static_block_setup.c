@@ -2169,6 +2169,275 @@ static int unmap_block_mappings(struct m2_state *s,
     return 0;
 }
 
+static int register_same_va_unobserved_block(struct m2_state *s,
+                                             uint32_t gpu_id,
+                                             uint64_t rm_client_token,
+                                             uint64_t va_space_token,
+                                             uint64_t mapping_base,
+                                             uint64_t *session_id_out,
+                                             uint64_t *block_id_out,
+                                             uint32_t *token_start_out,
+                                             uint32_t *token_count_out)
+{
+    struct polaris_session_create_arg session = {
+        .home_gpu = gpu_id,
+        .beam_width = 1,
+        .gpu_vas_bytes = POLARIS_MANAGED_SIZE,
+        .bytes_per_token = POLARIS_BLOCK_SIZE,
+        .priority = 5,
+    };
+    struct polaris_block_reserve_arg reserve = {
+        .token_start = 0,
+        .token_count = 1,
+        .phase = 2,
+        .flags = POLARIS_RESERVE_FLAG_DEFER_FAULT,
+    };
+
+    *session_id_out = 0;
+    *block_id_out = 0;
+    *token_start_out = 0;
+    *token_count_out = 0;
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_SESSION_CREATE,
+                              &session,
+                              "POLARIS_SESSION_CREATE observed isolation") != 0)
+        return -1;
+    *session_id_out = session.session_id;
+
+    reserve.session_id = session.session_id;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RESERVE,
+                              &reserve,
+                              "POLARIS_BLOCK_RESERVE observed isolation") != 0)
+        return -1;
+    if (reserve.block_id == 0) {
+        fprintf(stderr, "observed isolation reserve returned block_id=0\n");
+        return -1;
+    }
+    *block_id_out = reserve.block_id;
+    *token_start_out = reserve.token_start;
+    *token_count_out = reserve.token_count;
+
+    struct polaris_register_block_mapping_arg mapping = {
+        .block_id = reserve.block_id,
+        .gpu_id = gpu_id,
+        .rm_client_token = rm_client_token,
+        .va_space_token = va_space_token,
+        .base = mapping_base,
+        .length = POLARIS_BLOCK_SIZE,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_BLOCK_MAPPING,
+                              &mapping,
+                              "POLARIS_REGISTER_BLOCK_MAPPING observed isolation") != 0)
+        return -1;
+
+    printf("POLARIS registered observed-isolation alternate mapping: block=%llu session=%llu client=0x%llx token=0x%llx block_vaddr=0x%llx mapping_base=0x%llx\n",
+           (unsigned long long)reserve.block_id,
+           (unsigned long long)session.session_id,
+           (unsigned long long)rm_client_token,
+           (unsigned long long)va_space_token,
+           (unsigned long long)reserve.gpu_vaddr,
+           (unsigned long long)mapping_base);
+    return 0;
+}
+
+static int unregister_aux_vaspace(int fd,
+                                  uint32_t gpu_id,
+                                  uint64_t rm_client_token,
+                                  uint64_t va_space_token)
+{
+    struct polaris_unregister_vaspace_arg unva = {
+        .gpu_id = gpu_id,
+        .rm_client_token = rm_client_token,
+        .va_space_token = va_space_token,
+    };
+
+    return polaris_ioctl_checked(fd,
+                                 POLARIS_UNREGISTER_VASPACE,
+                                 &unva,
+                                 "POLARIS_UNREGISTER_VASPACE observed isolation");
+}
+
+static int observed_mapping_key_isolation(struct m2_state *s,
+                                          uint32_t gpu_id,
+                                          uint64_t rm_client_token,
+                                          uint64_t va_space_token,
+                                          uint64_t base,
+                                          uint64_t managed_length)
+{
+    pthread_t executor = 0;
+    bool executor_started = false;
+    struct completion_executor_args exec_args = {
+        .state = s,
+        .gpu_id = gpu_id,
+        .expected_base = base,
+    };
+    int aux_fd = -1;
+    bool aux_vaspace_registered = false;
+    uint64_t fake_client = rm_client_token ^ 0x504f4c4152495301ULL;
+    uint64_t fake_token = va_space_token ^ 0x504f4c4152495302ULL;
+    uint64_t block_a = 0;
+    uint64_t block_b = 0;
+    uint64_t session_b = 0;
+    uint32_t token_b = 0;
+    uint32_t count_b = 0;
+    uint32_t unmapped_count = 0;
+    uint64_t static_blocks = 0;
+    int rc = -1;
+
+    if (fake_client == 0 || fake_client == rm_client_token)
+        fake_client = rm_client_token + 0x100000001ULL;
+    if (fake_token == 0 || fake_token == va_space_token)
+        fake_token = va_space_token + 0x100000003ULL;
+
+    if (managed_length < 2 * POLARIS_MANAGED_SIZE) {
+        fprintf(stderr,
+                "observed isolation requires managed_length=0x%llx, got 0x%llx\n",
+                (unsigned long long)(2 * POLARIS_MANAGED_SIZE),
+                (unsigned long long)managed_length);
+        return -1;
+    }
+
+    aux_fd = open("/dev/polaris", O_RDWR | O_CLOEXEC);
+    if (aux_fd < 0) {
+        fprintf(stderr, "open /dev/polaris auxiliary fd failed: errno=%d (%s)\n", errno, strerror(errno));
+        return -1;
+    }
+
+    struct polaris_register_vaspace_arg fake_va = {
+        .gpu_id = gpu_id,
+        .rm_client_token = fake_client,
+        .va_space_token = fake_token,
+        .managed_base = base,
+        .managed_length = managed_length,
+    };
+    if (polaris_ioctl_checked(aux_fd,
+                              POLARIS_REGISTER_VASPACE,
+                              &fake_va,
+                              "POLARIS_REGISTER_VASPACE observed isolation") != 0)
+        goto out;
+    aux_vaspace_registered = true;
+
+    if (pthread_create(&executor, NULL, complete_backing_executor, &exec_args) != 0) {
+        fprintf(stderr, "pthread_create observed isolation executor failed\n");
+        goto out;
+    }
+    executor_started = true;
+
+    if (register_logical_block_mapping(s,
+                                       gpu_id,
+                                       rm_client_token,
+                                       va_space_token,
+                                       base,
+                                       managed_length,
+                                       POLARIS_BLOCK_SIZE,
+                                       false,
+                                       &block_a) != 0)
+        goto out;
+
+    if (pthread_join(executor, NULL) != 0) {
+        fprintf(stderr, "pthread_join observed isolation executor failed\n");
+        executor_started = false;
+        goto out;
+    }
+    executor_started = false;
+    if (exec_args.result != 0 || exec_args.completed_block_id != block_a) {
+        fprintf(stderr,
+                "observed isolation executor result=%d completed_block=%llu expected_block=%llu\n",
+                exec_args.result,
+                (unsigned long long)exec_args.completed_block_id,
+                (unsigned long long)block_a);
+        goto out;
+    }
+
+    if (register_same_va_unobserved_block(s,
+                                          gpu_id,
+                                          fake_client,
+                                          fake_token,
+                                          base,
+                                          &session_b,
+                                          &block_b,
+                                          &token_b,
+                                          &count_b) != 0)
+        goto out;
+
+    if (read_sysfs_stat_u64("static_blocks", &static_blocks) != 0)
+        goto out;
+    if (static_blocks != 0) {
+        fprintf(stderr,
+                "observed isolation unexpectedly registered static_blocks=%llu\n",
+                (unsigned long long)static_blocks);
+        goto out;
+    }
+
+    if (dispatch_test_fault(s, base) != 0)
+        goto out;
+
+    if (unmap_block_mappings(s, block_b, &unmapped_count) != 0)
+        goto out;
+    if (unmapped_count != 0) {
+        fprintf(stderr,
+                "observed isolation alternate block unmapped_count=%u, expected 0\n",
+                unmapped_count);
+        goto out;
+    }
+
+    if (unmap_block_mappings(s, block_a, &unmapped_count) != 0)
+        goto out;
+    if (unmapped_count != 1) {
+        fprintf(stderr,
+                "observed isolation primary block unmapped_count=%u, expected 1\n",
+                unmapped_count);
+        goto out;
+    }
+    if (dispatch_test_fault(s, base) != 0)
+        goto out;
+
+    printf("POLARIS observed mapping key isolation complete: primary_block=%llu alternate_block=%llu fake_client=0x%llx fake_token=0x%llx\n",
+           (unsigned long long)block_a,
+           (unsigned long long)block_b,
+           (unsigned long long)fake_client,
+           (unsigned long long)fake_token);
+    rc = 0;
+
+out:
+    if (executor_started)
+        (void)pthread_join(executor, NULL);
+    if (session_b != 0 && block_b != 0) {
+        struct polaris_block_release_arg release_b = {
+            .session_id = session_b,
+            .token_start = token_b,
+            .token_count = count_b,
+            .flags = POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_BLOCK_RELEASE,
+                                    &release_b,
+                                    "POLARIS_BLOCK_RELEASE observed isolation alternate");
+        block_b = 0;
+    }
+    if (session_b != 0) {
+        struct polaris_session_destroy_arg destroy_b = {
+            .session_id = session_b,
+        };
+        (void)polaris_ioctl_checked(s->polaris_fd,
+                                    POLARIS_SESSION_DESTROY,
+                                    &destroy_b,
+                                    "POLARIS_SESSION_DESTROY observed isolation alternate");
+        session_b = 0;
+    }
+    if (aux_vaspace_registered) {
+        (void)unregister_aux_vaspace(aux_fd, gpu_id, fake_client, fake_token);
+        aux_vaspace_registered = false;
+    }
+    if (aux_fd >= 0)
+        close(aux_fd);
+    return rc;
+}
+
 static int probe_rm_phys(struct m2_state *s, uint64_t block_id)
 {
     struct polaris_probe_rm_phys_arg probe = {
@@ -5129,6 +5398,7 @@ int main(int argc, char **argv)
     bool daemon_rm_alloc_oom_pressure_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
+    bool observed_mapping_key_isolation_mode = false;
     bool hold_registered_worker_mode = false;
     uint64_t block_id = 0;
     struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_MAX_BLOCKS] = {0};
@@ -5239,6 +5509,10 @@ int main(int argc, char **argv)
             daemon_rm_cow_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--observed-mapping-key-isolation") == 0) {
+            observed_mapping_key_isolation_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--hold-registered-worker") == 0) {
             hold_registered_worker_mode = true;
             continue;
@@ -5286,7 +5560,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-single-worker-microbench|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-single-worker-microbench|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--observed-mapping-key-isolation|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -5334,13 +5608,15 @@ int main(int argc, char **argv)
                                                       ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
                                                       : POLARIS_DAEMON_RM_MULTI_BLOCKS)))) *
                   POLARIS_BLOCK_SIZE)
-               : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
+               : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode ||
+                   observed_mapping_key_isolation_mode)
                       ? (2 * POLARIS_MANAGED_SIZE)
                       : POLARIS_MANAGED_SIZE));
     if (setup_uvm(&s,
                   base,
                   managed_length,
-                  !dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+                  !dispatch_fault && !observed_mapping_key_isolation_mode &&
+                  !daemon_rm_multi_block_stress_mode &&
                   !daemon_rm_single_worker_microbench_mode &&
                   !daemon_rm_dynamic_fragmentation_stress_mode &&
                   !daemon_rm_near_capacity_soak_mode &&
@@ -5363,6 +5639,7 @@ int main(int argc, char **argv)
                       managed_length,
                       !logical_backed_refault && !complete_backed_refault &&
                           !deferred_complete_fault &&
+                          !observed_mapping_key_isolation_mode &&
                           !daemon_rm_multi_block_stress_mode &&
                           !daemon_rm_single_worker_microbench_mode &&
                           !daemon_rm_dynamic_fragmentation_stress_mode &&
@@ -5397,6 +5674,16 @@ int main(int argc, char **argv)
         puts("M6 Polaris registered worker hold completed.");
         rc = 0;
         goto out;
+    }
+
+    if (observed_mapping_key_isolation_mode) {
+        if (observed_mapping_key_isolation(&s,
+                                           polaris_gpu_id,
+                                           polaris_rm_client_token,
+                                           polaris_va_space_token,
+                                           base,
+                                           managed_length) != 0)
+            goto out;
     }
 
     if (daemon_rm_alloc_oom_pressure_mode) {
@@ -5710,6 +5997,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM host-pool OOM pressure passed.");
     else if (daemon_rm_alloc_oom_pressure_mode)
         puts("M6 Polaris daemon-backed RM allocation OOM pressure passed.");
+    else if (observed_mapping_key_isolation_mode)
+        puts("M6 Polaris observed mapping key isolation passed.");
     else if (hold_registered_worker_mode)
         puts("M6 Polaris registered worker hold completed.");
     else if (rm_spill_reload_roundtrip_mode)
@@ -5728,7 +6017,8 @@ int main(int argc, char **argv)
         puts("M2 Polaris unmap/refault test passed.");
     else
         puts(dispatch_fault ? "M2 Polaris fault-dispatch test passed." : "M2 static-block setup passed.");
-    if (!dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+    if (!dispatch_fault && !observed_mapping_key_isolation_mode &&
+        !daemon_rm_multi_block_stress_mode &&
         !daemon_rm_single_worker_microbench_mode &&
         !daemon_rm_dynamic_fragmentation_stress_mode &&
         !daemon_rm_near_capacity_soak_mode &&
