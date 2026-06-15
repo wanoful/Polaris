@@ -20,7 +20,7 @@ CPPFLAGS += \
 LDFLAGS += -pthread
 LDLIBS += -lcuda
 
-.PHONY: all clean module-unload-stress
+.PHONY: all clean module-unload-stress daemon-rm-soak
 
 all: m2_static_block_setup
 
@@ -29,6 +29,9 @@ m2_static_block_setup: m2_static_block_setup.c
 
 module-unload-stress: m2_static_block_setup
 	./run_module_unload_stress.sh
+
+daemon-rm-soak: m2_static_block_setup
+	./run_daemon_rm_soak.sh
 
 clean:
 	rm -f m2_static_block_setup

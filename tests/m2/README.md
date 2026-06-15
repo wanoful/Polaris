@@ -642,6 +642,47 @@ reload/refault path on the live daemon-backed RM route without static RM or fake
 test errors. It also covers the first M6 bridge latency telemetry assertion for
 real UVM bridge map calls.
 
+## Daemon-Backed RM Soak Runner
+
+For a composed pre-M7 M6 soak over the live daemon-backed RM path, run:
+
+```sh
+sudo tests/m2/run_daemon_rm_soak.sh
+```
+
+or through the Makefile:
+
+```sh
+make -C tests/m2 daemon-rm-soak
+```
+
+The runner reloads real `polaris.ko`, starts a real `polarisd` with
+`POLARISD_RM_BACKING=1`, and repeats the focused daemon-backed stress gates:
+single-block spill/reload stress, multi-block stress, dynamic fragmentation
+stress, and daemon-backed overwrite COW. It then reloads `polaris.ko` again,
+starts `polarisd` with
+`POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304`, and runs the
+near-capacity soak. Each phase checks that `uvm_errors` does not move, bridge
+map calls increase, and cleanup drains `sessions`, `blocks`, `pending_decs`,
+`static_blocks`, `block_mappings`, and `v4_va_spaces`.
+
+The default run uses `POLARIS_SOAK_ITERS=2` for the normal-budget phase and
+`POLARIS_SOAK_NEAR_CAPACITY_ITERS=1` for the budget-pressure phase. For a faster
+bring-up pass, override the counters:
+
+```sh
+sudo env POLARIS_SOAK_ITERS=1 POLARIS_SOAK_NEAR_CAPACITY_ITERS=1 \
+  tests/m2/run_daemon_rm_soak.sh
+```
+
+Expected success ends with:
+
+```text
+M6 daemon-backed RM soak passed
+```
+
+Static RM registration and fake error injection are not used by this runner.
+
 ## Daemon-Backed RM Host-Pool OOM Pressure
 
 This validates a deterministic host pinned-pool exhaustion path with the same

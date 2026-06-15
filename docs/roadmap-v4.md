@@ -1100,6 +1100,19 @@ Still to do on the Polaris side for M1/M2:
   gates, and the focused near-capacity daemon-backed RM soak covers resident-set
   budget pressure plus async UVM-hook reload/refault behavior. Longer duration
   soak and module-unload stress remain useful before M7.
+- Composed daemon-backed RM soak gate wired and verified on 2026-06-15:
+  `tests/m2/run_daemon_rm_soak.sh` reloads real `polaris.ko`, runs repeated
+  normal-budget daemon-backed single-block spill/reload, multi-block,
+  dynamic-fragmentation, and overwrite-COW gates against a real `polarisd` with
+  `POLARISD_RM_BACKING=1`, then reloads the module again and runs the
+  near-capacity budget soak with `POLARISD_GPU_BUDGET_BYTES=4194304`. Each phase
+  requires `uvm_errors` to remain stable, `uvm_bridge_map_calls` to increase,
+  and cleanup to drain `sessions`, `blocks`, `pending_decs`, `static_blocks`,
+  `block_mappings`, and `v4_va_spaces`. Static RM registration and fake error
+  injection are not used. Local validation used the Makefile target with the
+  patched NVIDIA tree at `/home/wano/workspace/open-gpu-kernel-modules` and
+  completed the default `POLARIS_SOAK_ITERS=2` plus
+  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1` run.
 
 ### M7: PyTorch / vLLM integration
 
