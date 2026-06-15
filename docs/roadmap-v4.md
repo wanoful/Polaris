@@ -765,10 +765,13 @@ Still to do on the Polaris side for M1/M2:
   block queues daemon `RELOAD` and returns handled for replay, the harness waits
   for daemon completion to publish fresh RM backing, and a second refault maps
   the daemon-owned backing before byte-integrity verification. Cleanup checks
-  `pending_decs=0`, `blocks=0`, and `static_blocks=0`. Local validation used
-  the patched NVIDIA module, real `polaris.ko`, and real daemon-backed
-  `polarisd`; daemon logs showed real `RM ALLOC` / `RM OFFLOAD` / `RM RELOAD` /
-  `RM FREE` operations with no timeout or stale-completion lines.
+  `pending_decs=0`, `blocks=0`, and `static_blocks=0`. The gate now also
+  validates M6 bridge telemetry by checking `uvm_bridge_map_calls`,
+  `uvm_bridge_map_ok`, `uvm_bridge_map_err`, `uvm_bridge_map_last_ns`, and
+  `uvm_bridge_map_avg_ns` around the same daemon-backed faults. Local
+  validation used the patched NVIDIA module, real `polaris.ko`, and real
+  daemon-backed `polarisd`; daemon logs showed real `RM ALLOC` / `RM OFFLOAD` /
+  `RM RELOAD` / `RM FREE` operations with no timeout or stale-completion lines.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -1075,6 +1078,13 @@ Still to do on the Polaris side for M1/M2:
   `try_module_get` + `synchronize_rcu` ordering; verify under stress.
 - Tracing for: faults serviced, faults rejected, spills, reloads, bridge
   call latency, policy-mirror sequence drift.
+- Bridge map latency telemetry slice wired: `polaris.ko` now times each
+  `uvm_polaris_map_external_allocation` attempt and reports
+  `uvm_bridge_map_calls`, `uvm_bridge_map_ok`, `uvm_bridge_map_err`,
+  `uvm_bridge_map_retry`, `uvm_bridge_map_last_ns`, and
+  `uvm_bridge_map_avg_ns` in `/sys/kernel/polaris/stats`. The daemon-backed
+  near-capacity soak validates these counters on the production RM-backed path
+  with static RM disabled.
 - Stress: dynamic KV growth, fragmentation pressure, OOM behavior on
   both VRAM (RM alloc fails) and host pinned pool sides. The host pinned-pool
   side and the RM allocation-failure side now have deterministic daemon-backed

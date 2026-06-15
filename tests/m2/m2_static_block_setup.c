@@ -3525,6 +3525,14 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
     uint64_t reloads_before = 0;
     uint64_t offloads_after = 0;
     uint64_t reloads_after = 0;
+    uint64_t bridge_calls_before = 0;
+    uint64_t bridge_ok_before = 0;
+    uint64_t bridge_err_before = 0;
+    uint64_t bridge_calls_after = 0;
+    uint64_t bridge_ok_after = 0;
+    uint64_t bridge_err_after = 0;
+    uint64_t bridge_avg_ns_after = 0;
+    uint64_t bridge_last_ns_after = 0;
     int rc = -1;
 
     if (block_count != POLARIS_DAEMON_RM_NEAR_CAPACITY_BLOCKS) {
@@ -3553,6 +3561,10 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
 
     if (read_sysfs_stat_u64("offloads", &offloads_before) != 0 ||
         read_sysfs_stat_u64("reloads", &reloads_before) != 0)
+        return -1;
+    if (read_sysfs_stat_u64("uvm_bridge_map_calls", &bridge_calls_before) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_ok", &bridge_ok_before) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_err", &bridge_err_before) != 0)
         return -1;
 
     if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0) {
@@ -3721,6 +3733,12 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
     if (read_sysfs_stat_u64("offloads", &offloads_after) != 0 ||
         read_sysfs_stat_u64("reloads", &reloads_after) != 0)
         goto out;
+    if (read_sysfs_stat_u64("uvm_bridge_map_calls", &bridge_calls_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_ok", &bridge_ok_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_err", &bridge_err_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_avg_ns", &bridge_avg_ns_after) != 0 ||
+        read_sysfs_stat_u64("uvm_bridge_map_last_ns", &bridge_last_ns_after) != 0)
+        goto out;
     if (offloads_after < offloads_before + 2 ||
         reloads_after < reloads_before + 1) {
         fprintf(stderr,
@@ -3731,14 +3749,34 @@ static int daemon_rm_near_capacity_soak(struct m2_state *s,
                 (unsigned long long)reloads_after);
         goto out;
     }
+    if (bridge_calls_after < bridge_calls_before + block_count ||
+        bridge_ok_after < bridge_ok_before + block_count ||
+        bridge_err_after != bridge_err_before ||
+        bridge_avg_ns_after == 0 ||
+        bridge_last_ns_after == 0) {
+        fprintf(stderr,
+                "daemon near-capacity bridge telemetry unexpected: calls %llu->%llu ok %llu->%llu err %llu->%llu avg_ns=%llu last_ns=%llu\n",
+                (unsigned long long)bridge_calls_before,
+                (unsigned long long)bridge_calls_after,
+                (unsigned long long)bridge_ok_before,
+                (unsigned long long)bridge_ok_after,
+                (unsigned long long)bridge_err_before,
+                (unsigned long long)bridge_err_after,
+                (unsigned long long)bridge_avg_ns_after,
+                (unsigned long long)bridge_last_ns_after);
+        goto out;
+    }
 
-    printf("POLARIS daemon RM near-capacity soak complete: blocks=%u budget_blocks=%u offloads=%llu->%llu reloads=%llu->%llu\n",
+    printf("POLARIS daemon RM near-capacity soak complete: blocks=%u budget_blocks=%u offloads=%llu->%llu reloads=%llu->%llu bridge_maps=%llu->%llu avg_ns=%llu\n",
            block_count,
            POLARIS_DAEMON_RM_NEAR_CAPACITY_BUDGET_BLOCKS,
            (unsigned long long)offloads_before,
            (unsigned long long)offloads_after,
            (unsigned long long)reloads_before,
-           (unsigned long long)reloads_after);
+           (unsigned long long)reloads_after,
+           (unsigned long long)bridge_calls_before,
+           (unsigned long long)bridge_calls_after,
+           (unsigned long long)bridge_avg_ns_after);
     rc = 0;
 
 out:

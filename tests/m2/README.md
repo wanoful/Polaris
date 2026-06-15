@@ -626,6 +626,10 @@ a block is `CpuOffloaded`, the first synthetic fault queues a real daemon
 become `Resident`, then dispatches a second fault to map the daemon-published RM
 backing and verifies byte integrity with `POLARIS_RM_COPY_TO_CPU`. Cleanup
 releases all blocks through daemon `FREE` and checks the decision queue drains.
+The same gate samples `/sys/kernel/polaris/stats` before and after the run and
+requires bridge map telemetry to move on the live path:
+`uvm_bridge_map_calls`, `uvm_bridge_map_ok`, `uvm_bridge_map_err`,
+`uvm_bridge_map_last_ns`, and `uvm_bridge_map_avg_ns`.
 
 Expected success ends with:
 
@@ -635,7 +639,8 @@ M6 Polaris daemon-backed RM near-capacity soak passed.
 
 Passing this gate proves the focused near-capacity resident-set cap and
 reload/refault path on the live daemon-backed RM route without static RM or fake
-test errors.
+test errors. It also covers the first M6 bridge latency telemetry assertion for
+real UVM bridge map calls.
 
 ## Daemon-Backed RM Host-Pool OOM Pressure
 

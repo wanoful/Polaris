@@ -112,6 +112,12 @@ static POLARIS_UVM_LAST_ACCESS_TYPE: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_MAP_RET: Atomic<i32> = Atomic::new(0);
 static POLARIS_UVM_LAST_ENSURE_RET: Atomic<i32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RESULT: Atomic<i32> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_CALLS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_SUCCESSES: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_ERRORS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_RETRIES: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_LAST_NS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_BRIDGE_MAP_TOTAL_NS: Atomic<u64> = Atomic::new(0);
 
 struct PolarisFastStaticBlockSlot {
     gpu_id: Atomic<u32>,
@@ -639,7 +645,11 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
     UVM_POLARIS_FAULT_NOT_MINE
 }
 
-fn polaris_map_fault_mapping(gpu_va_space_ptr: u64, mapping: &PolarisFaultMapping) -> Result<(), ()> {
+fn polaris_timed_uvm_map_external_allocation(
+    gpu_va_space_ptr: u64,
+    mapping: &PolarisFaultMapping,
+) -> c_int {
+    let start_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
     let ret = unsafe {
         uvm_polaris_map_external_allocation(
             gpu_va_space_ptr,
@@ -651,6 +661,24 @@ fn polaris_map_fault_mapping(gpu_va_space_ptr: u64, mapping: &PolarisFaultMappin
             mapping.h_memory,
         )
     };
+    let elapsed_ns = unsafe {
+        bindings::ktime_get_mono_fast_ns().saturating_sub(start_ns)
+    };
+
+    POLARIS_UVM_BRIDGE_MAP_CALLS.fetch_add(1, Relaxed);
+    POLARIS_UVM_BRIDGE_MAP_LAST_NS.store(elapsed_ns, Relaxed);
+    POLARIS_UVM_BRIDGE_MAP_TOTAL_NS.fetch_add(elapsed_ns, Relaxed);
+    if ret == 0 {
+        POLARIS_UVM_BRIDGE_MAP_SUCCESSES.fetch_add(1, Relaxed);
+    } else {
+        POLARIS_UVM_BRIDGE_MAP_ERRORS.fetch_add(1, Relaxed);
+    }
+
+    ret
+}
+
+fn polaris_map_fault_mapping(gpu_va_space_ptr: u64, mapping: &PolarisFaultMapping) -> Result<(), ()> {
+    let ret = polaris_timed_uvm_map_external_allocation(gpu_va_space_ptr, mapping);
     POLARIS_UVM_LAST_MAP_RET.store(ret, Relaxed);
     if ret == 0 {
         return Ok(());
@@ -666,17 +694,11 @@ fn polaris_map_fault_mapping(gpu_va_space_ptr: u64, mapping: &PolarisFaultMappin
         };
         POLARIS_UVM_LAST_ENSURE_RET.store(range_ret, Relaxed);
         if range_ret == 0 {
-            let retry_ret = unsafe {
-                uvm_polaris_map_external_allocation(
-                    gpu_va_space_ptr,
-                    mapping.base,
-                    mapping.length,
-                    mapping.offset,
-                    mapping.rm_control_fd,
-                    mapping.h_client,
-                    mapping.h_memory,
-                )
-            };
+            POLARIS_UVM_BRIDGE_MAP_RETRIES.fetch_add(1, Relaxed);
+            let retry_ret = polaris_timed_uvm_map_external_allocation(
+                gpu_va_space_ptr,
+                mapping,
+            );
             POLARIS_UVM_LAST_MAP_RET.store(retry_ret, Relaxed);
             if retry_ret == 0 {
                 return Ok(());
@@ -2036,6 +2058,17 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_last_map_ret = POLARIS_UVM_LAST_MAP_RET.load(Relaxed);
     let uvm_last_ensure_ret = POLARIS_UVM_LAST_ENSURE_RET.load(Relaxed);
     let uvm_last_result = POLARIS_UVM_LAST_RESULT.load(Relaxed);
+    let uvm_bridge_map_calls = POLARIS_UVM_BRIDGE_MAP_CALLS.load(Relaxed);
+    let uvm_bridge_map_successes = POLARIS_UVM_BRIDGE_MAP_SUCCESSES.load(Relaxed);
+    let uvm_bridge_map_errors = POLARIS_UVM_BRIDGE_MAP_ERRORS.load(Relaxed);
+    let uvm_bridge_map_retries = POLARIS_UVM_BRIDGE_MAP_RETRIES.load(Relaxed);
+    let uvm_bridge_map_last_ns = POLARIS_UVM_BRIDGE_MAP_LAST_NS.load(Relaxed);
+    let uvm_bridge_map_total_ns = POLARIS_UVM_BRIDGE_MAP_TOTAL_NS.load(Relaxed);
+    let uvm_bridge_map_avg_ns = if uvm_bridge_map_calls == 0 {
+        0
+    } else {
+        uvm_bridge_map_total_ns / uvm_bridge_map_calls
+    };
     drop(guard);
 
     // Write into the kernel-provided buffer (typically PAGE_SIZE = 4096).
@@ -2090,6 +2123,12 @@ uvm_last_access:{uvm_last_access}
 uvm_last_map_ret:{uvm_last_map_ret}
 uvm_last_ensure_ret:{uvm_last_ensure_ret}
 uvm_last_result:{uvm_last_result}
+uvm_bridge_map_calls:{uvm_bridge_map_calls}
+uvm_bridge_map_ok:{uvm_bridge_map_successes}
+uvm_bridge_map_err:{uvm_bridge_map_errors}
+uvm_bridge_map_retry:{uvm_bridge_map_retries}
+uvm_bridge_map_last_ns:{uvm_bridge_map_last_ns}
+uvm_bridge_map_avg_ns:{uvm_bridge_map_avg_ns}
 ",
                 sessions = sessions,
                 blocks = blocks,
@@ -2134,6 +2173,12 @@ uvm_last_result:{uvm_last_result}
                 uvm_last_map_ret = uvm_last_map_ret,
                 uvm_last_ensure_ret = uvm_last_ensure_ret,
                 uvm_last_result = uvm_last_result,
+                uvm_bridge_map_calls = uvm_bridge_map_calls,
+                uvm_bridge_map_successes = uvm_bridge_map_successes,
+                uvm_bridge_map_errors = uvm_bridge_map_errors,
+                uvm_bridge_map_retries = uvm_bridge_map_retries,
+                uvm_bridge_map_last_ns = uvm_bridge_map_last_ns,
+                uvm_bridge_map_avg_ns = uvm_bridge_map_avg_ns,
             ),
         );
         w.pos
