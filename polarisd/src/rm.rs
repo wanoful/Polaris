@@ -8,6 +8,9 @@ const NV_IOCTL_MAGIC: u8 = b'F';
 const NV_ESC_RM_ALLOC: u32 = 0x2b;
 const NV_ESC_RM_FREE: u32 = 0x29;
 
+const NV_ERR_GENERIC: u32 = 0x0000_ffff;
+const NV_STATUS_WARN_BIT: u32 = 0x0001_0000;
+
 const NV01_NULL_OBJECT: u32 = 0;
 const NV01_ROOT_CLIENT: u32 = 0x41;
 const NV01_DEVICE_0: u32 = 0x80;
@@ -17,6 +20,10 @@ const NV01_MEMORY_LOCAL_USER: u32 = 0x40;
 const NV_DEVICE_ALLOCATION_VAMODE_MULTIPLE_VASPACES: i32 = 0x2;
 const NVOS32_TYPE_IMAGE: u32 = 0;
 const NVOS32_ATTR_LOCATION_VIDMEM: u32 = 0;
+const NVOS32_ATTR_PHYSICALITY_CONTIGUOUS: u32 = 0x2;
+const NVOS32_ATTR_PHYSICALITY_SHIFT: u32 = 27;
+const NVOS32_ALLOC_FLAGS_USE_BEGIN_END: u32 = 0x0002_0000;
+const DEFAULT_PRESSURE_RANGE_BASE: u64 = 1u64 << 40;
 
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
@@ -35,7 +42,25 @@ fn nv_ioctl_cmd(esc: u32, size: usize) -> c_ulong {
 }
 
 fn nv_status_ok(status: u32) -> bool {
-    status & 0xc000_0000 != 0xc000_0000
+    status == 0 || (status != NV_ERR_GENERIC && (status & NV_STATUS_WARN_BIT) != 0)
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let lower = v.to_ascii_lowercase();
+            !(lower.is_empty() || lower == "0" || lower == "false" || lower == "no")
+        })
+        .unwrap_or(false)
+}
+
+fn env_u64(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    value.parse::<u64>().ok()
 }
 
 #[repr(C)]
@@ -140,6 +165,9 @@ pub struct RmBackend {
     pub h_client: u32,
     h_device: u32,
     h_subdevice: u32,
+    force_contiguous: bool,
+    pressure_outside_fb_range: bool,
+    pressure_range_base: u64,
     allocations: HashMap<u64, RmAllocation>,
 }
 
@@ -203,12 +231,30 @@ impl RmBackend {
             "RM_ALLOC subdevice",
         )?;
 
+        let force_contiguous = env_enabled("POLARISD_RM_FORCE_CONTIGUOUS");
+        if force_contiguous {
+            eprintln!(
+                "polarisd: RM allocations forced contiguous by POLARISD_RM_FORCE_CONTIGUOUS"
+            );
+        }
+        let pressure_outside_fb_range = env_enabled("POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE");
+        let pressure_range_base =
+            env_u64("POLARISD_RM_PRESSURE_RANGE_BASE_BYTES").unwrap_or(DEFAULT_PRESSURE_RANGE_BASE);
+        if pressure_outside_fb_range {
+            eprintln!(
+                "polarisd: RM allocations constrained outside FB by POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE base=0x{pressure_range_base:x}"
+            );
+        }
+
         Ok(Self {
             rm_control,
             _gpu: gpu,
             h_client,
             h_device,
             h_subdevice,
+            force_contiguous,
+            pressure_outside_fb_range,
+            pressure_range_base,
             allocations: HashMap::new(),
         })
     }
@@ -229,6 +275,25 @@ impl RmBackend {
             size,
             ..Default::default()
         };
+        if self.force_contiguous {
+            params.attr |= NVOS32_ATTR_PHYSICALITY_CONTIGUOUS << NVOS32_ATTR_PHYSICALITY_SHIFT;
+        }
+        if self.pressure_outside_fb_range {
+            let range_hi = self
+                .pressure_range_base
+                .checked_add(size)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or_else(|| {
+                    format!(
+                        "RM pressure range overflow base=0x{:x} size=0x{:x}",
+                        self.pressure_range_base, size
+                    )
+                })?;
+            params.flags |= NVOS32_ALLOC_FLAGS_USE_BEGIN_END;
+            params.range_lo = self.pressure_range_base;
+            params.range_hi = range_hi;
+            params.attr |= NVOS32_ATTR_PHYSICALITY_CONTIGUOUS << NVOS32_ATTR_PHYSICALITY_SHIFT;
+        }
         let mut h_memory = 0;
         rm_alloc(
             self.rm_control.as_raw_fd(),
@@ -422,6 +487,14 @@ mod tests {
         assert_eq!(offset_of!(NvMemoryAllocationParameters, address), 96);
         assert_eq!(offset_of!(NvMemoryAllocationParameters, ctag_offset), 104);
         assert_eq!(offset_of!(NvMemoryAllocationParameters, numa_node), 120);
+    }
+
+    #[test]
+    fn rm_status_helper_rejects_nv_errors() {
+        assert!(nv_status_ok(0));
+        assert!(nv_status_ok(NV_STATUS_WARN_BIT));
+        assert!(!nv_status_ok(0x51));
+        assert!(!nv_status_ok(NV_ERR_GENERIC));
     }
 
     #[test]

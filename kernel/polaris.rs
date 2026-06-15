@@ -1708,8 +1708,16 @@ fn polaris_resolve_gpu_fault(
                             polaris_clear_block_rm_backing(blk);
                             return Err(ETIMEDOUT);
                         }
+                        if wait_ret < 0 && blk.state != PolarisBlockState::Resident {
+                            return Err(EIO);
+                        }
+                        return match blk.state {
+                            PolarisBlockState::Resident => Ok(PolarisUvmFaultResult::Handled),
+                            PolarisBlockState::Evicted => Ok(PolarisUvmFaultResult::Error),
+                            _ => Ok(PolarisUvmFaultResult::Error),
+                        };
                     }
-                    return Ok(PolarisUvmFaultResult::Handled);
+                    return Ok(PolarisUvmFaultResult::Error);
                 }
             }
             found_idx
@@ -1862,8 +1870,16 @@ fn polaris_resolve_gpu_fault(
             polaris_clear_block_rm_backing(block);
             return Err(ETIMEDOUT);
         }
+        if wait_ret < 0 && block.state != PolarisBlockState::Resident {
+            return Err(EIO);
+        }
+        return match block.state {
+            PolarisBlockState::Resident => Ok(PolarisUvmFaultResult::Handled),
+            PolarisBlockState::Evicted => Ok(PolarisUvmFaultResult::Error),
+            _ => Ok(PolarisUvmFaultResult::Error),
+        };
     }
-    Ok(PolarisUvmFaultResult::Handled)
+    Ok(PolarisUvmFaultResult::Error)
 }
 
 // ─── sysfs buffer writer ────────────────────────────────────────────────────
@@ -1951,10 +1967,11 @@ unsafe extern "C" fn polaris_stats_show(
         }
     }
 
-    let (mut total_gpu, mut used_gpu, mut cpu_total, mut cpu_used, mut unhealthy_gpus) =
-        (0u64, 0u64, 0u64, 0u64, 0u32);
+    let (mut total_gpu, mut budget_gpu, mut used_gpu, mut cpu_total, mut cpu_used, mut unhealthy_gpus) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u32);
     for g in &inner.gpus {
         total_gpu += g.total_bytes;
+        budget_gpu += g.budget_bytes;
         used_gpu += g.used_bytes;
         cpu_total += g.cpu_pool_total_bytes;
         cpu_used += g.cpu_pool_used_bytes;
@@ -2025,6 +2042,7 @@ cow_breaks:     {cow_cnt}
 cow_copy_mib:   {cow_copy_mib}
 cow_saved_mib:  {saved_mib}
 gpu_total_mib:  {gpu_total_mib}
+gpu_budget_mib: {gpu_budget_mib}
 gpu_used_mib:   {gpu_used_mib}
 cpu_pool_mib:   {cpu_pool_mib}
 cpu_used_mib:   {cpu_used_mib}
@@ -2068,6 +2086,7 @@ uvm_last_result:{uvm_last_result}
                 cow_copy_mib = cow_bytes / (1024 * 1024),
                 saved_mib = memory_saved_naive / (1024 * 1024),
                 gpu_total_mib = total_gpu / (1024 * 1024),
+                gpu_budget_mib = budget_gpu / (1024 * 1024),
                 gpu_used_mib = used_gpu / (1024 * 1024),
                 cpu_pool_mib = cpu_total / (1024 * 1024),
                 cpu_used_mib = cpu_used / (1024 * 1024),

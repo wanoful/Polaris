@@ -707,9 +707,8 @@ Still to do on the Polaris side for M1/M2:
   blocks, waits for daemon `OFFLOAD`, reloads/refaults them, verifies byte
   integrity for survivor and regrown blocks, and checks `pending_decs=0` plus
   `static_blocks=0`. This covers the first dynamic-growth / fragmentation M6
-  slice on the production daemon-backed RM path; host-pool OOM pressure is now
-  covered separately, while VRAM/RM allocation failure still needs controlled
-  pressure.
+  slice on the production daemon-backed RM path; host-pool and RM allocation
+  OOM pressure are now covered separately.
 - Daemon-backed RM host-pool OOM pressure wired:
   `tests/m2/m2_static_block_setup --daemon-rm-host-pool-oom-pressure` runs
   against a real `polarisd` started with
@@ -723,8 +722,28 @@ Still to do on the Polaris side for M1/M2:
   `FREE`, with `blocks=0`, `pending_decs=0`, `static_blocks=0`, and
   `block_mappings=0`. This covers the host pinned-pool side of the M6 OOM
   requirement on the production daemon-backed RM path without static RM or a
-  fake `POLARIS_TEST_ERROR`; VRAM/RM allocation failure pressure remains
-  separate.
+  fake `POLARIS_TEST_ERROR`.
+- Daemon-backed RM allocation OOM pressure wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-alloc-oom-pressure` runs against
+  a real `polarisd` started with
+  `POLARISD_RM_BACKING=1 POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE=1
+  POLARISD_GPU_BUDGET_BYTES=68719476736`, registers a large UVM external range,
+  reserves one 32 GiB deferred logical block, and dispatches a synthetic fault
+  that queues a real daemon-backed `ALLOC`. Because the kernel GPU budget is
+  intentionally above the request, the decision reaches the daemon; because
+  the daemon constrains the real `NV01_MEMORY_LOCAL_USER` request to a physical
+  FB range outside local memory with `NVOS32_ALLOC_FLAGS_USE_BEGIN_END`, RM
+  returns real `NV_ERR_NO_MEMORY` (`0x51`) before bridge mapping instead of
+  using static RM or `POLARIS_TEST_ERROR`. `polarisd` now treats non-warning
+  `NV_STATUS` values as failures rather than using the old high-bit heuristic,
+  so the daemon completes the decision with `-ENOMEM`. The kernel retries,
+  marks the block `Evicted`, reports UVM `ERROR` rather than `HANDLED`,
+  verifies `uvm_errors` increments while `uvm_handled` does not, verifies
+  `uvm_last_map_ret` is unchanged so the bridge was not the failure source, and
+  cleans up with `blocks=0`, `pending_decs=0`, `static_blocks=0`, and
+  `block_mappings=0`. This covers the VRAM/RM allocation side of the M6 OOM
+  requirement with deterministic RM allocation pressure; broader near-capacity
+  fragmentation soak remains useful.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -1030,8 +1049,8 @@ Still to do on the Polaris side for M1/M2:
   call latency, policy-mirror sequence drift.
 - Stress: dynamic KV growth, fragmentation pressure, OOM behavior on
   both VRAM (RM alloc fails) and host pinned pool sides. The host pinned-pool
-  side now has a deterministic daemon-backed gate; VRAM/RM allocation failure
-  remains open.
+  side and the RM allocation-failure side now have deterministic daemon-backed
+  gates; broader near-capacity fragmentation soak remains useful.
 
 ### M7: PyTorch / vLLM integration
 

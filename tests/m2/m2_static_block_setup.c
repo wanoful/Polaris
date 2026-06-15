@@ -55,6 +55,14 @@
 #define POLARIS_DAEMON_RM_MULTI_ITERS 2U
 #define POLARIS_DAEMON_RM_DYNAMIC_BLOCKS 5U
 #define POLARIS_DAEMON_RM_HOST_OOM_BLOCKS 2U
+#define POLARIS_DAEMON_RM_ALLOC_OOM_BYTES (32ULL * 1024ULL * 1024ULL * 1024ULL)
+#define POLARIS_DAEMON_RM_ALLOC_OOM_BUDGET_BYTES (64ULL * 1024ULL * 1024ULL * 1024ULL)
+
+enum {
+    POLARIS_UVM_FAULT_ERROR = -1,
+    POLARIS_UVM_FAULT_NOT_MINE = 0,
+    POLARIS_UVM_FAULT_HANDLED = 1,
+};
 
 struct polaris_register_gpu_arg {
     uint32_t gpu_id;
@@ -1123,7 +1131,10 @@ static int run_rm_cpu_map_probe_isolated(int ordinal)
     return 0;
 }
 
-static int dispatch_test_fault(struct m2_state *s, uint64_t fault_address)
+static int dispatch_test_fault_expect(struct m2_state *s,
+                                      uint64_t fault_address,
+                                      int expected_status,
+                                      const char *expected_name)
 {
     struct uvm_test_polaris_dispatch_fault_params fault = {
         .gpu_uuid = s->gpu_uuid,
@@ -1145,14 +1156,27 @@ static int dispatch_test_fault(struct m2_state *s, uint64_t fault_address)
            (unsigned long long)fault.observed_rm_client_token,
            (unsigned long long)fault.observed_va_space_token,
            fault.polaris_status);
-    if (fault.polaris_status != 1) {
-        fprintf(stderr, "Polaris dispatch result=%d, expected HANDLED(1)\n", fault.polaris_status);
+    if (fault.polaris_status != expected_status) {
+        fprintf(stderr,
+                "Polaris dispatch result=%d, expected %s(%d)\n",
+                fault.polaris_status,
+                expected_name,
+                expected_status);
         return -1;
     }
 
-    printf("Polaris synthetic fault dispatch handled address=0x%llx\n",
+    printf("Polaris synthetic fault dispatch returned %s for address=0x%llx\n",
+           expected_name,
            (unsigned long long)fault_address);
     return 0;
+}
+
+static int dispatch_test_fault(struct m2_state *s, uint64_t fault_address)
+{
+    return dispatch_test_fault_expect(s,
+                                      fault_address,
+                                      POLARIS_UVM_FAULT_HANDLED,
+                                      "HANDLED");
 }
 
 static int unmap_static_block(struct m2_state *s,
@@ -1530,6 +1554,108 @@ static int reserve_deferred_daemon_block(struct m2_state *s,
            (unsigned long long)block->block_id,
            block->token_start,
            (unsigned long long)block->vaddr);
+    return 0;
+}
+
+static int setup_oversized_deferred_daemon_block(struct m2_state *s,
+                                                 uint32_t gpu_id,
+                                                 uint64_t rm_client_token,
+                                                 uint64_t va_space_token,
+                                                 uint64_t base,
+                                                 uint64_t managed_length,
+                                                 uint64_t oversized_bytes,
+                                                 struct daemon_rm_stress_block *block,
+                                                 uint64_t *session_id_out)
+{
+    struct polaris_register_va_range_arg range = {
+        .gpu_id = gpu_id,
+        .base = base,
+        .length = managed_length,
+        .block_size = POLARIS_BLOCK_SIZE,
+    };
+    struct polaris_session_create_arg session = {
+        .home_gpu = gpu_id,
+        .beam_width = 1,
+        .gpu_vas_bytes = managed_length,
+        .bytes_per_token = oversized_bytes,
+        .priority = 5,
+    };
+    struct polaris_block_reserve_arg reserve = {
+        .token_start = 0,
+        .token_count = 1,
+        .phase = 2,
+        .flags = POLARIS_RESERVE_FLAG_DEFER_FAULT,
+    };
+
+    if (block == NULL || session_id_out == NULL ||
+        managed_length < POLARIS_BLOCK_SIZE ||
+        oversized_bytes <= POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "invalid oversized daemon block setup managed_length=0x%llx oversized=0x%llx\n",
+                (unsigned long long)managed_length,
+                (unsigned long long)oversized_bytes);
+        return -1;
+    }
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_VA_RANGE,
+                              &range,
+                              "POLARIS_REGISTER_VA_RANGE daemon oversized") != 0)
+        return -1;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_SESSION_CREATE,
+                              &session,
+                              "POLARIS_SESSION_CREATE daemon oversized") != 0)
+        return -1;
+
+    s->polaris_session_id = session.session_id;
+    *session_id_out = session.session_id;
+    reserve.session_id = session.session_id;
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RESERVE,
+                              &reserve,
+                              "POLARIS_BLOCK_RESERVE daemon oversized deferred") != 0)
+        return -1;
+    if (reserve.block_id == 0 || reserve.gpu_vaddr != base) {
+        fprintf(stderr,
+                "daemon oversized reserve block=%llu vaddr=0x%llx expected_vaddr=0x%llx\n",
+                (unsigned long long)reserve.block_id,
+                (unsigned long long)reserve.gpu_vaddr,
+                (unsigned long long)base);
+        return -1;
+    }
+
+    struct polaris_register_block_mapping_arg mapping = {
+        .block_id = reserve.block_id,
+        .gpu_id = gpu_id,
+        .rm_client_token = rm_client_token,
+        .va_space_token = va_space_token,
+        .base = reserve.gpu_vaddr,
+        .length = oversized_bytes,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_BLOCK_MAPPING,
+                              &mapping,
+                              "POLARIS_REGISTER_BLOCK_MAPPING daemon oversized") != 0)
+        return -1;
+
+    block->block_id = reserve.block_id;
+    block->token_start = reserve.token_start;
+    block->token_count = reserve.token_count;
+    block->vaddr = reserve.gpu_vaddr;
+    s->polaris_block_token_start = reserve.token_start;
+    s->polaris_block_token_count = reserve.token_count;
+    s->polaris_block_reserved = true;
+    s->polaris_block_caller_owns_backing = false;
+
+    printf("POLARIS registered oversized daemon block: block=%llu token=%u vaddr=0x%llx logical_size=0x%llx mapped_len=0x%llx\n",
+           (unsigned long long)block->block_id,
+           block->token_start,
+           (unsigned long long)block->vaddr,
+           (unsigned long long)oversized_bytes,
+           (unsigned long long)oversized_bytes);
     return 0;
 }
 
@@ -3500,6 +3626,126 @@ out:
     return rc;
 }
 
+static int daemon_rm_alloc_oom_pressure(struct m2_state *s,
+                                        uint64_t session_id,
+                                        const struct daemon_rm_stress_block *block,
+                                        uint64_t oversized_bytes)
+{
+    struct polaris_block_get_state_arg state = {0};
+    uint64_t hooks_before = 0;
+    uint64_t handled_before = 0;
+    uint64_t errors_before = 0;
+    uint64_t hooks_after = 0;
+    uint64_t handled_after = 0;
+    uint64_t errors_after = 0;
+    uint64_t map_ret_before = 0;
+    uint64_t map_ret_after = 0;
+    uint64_t budget_mib = 0;
+
+    if (block == NULL || block->block_id == 0 || oversized_bytes <= POLARIS_BLOCK_SIZE) {
+        fprintf(stderr, "daemon RM allocation OOM pressure received invalid block\n");
+        return -1;
+    }
+
+    if (read_sysfs_stat_u64("gpu_budget_mib", &budget_mib) != 0)
+        return -1;
+    if (budget_mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+        fprintf(stderr, "gpu_budget_mib=%llu is too large to convert to bytes\n",
+                (unsigned long long)budget_mib);
+        return -1;
+    }
+    uint64_t budget_bytes = budget_mib * 1024ULL * 1024ULL;
+    if (budget_bytes <= oversized_bytes) {
+        fprintf(stderr,
+                "daemon RM allocation OOM requires kernel GPU budget > 0x%llx; current aggregate gpu_budget_mib=%llu. Start polarisd with POLARISD_GPU_BUDGET_BYTES=0x%llx and POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE=1.\n",
+                (unsigned long long)oversized_bytes,
+                (unsigned long long)budget_mib,
+                (unsigned long long)POLARIS_DAEMON_RM_ALLOC_OOM_BUDGET_BYTES);
+        return -1;
+    }
+
+    if (read_sysfs_stat_u64("uvm_hook_calls", &hooks_before) != 0 ||
+        read_sysfs_stat_u64("uvm_handled", &handled_before) != 0 ||
+        read_sysfs_stat_u64("uvm_errors", &errors_before) != 0 ||
+        read_sysfs_stat_u64("uvm_last_map_ret", &map_ret_before) != 0)
+        return -1;
+
+    if (dispatch_test_fault_expect(s,
+                                   block->vaddr,
+                                   POLARIS_UVM_FAULT_ERROR,
+                                   "ERROR") != 0)
+        return -1;
+
+    if (wait_for_block_state(s,
+                             session_id,
+                             block->token_start,
+                             block->token_count,
+                             POLARIS_BLOCK_STATE_EVICTED,
+                             "daemon RM allocation OOM eviction",
+                             &state) != 0)
+        return -1;
+    if (state.block_id != block->block_id) {
+        fprintf(stderr,
+                "daemon RM allocation OOM evicted block=%llu expected=%llu\n",
+                (unsigned long long)state.block_id,
+                (unsigned long long)block->block_id);
+        return -1;
+    }
+
+    if (wait_for_sysfs_stat_u64("pending_decs",
+                                0,
+                                "daemon RM allocation OOM decision drain") != 0)
+        return -1;
+    if (wait_for_sysfs_stat_u64("static_blocks",
+                                0,
+                                "daemon RM allocation OOM static-block guard") != 0)
+        return -1;
+
+    if (read_sysfs_stat_u64("uvm_hook_calls", &hooks_after) != 0 ||
+        read_sysfs_stat_u64("uvm_handled", &handled_after) != 0 ||
+        read_sysfs_stat_u64("uvm_errors", &errors_after) != 0 ||
+        read_sysfs_stat_u64("uvm_last_map_ret", &map_ret_after) != 0)
+        return -1;
+    if (hooks_after <= hooks_before) {
+        fprintf(stderr,
+                "daemon RM allocation OOM hook counter did not increase: before=%llu after=%llu\n",
+                (unsigned long long)hooks_before,
+                (unsigned long long)hooks_after);
+        return -1;
+    }
+    if (errors_after != errors_before + 1) {
+        fprintf(stderr,
+                "daemon RM allocation OOM uvm_errors before=%llu after=%llu expected_after=%llu\n",
+                (unsigned long long)errors_before,
+                (unsigned long long)errors_after,
+                (unsigned long long)(errors_before + 1));
+        return -1;
+    }
+    if (handled_after != handled_before) {
+        fprintf(stderr,
+                "daemon RM allocation OOM uvm_handled before=%llu after=%llu expected unchanged\n",
+                (unsigned long long)handled_before,
+                (unsigned long long)handled_after);
+        return -1;
+    }
+    if (map_ret_after != map_ret_before) {
+        fprintf(stderr,
+                "daemon RM allocation OOM reached UVM bridge unexpectedly: uvm_last_map_ret before=%llu after=%llu. Expected daemon RM allocation failure before bridge mapping.\n",
+                (unsigned long long)map_ret_before,
+                (unsigned long long)map_ret_after);
+        return -1;
+    }
+
+    printf("POLARIS daemon RM allocation OOM pressure complete: block=%llu logical_size=0x%llx hooks=%llu->%llu errors=%llu->%llu\n",
+           (unsigned long long)block->block_id,
+           (unsigned long long)oversized_bytes,
+           (unsigned long long)hooks_before,
+           (unsigned long long)hooks_after,
+           (unsigned long long)errors_before,
+           (unsigned long long)errors_after);
+    return 0;
+}
+
 static int rm_cow_roundtrip(struct m2_state *s,
                             uint32_t gpu_id,
                             uint64_t rm_client_token,
@@ -3830,16 +4076,19 @@ static int setup_polaris(struct m2_state *s,
             gpu = attach_gpu;
         } else if (errno == ENOENT) {
             uint64_t total_mib = 0;
+            uint64_t budget_mib = 0;
             uint64_t cpu_pool_mib = 0;
 
             if (read_sysfs_stat_u64("gpu_total_mib", &total_mib) != 0 ||
+                read_sysfs_stat_u64("gpu_budget_mib", &budget_mib) != 0 ||
                 read_sysfs_stat_u64("cpu_pool_mib", &cpu_pool_mib) != 0 ||
-                total_mib == 0) {
+                total_mib == 0 ||
+                budget_mib == 0) {
                 fprintf(stderr, "failed to mirror daemon GPU accounting for gpu_id=%u\n", gpu_id);
                 return -1;
             }
             gpu.total_bytes = total_mib * 1024ULL * 1024ULL;
-            gpu.budget_bytes = gpu.total_bytes;
+            gpu.budget_bytes = budget_mib * 1024ULL * 1024ULL;
             gpu.cpu_pool_bytes = cpu_pool_mib * 1024ULL * 1024ULL;
             gpu._reserved = POLARIS_REGISTER_GPU_FLAG_TRANSIENT;
             if (polaris_ioctl_checked(s->polaris_fd,
@@ -4010,10 +4259,13 @@ int main(int argc, char **argv)
     bool daemon_rm_multi_block_stress_mode = false;
     bool daemon_rm_dynamic_fragmentation_stress_mode = false;
     bool daemon_rm_host_pool_oom_pressure_mode = false;
+    bool daemon_rm_alloc_oom_pressure_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
     struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
+    struct daemon_rm_stress_block daemon_oversized_block = {0};
+    bool daemon_oversized_block_setup = false;
     bool daemon_multi_blocks_setup = false;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -4100,6 +4352,10 @@ int main(int argc, char **argv)
             daemon_rm_host_pool_oom_pressure_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-alloc-oom-pressure") == 0) {
+            daemon_rm_alloc_oom_pressure_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--daemon-rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             deferred_complete_fault = true;
@@ -4149,7 +4405,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-host-pool-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -4174,25 +4430,29 @@ int main(int argc, char **argv)
                      !daemon_rm_multi_block_stress_mode &&
                      !daemon_rm_dynamic_fragmentation_stress_mode &&
                      !daemon_rm_host_pool_oom_pressure_mode &&
+                     !daemon_rm_alloc_oom_pressure_mode &&
                      !daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
-    uint64_t managed_length = (daemon_rm_multi_block_stress_mode ||
-                               daemon_rm_dynamic_fragmentation_stress_mode ||
-                               daemon_rm_host_pool_oom_pressure_mode)
-        ? ((uint64_t)(daemon_rm_dynamic_fragmentation_stress_mode
-                          ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
-                          : (daemon_rm_host_pool_oom_pressure_mode
-                                 ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
-                                 : POLARIS_DAEMON_RM_MULTI_BLOCKS)) * POLARIS_BLOCK_SIZE)
-        : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
-               ? (2 * POLARIS_MANAGED_SIZE)
-               : POLARIS_MANAGED_SIZE);
+    uint64_t managed_length = daemon_rm_alloc_oom_pressure_mode
+        ? POLARIS_DAEMON_RM_ALLOC_OOM_BYTES
+        : ((daemon_rm_multi_block_stress_mode ||
+            daemon_rm_dynamic_fragmentation_stress_mode ||
+            daemon_rm_host_pool_oom_pressure_mode)
+               ? ((uint64_t)(daemon_rm_dynamic_fragmentation_stress_mode
+                                 ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
+                                 : (daemon_rm_host_pool_oom_pressure_mode
+                                        ? POLARIS_DAEMON_RM_HOST_OOM_BLOCKS
+                                        : POLARIS_DAEMON_RM_MULTI_BLOCKS)) * POLARIS_BLOCK_SIZE)
+               : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
+                      ? (2 * POLARIS_MANAGED_SIZE)
+                      : POLARIS_MANAGED_SIZE));
     if (setup_uvm(&s,
                   base,
                   managed_length,
                   !dispatch_fault && !daemon_rm_multi_block_stress_mode &&
                       !daemon_rm_dynamic_fragmentation_stress_mode &&
-                      !daemon_rm_host_pool_oom_pressure_mode) != 0)
+                      !daemon_rm_host_pool_oom_pressure_mode &&
+                      !daemon_rm_alloc_oom_pressure_mode) != 0)
         goto out;
     polaris_va_space_token = s.h_vaspace;
     if (probe_uvm_dispatch_key(&s,
@@ -4211,14 +4471,41 @@ int main(int argc, char **argv)
                           !deferred_complete_fault &&
                           !daemon_rm_multi_block_stress_mode &&
                           !daemon_rm_dynamic_fragmentation_stress_mode &&
-                          !daemon_rm_host_pool_oom_pressure_mode,
+                          !daemon_rm_host_pool_oom_pressure_mode &&
+                          !daemon_rm_alloc_oom_pressure_mode,
                       daemon_rm_spill_reload_roundtrip_mode ||
                           daemon_rm_spill_reload_stress_mode ||
                           daemon_rm_multi_block_stress_mode ||
                           daemon_rm_dynamic_fragmentation_stress_mode ||
                           daemon_rm_host_pool_oom_pressure_mode ||
+                          daemon_rm_alloc_oom_pressure_mode ||
                           daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
+
+    if (daemon_rm_alloc_oom_pressure_mode) {
+        if (setup_oversized_deferred_daemon_block(&s,
+                                                  polaris_gpu_id,
+                                                  polaris_rm_client_token,
+                                                  polaris_va_space_token,
+                                                  base,
+                                                  managed_length,
+                                                  POLARIS_DAEMON_RM_ALLOC_OOM_BYTES,
+                                                  &daemon_oversized_block,
+                                                  &s.polaris_session_id) != 0)
+            goto out;
+        daemon_oversized_block_setup = true;
+        if (daemon_rm_alloc_oom_pressure(&s,
+                                         s.polaris_session_id,
+                                         &daemon_oversized_block,
+                                         POLARIS_DAEMON_RM_ALLOC_OOM_BYTES) != 0)
+            goto out;
+        cleanup_multi_deferred_blocks(&s,
+                                      &daemon_oversized_block,
+                                      1);
+        s.polaris_block_reserved = false;
+        daemon_oversized_block.block_id = 0;
+        daemon_oversized_block_setup = false;
+    }
     if (daemon_rm_multi_block_stress_mode ||
         daemon_rm_dynamic_fragmentation_stress_mode ||
         daemon_rm_host_pool_oom_pressure_mode) {
@@ -4467,6 +4754,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM dynamic fragmentation stress passed.");
     else if (daemon_rm_host_pool_oom_pressure_mode)
         puts("M6 Polaris daemon-backed RM host-pool OOM pressure passed.");
+    else if (daemon_rm_alloc_oom_pressure_mode)
+        puts("M6 Polaris daemon-backed RM allocation OOM pressure passed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)
@@ -4485,11 +4774,20 @@ int main(int argc, char **argv)
         puts(dispatch_fault ? "M2 Polaris fault-dispatch test passed." : "M2 static-block setup passed.");
     if (!dispatch_fault && !daemon_rm_multi_block_stress_mode &&
         !daemon_rm_dynamic_fragmentation_stress_mode &&
-        !daemon_rm_host_pool_oom_pressure_mode)
+        !daemon_rm_host_pool_oom_pressure_mode &&
+        !daemon_rm_alloc_oom_pressure_mode)
         puts("Next step: add an RM GPFIFO channel bound to this VA-space and submit a write to the unmapped block.");
     rc = 0;
 
 out:
+    if (daemon_oversized_block_setup) {
+        cleanup_multi_deferred_blocks(&s,
+                                      &daemon_oversized_block,
+                                      1);
+        s.polaris_block_reserved = false;
+        daemon_oversized_block.block_id = 0;
+        daemon_oversized_block_setup = false;
+    }
     if (daemon_multi_blocks_setup) {
         cleanup_multi_deferred_blocks(&s,
                                       daemon_multi_blocks,

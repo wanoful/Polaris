@@ -597,8 +597,8 @@ M6 Polaris daemon-backed RM dynamic fragmentation stress passed.
 ```
 
 This covers the first dynamic-growth / fragmentation slice for the production
-daemon-backed RM path. Host-pool OOM pressure lives in the next daemon-backed
-gate; VRAM/RM allocation pressure remains separate M6 work.
+daemon-backed RM path. The host-pool and RM allocation OOM sides live in the
+next daemon-backed gates.
 
 ## Daemon-Backed RM Host-Pool OOM Pressure
 
@@ -628,9 +628,42 @@ M6 Polaris daemon-backed RM host-pool OOM pressure passed.
 ```
 
 Passing this gate proves the host-pool OOM path on the live daemon-backed RM
-route without falling back to static RM or a fake test error. It does not cover
-VRAM/RM allocation failure pressure, which still needs a separate controlled
-budget or fault-injection mechanism.
+route without falling back to static RM or a fake test error.
+
+## Daemon-Backed RM Allocation OOM Pressure
+
+This validates the VRAM/RM allocation failure side of M6 on the same production
+daemon-backed path. Start `polarisd` with daemon-owned RM backing and a kernel
+GPU budget above the oversized logical block request:
+
+```sh
+POLARISD_RM_BACKING=1 POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE=1 POLARISD_GPU_BUDGET_BYTES=68719476736 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-alloc-oom-pressure
+```
+
+The mode registers a UVM external range matching one 32 GiB deferred logical
+block. The daemon is started with a 64 GiB kernel GPU budget so the request
+reaches `polarisd`, and with `POLARISD_RM_PRESSURE_OUTSIDE_FB_RANGE=1` so the
+real RM `NV01_MEMORY_LOCAL_USER` request is constrained to a physical FB range
+outside local memory using `NVOS32_ALLOC_FLAGS_USE_BEGIN_END`. On the local
+16 GiB RTX 5070 Ti this makes RM return real `NV_ERR_NO_MEMORY` (`0x51`) before
+any UVM bridge map is attempted. `polarisd` treats non-warning `NV_STATUS`
+values as failures and completes the `ALLOC` with `-ENOMEM`; the kernel retries,
+marks the block `Evicted` after the bounded retry limit, and reports UVM
+`ERROR` for the fault instead of `HANDLED`.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM allocation OOM pressure passed.
+```
+
+Passing this gate proves the RM allocation OOM path on the live daemon-backed
+RM route without static RM or `POLARIS_TEST_ERROR`. The pressure is a
+deterministic out-of-FB physical range constraint on the daemon's real RM
+allocation; the harness also checks that `uvm_last_map_ret` is unchanged so a
+bridge mapping failure cannot satisfy the gate. Near-capacity fragmentation
+pressure can still be added as a broader soak test.
 
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete
