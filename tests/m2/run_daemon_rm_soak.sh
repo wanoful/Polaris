@@ -266,6 +266,7 @@ for iter in $(seq 1 "$POLARIS_SOAK_ITERS"); do
     run_gate "multi-block stress iter $iter" --daemon-rm-multi-block-stress
     run_gate "dynamic fragmentation stress iter $iter" --daemon-rm-dynamic-fragmentation-stress
     run_gate "overwrite COW roundtrip iter $iter" --daemon-rm-cow-roundtrip
+    run_gate "observed mapping key isolation iter $iter" --daemon-rm-observed-mapping-key-isolation
 done
 stop_polarisd
 assert_no_gpu_accounting "normal-budget"

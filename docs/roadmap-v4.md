@@ -783,6 +783,16 @@ Still to do on the Polaris side for M1/M2:
   bytes, and waits for daemon `FREE` cleanup to drain. This removes the remaining
   harness-executor dependency from the RM-backed overwrite COW gate; permission-
   based write-fault COW and broader stress remain M4/M6 work.
+- Focused daemon-backed observed mapping key isolation wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-observed-mapping-key-isolation`
+  requires a real `polarisd` with `POLARISD_RM_BACKING=1`, reserves the primary
+  logical block with `DEFER_FAULT`, lets daemon `ALLOC` publish the RM backing,
+  registers an alternate same-address mapping under a different
+  `(rm_client_token, va_space_token)` key, and verifies only the truly faulted
+  key records an observed UVM `gpu_va_space_ptr`. The alternate block unmap
+  returns `unmapped_count=0`, the primary returns `unmapped_count=1`, the primary
+  refault maps daemon-owned RM backing again, and cleanup drains daemon `FREE`
+  with `static_blocks=0`.
 - Kernel state-machine coverage added: `libpolaris` has ignored root-only
   `kernel_spill_state` tests that drive legacy
   `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through
@@ -1160,8 +1170,9 @@ Still to do on the Polaris side for M1/M2:
 - Composed daemon-backed RM soak gate wired and verified on 2026-06-15:
   `tests/m2/run_daemon_rm_soak.sh` reloads real `polaris.ko`, runs repeated
   normal-budget daemon-backed single-block spill/reload, multi-block,
-  dynamic-fragmentation, and overwrite-COW gates against a real `polarisd` with
-  `POLARISD_RM_BACKING=1`, then reloads the module for the CUDA-kernel
+  dynamic-fragmentation, overwrite-COW, and observed mapping key isolation gates
+  against a real `polarisd` with `POLARISD_RM_BACKING=1`, then reloads the module
+  for the CUDA-kernel
   single-worker microbench and near-capacity budget soak with
   `POLARISD_GPU_BUDGET_BYTES=4194304`. Each phase
   requires `uvm_errors` to remain stable, `uvm_bridge_map_calls` to increase,
@@ -1174,7 +1185,10 @@ Still to do on the Polaris side for M1/M2:
   `POLARIS_SOAK_MICROBENCH_ITERS=1`, and
   `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1`; the earlier pre-microbench default run
   completed `POLARIS_SOAK_ITERS=2` plus
-  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1`.
+  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=1`. The observed mapping key isolation gate
+  was later added to the normal-budget loop and validated in a reduced live run
+  with `POLARIS_SOAK_ITERS=1`, `POLARIS_SOAK_MICROBENCH_ITERS=0`, and
+  `POLARIS_SOAK_NEAR_CAPACITY_ITERS=0`.
 
 ### M7: PyTorch / vLLM integration
 

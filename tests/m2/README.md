@@ -690,11 +690,12 @@ make -C tests/m2 daemon-rm-soak
 The runner reloads real `polaris.ko`, starts a real `polarisd` with
 `POLARISD_RM_BACKING=1`, and repeats the focused daemon-backed stress gates:
 single-block spill/reload stress, multi-block stress, dynamic fragmentation
-stress, and daemon-backed overwrite COW. It then reloads `polaris.ko` for the
-single-worker microbenchmark and the near-capacity soak, starting `polarisd`
-with `POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304` for each
-budget-pressure phase. Each phase checks that `uvm_errors` does not move, bridge
-map calls increase, and cleanup drains `sessions`, `blocks`, `pending_decs`,
+stress, daemon-backed overwrite COW, and daemon-backed observed mapping key
+isolation. It then reloads `polaris.ko` for the single-worker microbenchmark
+and the near-capacity soak, starting `polarisd` with `POLARISD_RM_BACKING=1
+POLARISD_GPU_BUDGET_BYTES=4194304` for each budget-pressure phase. Each phase
+checks that `uvm_errors` does not move, bridge map calls increase, rejected fault
+counters move, and cleanup drains `sessions`, `blocks`, `pending_decs`,
 `static_blocks`, `block_mappings`, and `v4_va_spaces`.
 
 The daemon-backed synthetic fault gates are DEFERRED-aware: first faults that

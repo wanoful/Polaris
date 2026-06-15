@@ -2266,7 +2266,8 @@ static int observed_mapping_key_isolation(struct m2_state *s,
                                           uint64_t rm_client_token,
                                           uint64_t va_space_token,
                                           uint64_t base,
-                                          uint64_t managed_length)
+                                          uint64_t managed_length,
+                                          bool use_daemon_executor)
 {
     pthread_t executor = 0;
     bool executor_started = false;
@@ -2321,11 +2322,13 @@ static int observed_mapping_key_isolation(struct m2_state *s,
         goto out;
     aux_vaspace_registered = true;
 
-    if (pthread_create(&executor, NULL, complete_backing_executor, &exec_args) != 0) {
-        fprintf(stderr, "pthread_create observed isolation executor failed\n");
-        goto out;
+    if (!use_daemon_executor) {
+        if (pthread_create(&executor, NULL, complete_backing_executor, &exec_args) != 0) {
+            fprintf(stderr, "pthread_create observed isolation executor failed\n");
+            goto out;
+        }
+        executor_started = true;
     }
-    executor_started = true;
 
     if (register_logical_block_mapping(s,
                                        gpu_id,
@@ -2334,23 +2337,35 @@ static int observed_mapping_key_isolation(struct m2_state *s,
                                        base,
                                        managed_length,
                                        POLARIS_BLOCK_SIZE,
-                                       false,
+                                       use_daemon_executor,
                                        &block_a) != 0)
         goto out;
+    if (use_daemon_executor)
+        s->polaris_block_caller_owns_backing = false;
 
-    if (pthread_join(executor, NULL) != 0) {
-        fprintf(stderr, "pthread_join observed isolation executor failed\n");
+    if (use_daemon_executor) {
+        if (dispatch_test_fault_materialize_resident(s,
+                                                     base,
+                                                     s->polaris_session_id,
+                                                     s->polaris_block_token_start,
+                                                     s->polaris_block_token_count,
+                                                     "daemon observed isolation ALLOC") != 0)
+            goto out;
+    } else {
+        if (pthread_join(executor, NULL) != 0) {
+            fprintf(stderr, "pthread_join observed isolation executor failed\n");
+            executor_started = false;
+            goto out;
+        }
         executor_started = false;
-        goto out;
-    }
-    executor_started = false;
-    if (exec_args.result != 0 || exec_args.completed_block_id != block_a) {
-        fprintf(stderr,
-                "observed isolation executor result=%d completed_block=%llu expected_block=%llu\n",
-                exec_args.result,
-                (unsigned long long)exec_args.completed_block_id,
-                (unsigned long long)block_a);
-        goto out;
+        if (exec_args.result != 0 || exec_args.completed_block_id != block_a) {
+            fprintf(stderr,
+                    "observed isolation executor result=%d completed_block=%llu expected_block=%llu\n",
+                    exec_args.result,
+                    (unsigned long long)exec_args.completed_block_id,
+                    (unsigned long long)block_a);
+            goto out;
+        }
     }
 
     if (register_same_va_unobserved_block(s,
@@ -2396,11 +2411,12 @@ static int observed_mapping_key_isolation(struct m2_state *s,
     if (dispatch_test_fault(s, base) != 0)
         goto out;
 
-    printf("POLARIS observed mapping key isolation complete: primary_block=%llu alternate_block=%llu fake_client=0x%llx fake_token=0x%llx\n",
+    printf("POLARIS observed mapping key isolation complete: primary_block=%llu alternate_block=%llu fake_client=0x%llx fake_token=0x%llx executor=%s\n",
            (unsigned long long)block_a,
            (unsigned long long)block_b,
            (unsigned long long)fake_client,
-           (unsigned long long)fake_token);
+           (unsigned long long)fake_token,
+           use_daemon_executor ? "daemon-rm" : "harness");
     rc = 0;
 
 out:
@@ -5399,6 +5415,7 @@ int main(int argc, char **argv)
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
     bool observed_mapping_key_isolation_mode = false;
+    bool daemon_rm_observed_mapping_key_isolation_mode = false;
     bool hold_registered_worker_mode = false;
     uint64_t block_id = 0;
     struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_MAX_BLOCKS] = {0};
@@ -5513,6 +5530,11 @@ int main(int argc, char **argv)
             observed_mapping_key_isolation_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-observed-mapping-key-isolation") == 0) {
+            observed_mapping_key_isolation_mode = true;
+            daemon_rm_observed_mapping_key_isolation_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--hold-registered-worker") == 0) {
             hold_registered_worker_mode = true;
             continue;
@@ -5560,7 +5582,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-single-worker-microbench|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--observed-mapping-key-isolation|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-single-worker-microbench|--daemon-rm-dynamic-fragmentation-stress|--daemon-rm-near-capacity-soak|--daemon-rm-host-pool-oom-pressure|--daemon-rm-alloc-oom-pressure|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--observed-mapping-key-isolation|--daemon-rm-observed-mapping-key-isolation|--hold-registered-worker|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -5589,6 +5611,7 @@ int main(int argc, char **argv)
                      !daemon_rm_host_pool_oom_pressure_mode &&
                      !daemon_rm_alloc_oom_pressure_mode &&
                      !daemon_rm_cow_roundtrip_mode &&
+                     !daemon_rm_observed_mapping_key_isolation_mode &&
                      !hold_registered_worker_mode) != 0)
         goto out;
     uint64_t managed_length = daemon_rm_alloc_oom_pressure_mode
@@ -5655,7 +5678,8 @@ int main(int argc, char **argv)
                           daemon_rm_near_capacity_soak_mode ||
                           daemon_rm_host_pool_oom_pressure_mode ||
                           daemon_rm_alloc_oom_pressure_mode ||
-                          daemon_rm_cow_roundtrip_mode) != 0)
+                          daemon_rm_cow_roundtrip_mode ||
+                          daemon_rm_observed_mapping_key_isolation_mode) != 0)
         goto out;
 
     if (hold_registered_worker_mode) {
@@ -5682,7 +5706,8 @@ int main(int argc, char **argv)
                                            polaris_rm_client_token,
                                            polaris_va_space_token,
                                            base,
-                                           managed_length) != 0)
+                                           managed_length,
+                                           daemon_rm_observed_mapping_key_isolation_mode) != 0)
             goto out;
     }
 
@@ -5997,6 +6022,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM host-pool OOM pressure passed.");
     else if (daemon_rm_alloc_oom_pressure_mode)
         puts("M6 Polaris daemon-backed RM allocation OOM pressure passed.");
+    else if (daemon_rm_observed_mapping_key_isolation_mode)
+        puts("M6 Polaris daemon-backed RM observed mapping key isolation passed.");
     else if (observed_mapping_key_isolation_mode)
         puts("M6 Polaris observed mapping key isolation passed.");
     else if (hold_registered_worker_mode)
