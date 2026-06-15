@@ -50,6 +50,7 @@
 #define POLARIS_IOCTL_MAGIC 0x50
 #define POLARIS_BLOCK_SIZE (2ULL * 1024ULL * 1024ULL)
 #define POLARIS_MANAGED_SIZE (4ULL * 1024ULL * 1024ULL)
+#define POLARIS_DAEMON_RM_STRESS_ITERS 4U
 
 struct polaris_register_gpu_arg {
     uint32_t gpu_id;
@@ -2461,6 +2462,182 @@ out:
     return rc;
 }
 
+static int daemon_rm_spill_reload_stress(struct m2_state *s,
+                                         uint64_t session_id,
+                                         uint32_t token_start,
+                                         uint32_t token_count,
+                                         uint64_t block_id,
+                                         uint64_t fault_vaddr,
+                                         uint32_t iterations)
+{
+    uint8_t *src = NULL;
+    uint8_t *dst = NULL;
+    const uint64_t seed = 0x535452455353524dULL;
+    int rc = -1;
+
+    if (iterations == 0)
+        iterations = POLARIS_DAEMON_RM_STRESS_ITERS;
+
+    if (wait_for_block_state(s,
+                             session_id,
+                             token_start,
+                             token_count,
+                             POLARIS_BLOCK_STATE_RESIDENT,
+                             "daemon RM stress initial ALLOC",
+                             NULL) != 0)
+        goto out;
+
+    if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon stress src failed\n");
+        goto out;
+    }
+    if (posix_memalign((void **)&dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon stress dst failed\n");
+        goto out;
+    }
+
+    for (uint32_t iter = 0; iter < iterations; ++iter) {
+        uint64_t iter_seed = seed ^ ((uint64_t)(iter + 1) * 0x9e3779b97f4a7c15ULL);
+
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            src[i] = rm_copy_roundtrip_pattern(iter_seed, i);
+            dst[i] = 0;
+        }
+
+        struct polaris_rm_copy_arg write_initial = {
+            .block_id = block_id,
+            .length = POLARIS_BLOCK_SIZE,
+            .user_cpu_addr = (uint64_t)(uintptr_t)src,
+            .direction = POLARIS_RM_COPY_FROM_CPU,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_RM_COPY,
+                                  &write_initial,
+                                  "POLARIS_RM_COPY daemon stress FROM_CPU") != 0)
+            goto out;
+        if (write_initial.bytes_copied != POLARIS_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "daemon stress write bytes=0x%llx expected=0x%llx iter=%u\n",
+                    (unsigned long long)write_initial.bytes_copied,
+                    (unsigned long long)POLARIS_BLOCK_SIZE,
+                    iter);
+            goto out;
+        }
+
+        struct polaris_spill_block_arg spill = {
+            .block_id = block_id,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_SPILL_BLOCK,
+                                  &spill,
+                                  "POLARIS_SPILL_BLOCK daemon RM stress") != 0)
+            goto out;
+        if (spill.decision_id == 0) {
+            fprintf(stderr,
+                    "POLARIS_SPILL_BLOCK did not queue daemon OFFLOAD decision in stress iter=%u\n",
+                    iter);
+            goto out;
+        }
+        printf("POLARIS daemon RM stress spill iter=%u block=%llu decision=%llu unmapped=%u\n",
+               iter + 1,
+               (unsigned long long)block_id,
+               (unsigned long long)spill.decision_id,
+               spill.unmapped_count);
+
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 token_start,
+                                 token_count,
+                                 POLARIS_BLOCK_STATE_CPU_OFFLOADED,
+                                 "daemon RM stress OFFLOAD completion",
+                                 NULL) != 0)
+            goto out;
+
+        struct polaris_block_reserve_arg reserve = {
+            .session_id = session_id,
+            .token_start = token_start,
+            .token_count = token_count,
+            .phase = 2,
+            .flags = POLARIS_RESERVE_FLAG_OVERWRITE,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_BLOCK_RESERVE,
+                                  &reserve,
+                                  "POLARIS_BLOCK_RESERVE daemon RM stress reload") != 0)
+            goto out;
+        if (reserve.block_id != block_id || reserve.gpu_vaddr != fault_vaddr) {
+            fprintf(stderr,
+                    "daemon stress reload reserve returned block=%llu vaddr=0x%llx; expected block=%llu vaddr=0x%llx iter=%u\n",
+                    (unsigned long long)reserve.block_id,
+                    (unsigned long long)reserve.gpu_vaddr,
+                    (unsigned long long)block_id,
+                    (unsigned long long)fault_vaddr,
+                    iter);
+            goto out;
+        }
+
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 token_start,
+                                 token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon RM stress RELOAD completion",
+                                 NULL) != 0)
+            goto out;
+
+        if (dispatch_test_fault(s, fault_vaddr) != 0)
+            goto out;
+
+        struct polaris_rm_copy_arg read_back = {
+            .block_id = block_id,
+            .length = POLARIS_BLOCK_SIZE,
+            .user_cpu_addr = (uint64_t)(uintptr_t)dst,
+            .direction = POLARIS_RM_COPY_TO_CPU,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_RM_COPY,
+                                  &read_back,
+                                  "POLARIS_RM_COPY daemon stress TO_CPU") != 0)
+            goto out;
+        if (read_back.bytes_copied != POLARIS_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "daemon stress read bytes=0x%llx expected=0x%llx iter=%u\n",
+                    (unsigned long long)read_back.bytes_copied,
+                    (unsigned long long)POLARIS_BLOCK_SIZE,
+                    iter);
+            goto out;
+        }
+
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            if (dst[i] != src[i]) {
+                fprintf(stderr,
+                        "daemon RM stress mismatch iter=%u at 0x%llx: expected=0x%x actual=0x%x\n",
+                        iter + 1,
+                        (unsigned long long)i,
+                        src[i],
+                        dst[i]);
+                goto out;
+            }
+        }
+
+        if (wait_for_sysfs_stat_u64("pending_decs",
+                                    0,
+                                    "daemon-backed stress decision drain") != 0)
+            goto out;
+    }
+
+    printf("POLARIS daemon RM spill/reload stress complete: block=%llu iterations=%u bytes_per_iter=0x%llx\n",
+           (unsigned long long)block_id,
+           iterations,
+           (unsigned long long)POLARIS_BLOCK_SIZE);
+    rc = 0;
+
+out:
+    free(dst);
+    free(src);
+    return rc;
+}
+
 static int rm_cow_roundtrip(struct m2_state *s,
                             uint32_t gpu_id,
                             uint64_t rm_client_token,
@@ -2928,6 +3105,7 @@ int main(int argc, char **argv)
     bool rm_copy_roundtrip_mode = false;
     bool rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_roundtrip_mode = false;
+    bool daemon_rm_spill_reload_stress_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
@@ -2998,6 +3176,12 @@ int main(int argc, char **argv)
             daemon_rm_spill_reload_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-spill-reload-stress") == 0) {
+            dispatch_fault = true;
+            deferred_complete_fault = true;
+            daemon_rm_spill_reload_stress_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--daemon-rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             deferred_complete_fault = true;
@@ -3047,7 +3231,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -3068,6 +3252,7 @@ int main(int argc, char **argv)
     if (setup_rm(&s,
                  ordinal,
                  !daemon_rm_spill_reload_roundtrip_mode &&
+                     !daemon_rm_spill_reload_stress_mode &&
                      !daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
     uint64_t managed_length = (rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
@@ -3093,6 +3278,7 @@ int main(int argc, char **argv)
     if (complete_backed_refault ||
         (deferred_complete_fault &&
          !daemon_rm_spill_reload_roundtrip_mode &&
+         !daemon_rm_spill_reload_stress_mode &&
          !daemon_rm_cow_roundtrip_mode)) {
         exec_args.state = &s;
         exec_args.gpu_id = polaris_gpu_id;
@@ -3123,6 +3309,7 @@ int main(int argc, char **argv)
             goto out;
         }
         if (daemon_rm_spill_reload_roundtrip_mode ||
+            daemon_rm_spill_reload_stress_mode ||
             daemon_rm_cow_roundtrip_mode)
             s.polaris_block_caller_owns_backing = false;
         if (complete_backed_refault) {
@@ -3167,6 +3354,7 @@ int main(int argc, char **argv)
             goto out;
         if (deferred_complete_fault &&
             !daemon_rm_spill_reload_roundtrip_mode &&
+            !daemon_rm_spill_reload_stress_mode &&
             !daemon_rm_cow_roundtrip_mode) {
             if (pthread_join(completion_executor, NULL) != 0) {
                 completion_executor_started = false;
@@ -3186,6 +3374,7 @@ int main(int argc, char **argv)
         if ((complete_backed_refault || deferred_complete_fault) &&
             !rm_spill_reload_roundtrip_mode &&
             !daemon_rm_spill_reload_roundtrip_mode &&
+            !daemon_rm_spill_reload_stress_mode &&
             !rm_cow_roundtrip_mode &&
             !daemon_rm_cow_roundtrip_mode) {
             if (dispatch_test_fault(&s, base) != 0)
@@ -3214,6 +3403,16 @@ int main(int argc, char **argv)
                                                 s.polaris_block_token_count,
                                                 block_id,
                                                 base) != 0)
+                goto out;
+        }
+        if (daemon_rm_spill_reload_stress_mode) {
+            if (daemon_rm_spill_reload_stress(&s,
+                                              s.polaris_session_id,
+                                              s.polaris_block_token_start,
+                                              s.polaris_block_token_count,
+                                              block_id,
+                                              base,
+                                              POLARIS_DAEMON_RM_STRESS_ITERS) != 0)
                 goto out;
         }
         if (rm_cow_roundtrip_mode) {
@@ -3267,6 +3466,8 @@ int main(int argc, char **argv)
         puts("M4 Polaris RM COW roundtrip passed.");
     else if (daemon_rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris daemon-backed RM spill/reload roundtrip passed.");
+    else if (daemon_rm_spill_reload_stress_mode)
+        puts("M6 Polaris daemon-backed RM spill/reload stress passed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)

@@ -679,7 +679,15 @@ Still to do on the Polaris side for M1/M2:
   `POLARIS_RM_COPY`, queues `POLARIS_SPILL_BLOCK`, waits for daemon `OFFLOAD`,
   forces daemon `RELOAD`, refaults, and verifies cleanup drains daemon `FREE`.
   This closes the gap between the harness-owned RM byte roundtrip and the
-  llama.cpp gate; broader multi-iteration stress remains M6 work.
+  llama.cpp gate.
+- Focused daemon-backed RM spill/reload stress wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-spill-reload-stress` runs repeated
+  real-daemon `POLARIS_SPILL_BLOCK` / `OFFLOAD` / `RELOAD` cycles on one deferred
+  logical block with daemon-owned RM backing, writes a different deterministic
+  pattern through `POLARIS_RM_COPY` each cycle, refaults after reload, verifies
+  byte integrity, and checks daemon decision-queue drain between cycles. This is
+  a focused single-block stress gate; fragmentation, dynamic KV growth, and OOM
+  pressure remain broader M6 work.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -963,8 +971,9 @@ Still to do on the Polaris side for M1/M2:
   `uvm_no_pte` or `uvm_errors` increments. This validates the no-source-change
   KV-only path through daemon-published RM backing.
 - Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management, broaden daemon-backed
-  spill/reload stress coverage, and document or disable CUDA Graph interactions.
+  model with workload-appropriate VA management, broaden daemon-backed stress
+  beyond the focused single-block spill/reload gate, and document or disable
+  CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

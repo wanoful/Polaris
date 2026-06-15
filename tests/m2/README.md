@@ -509,6 +509,35 @@ M3 Polaris daemon-backed RM spill/reload roundtrip passed.
 This is the focused M2/M3 gate for the production daemon-backed path; static RM
 registration remains diagnostic-only.
 
+## Daemon-Backed RM Spill / Reload Stress
+
+This extends the focused daemon-backed spill/reload gate into a small repeated
+cycle stress test. It uses the same real `polarisd` path as
+`--daemon-rm-spill-reload-roundtrip`: no static RM registration, no
+harness-owned logical backing, and no harness-side decision executor. Start
+`polarisd` with daemon-owned RM backing first:
+
+```sh
+POLARISD_RM_BACKING=1 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-spill-reload-stress
+```
+
+The mode reserves one deferred logical block, lets the daemon materialize it,
+then runs multiple `POLARIS_SPILL_BLOCK` / daemon `OFFLOAD` / daemon `RELOAD`
+cycles. Each cycle writes a different deterministic pattern into daemon-owned
+RM backing with `POLARIS_RM_COPY`, refaults after reload, copies the reloaded
+bytes back, verifies byte integrity, and checks that the daemon decision queue
+drains before the next cycle.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM spill/reload stress passed.
+```
+
+This is still a focused single-block stress gate. Fragmentation, dynamic KV
+growth, and OOM pressure remain broader M6 work.
+
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete
 legacy `ALLOC`, `OFFLOAD`, and `RELOAD` decisions, plus a real-`polarisd`
