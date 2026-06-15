@@ -214,8 +214,8 @@ flags, and first mismatch. A successful run reports
 `mismatch=0xffffffffffffffff`. Passing this test proves the narrow local
 backing shape used by the harness (contiguous vidmem, one 2 MiB page on the
 validated GPU) can move bytes through UVM's CE copy path. It is still a
-diagnostic: production RM-backed `OFFLOAD`, `RELOAD`, and `COW_BREAK` remain
-guarded until polarisd/runtime spill and reload are wired to this copy path.
+diagnostic: production RM-backed `OFFLOAD`, `RELOAD`, and staged overwrite
+`COW_BREAK` are covered by the later RM roundtrip and daemon-backed gates.
 
 ## RM User-Buffer Copy Roundtrip
 
@@ -445,9 +445,39 @@ M3 Polaris spill ioctl validation passed.
 ```
 
 Positive RM-backed spill execution is covered by
-`--rm-spill-reload-roundtrip` and by the strict daemon-backed llama.cpp gate.
-The `--spill-validation` mode remains a negative ioctl validation for an
-unresident block.
+`--rm-spill-reload-roundtrip`,
+`--daemon-rm-spill-reload-roundtrip`, and by the strict daemon-backed
+llama.cpp gate. The `--spill-validation` mode remains a negative ioctl
+validation for an unresident block.
+
+## Daemon-Backed RM Spill / Reload Roundtrip
+
+This validates the same byte-preserving spill/reload path with a real
+long-running `polarisd` handling the decisions. Unlike
+`--rm-spill-reload-roundtrip`, this mode does not consume `GET_DECISION` or
+complete operations inside the harness, does not register static backing, and
+does not allocate a harness-owned logical backing object. Start `polarisd` with
+daemon-owned RM backing first:
+
+```sh
+POLARISD_RM_BACKING=1 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-spill-reload-roundtrip
+```
+
+The mode reserves a deferred logical block, triggers the first synthetic fault,
+waits for daemon-backed `ALLOC`, writes a deterministic pattern into the
+daemon-owned RM object with `POLARIS_RM_COPY`, calls `POLARIS_SPILL_BLOCK`,
+waits for daemon `OFFLOAD`, reserves the same block again to force daemon
+`RELOAD`, refaults it, and verifies the bytes survived.
+
+Expected success ends with:
+
+```text
+M3 Polaris daemon-backed RM spill/reload roundtrip passed.
+```
+
+This is the focused M2/M3 gate for the production daemon-backed path; static RM
+registration remains diagnostic-only.
 
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete

@@ -668,6 +668,15 @@ Still to do on the Polaris side for M1/M2:
   spills to a CPU buffer, reloads into fresh RM backing, refaults through the
   bridge, and verifies byte integrity. This exercises the same UVM copy helper
   used by the daemon path without requiring static RM registration.
+- Focused daemon-backed RM spill/reload gate wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-spill-reload-roundtrip` requires a
+  real `polarisd` already running with `POLARISD_RM_BACKING=1`, reserves a
+  deferred logical block without static RM registration or harness-owned
+  logical backing, lets the daemon handle `ALLOC`, writes/verifies bytes through
+  `POLARIS_RM_COPY`, queues `POLARIS_SPILL_BLOCK`, waits for daemon `OFFLOAD`,
+  forces daemon `RELOAD`, refaults, and verifies cleanup drains daemon `FREE`.
+  This closes the gap between the harness-owned RM byte roundtrip and the
+  llama.cpp gate; broader multi-iteration stress remains M6 work.
 - Kernel state-machine coverage added: `libpolaris` has ignored root-only
   `kernel_spill_state` tests that drive legacy
   `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through

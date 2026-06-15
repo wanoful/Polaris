@@ -129,8 +129,9 @@ VA-space; for that case polaris.ko services the fault only when a single
 unambiguous logical block mapping covers the faulting GPU/address.
 `POLARISD_RM_BACKING=1` also wires daemon-backed `OFFLOAD` and `RELOAD`
 through `POLARIS_RM_COPY`, which copies between daemon-owned RM vidmem and the
-pinned CPU pool using UVM-owned staging and CE. `COW_BREAK` for RM-backed
-blocks is still guarded until an RM-to-RM or staged copy path is integrated.
+pinned CPU pool using UVM-owned staging and CE. RM-backed overwrite
+`COW_BREAK` uses the same staged CPU-pool copy path for the current
+`SESSION_BRANCH` + overwrite-reserve surface.
 `POLARIS_SHIM_STATIC_RM_BACKEND=1` remains available only as a diagnostic
 backend: it allocates shim-owned RM vidmem and registers both
 `POLARIS_REGISTER_STATIC_BLOCK` and `POLARIS_REGISTER_BLOCK_BACKING`.
