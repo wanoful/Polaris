@@ -557,11 +557,7 @@ Still to do on the Polaris side for M1/M2:
   returns the real daemon-owned `(rm_control_fd, h_client, h_memory, length)`
   tuple through `POLARIS_COMPLETE_OPERATION`. `FREE` decisions release the
   daemon-owned RM object by block id, so normal `BLOCK_RELEASE` /
-  `SESSION_DESTROY` cleanup now has a real RM owner on the daemon path. This
-  deliberately does **not** remove the RM-backed spill guard: RM-backed
-  device↔host copy for `OFFLOAD` / `RELOAD` / `COW_BREAK` remains pending, and
-  those operations return `EOPNOTSUPP` in the opt-in backend until the copy path
-  is implemented.
+  `SESSION_DESTROY` cleanup now has a real RM owner on the daemon path.
 - CUDA-copy visibility probe wired: `tests/m2/m2_static_block_setup
   --cuda-copy-probe` maps a harness-created RM vidmem allocation through the
   public UVM external-allocation ioctl, creates a normal CUDA primary context
@@ -590,15 +586,14 @@ Still to do on the Polaris side for M1/M2:
 - RM CE-copy probe wired: UVM now exports the diagnostic
   `uvm_polaris_probe_external_copy`, polaris.ko exposes
   `POLARIS_PROBE_RM_COPY`, and the M2 harness's `--rm-copy-probe` mode
-  follows the completion-backed resident path, verifies the RM-backed spill
-  guard still returns `EOPNOTSUPP`, then stages a deterministic CPU pattern in
+  follows the completion-backed resident path, then stages a deterministic CPU pattern in
   UVM-owned sysmem DMA memory, CE-copies it into the RM allocation's
   GPU-visible physical address, CE-copies it back to sysmem, and verifies byte
   integrity. Local validation on 2026-06-14 copied and verified the full 2 MiB
   contiguous vidmem harness allocation (`page=0x200000 count=1
   mismatch=0xffffffffffffffff`) and then unmap/refaulted the block through the
   bridge. This proves the narrow local RM-backed shape can move bytes through
-  UVM's CE path; it is still diagnostic, not production spill/reload wiring.
+  UVM's CE path; it is still diagnostic, not the daemon integration itself.
 - RM user-buffer copy primitive wired: UVM now exports
   `uvm_polaris_copy_external_allocation`, polaris.ko exposes `POLARIS_RM_COPY`,
   and the M2 harness's `--rm-copy-roundtrip` mode copies a deterministic
@@ -607,12 +602,13 @@ Still to do on the Polaris side for M1/M2:
   the same narrow bring-up limit as the probe (contiguous vidmem reached through
   UVM CE staging), but changes the endpoint from an internal diagnostic pattern
   to the user CPU pointer shape needed by daemon-backed `OFFLOAD` and `RELOAD`.
-- RM-backed spill guard wired: `POLARIS_SPILL_BLOCK` now validates the logical
-  block before tearing down observed UVM mappings, and rejects RM-backed
-  bridge-resident blocks with `EOPNOTSUPP` until the daemon/runtime has a real
-  RM-backed device→host copy and RM release path. The completion-backed M2
-  diagnostic verifies this rejection leaves the observed mapping intact before
-  the explicit block-unmap/refault step.
+- RM-backed spill/reload execution wired: `POLARIS_SPILL_BLOCK` validates the
+  logical block, tears down observed UVM mappings, and queues `OFFLOAD` for
+  RM-backed bridge-resident blocks. `polarisd` uses `POLARIS_RM_COPY` to copy
+  daemon-owned RM backing to the pinned CPU pool, frees the RM allocation, then
+  later services `RELOAD` by allocating fresh daemon-owned RM backing and
+  copying the CPU buffer back. `COW_BREAK` for RM-backed blocks remains guarded
+  until an RM-to-RM or staged copy path is integrated.
 - Live-backing FREE lifetime slice wired: `BLOCK_RELEASE` and
   `SESSION_DESTROY` now queue daemon `FREE` decisions for resident legacy
   physical handles, RM-backed bridge-resident logical blocks, and CPU-offloaded
@@ -645,11 +641,11 @@ Still to do on the Polaris side for M1/M2:
 - Third slice complete: `POLARIS_SPILL_BLOCK` is in the ABI. It first tears
   down observed UVM mappings with the same block-level unmap helper, then
   queues the existing `OFFLOAD` decision for resident logical blocks so
-  polarisd performs device → host copy and physical-handle release through
-  the normal completion path. The M2 harness validates the ioctl's unresident
-  block rejection (`--spill-validation`), but the static RM harness cannot
-  positively execute copy/release because it does not create a daemon-owned
-  CUDA VMM resident block.
+  polarisd performs device → host copy and backing release through the normal
+  completion path. The M2 harness validates the ioctl's unresident block
+  rejection (`--spill-validation`); positive RM-backed copy coverage now lives
+  in the RM roundtrip and llama gates below because real RM copy requires an
+  observed UVM VA-space context.
 - Positive daemon/runtime spill test wired: the ignored root/GPU
   `polaris-runtime` fault-smoke creates a resident logical block through the
   runtime decision worker, writes a CUDA-visible pattern, calls
@@ -658,13 +654,21 @@ Still to do on the Polaris side for M1/M2:
   the bytes survive the device → host → device cycle. A separate long-running
   `polarisd` process soak remains useful, but the production decision path is
   no longer covered only by fake executor state-machine tests.
-- Kernel state-machine coverage added: `libpolaris` has an ignored
-  root-only `kernel_spill_state` test that drives
+- Positive RM harness spill/reload test wired:
+  `tests/m2/m2_static_block_setup --rm-spill-reload-roundtrip` writes a
+  deterministic userspace pattern into RM backing with `POLARIS_RM_COPY`,
+  spills to a CPU buffer, reloads into fresh RM backing, refaults through the
+  bridge, and verifies byte integrity. This exercises the same UVM copy helper
+  used by the daemon path without requiring static RM registration.
+- Kernel state-machine coverage added: `libpolaris` has ignored root-only
+  `kernel_spill_state` tests that drive legacy
   `ALLOC → POLARIS_SPILL_BLOCK/OFFLOAD → BLOCK_RESERVE/RELOAD` through
-  `GET_DECISION` / `COMPLETE_OPERATION` without invoking CUDA. This catches
-  the M3 control-plane contract even when the CUDA/UVM channel path is not
-  safe to run. It is build-covered by `cargo test`; execution requires a
-  freshly loaded `polaris.ko`.
+  `GET_DECISION` / `COMPLETE_OPERATION` without invoking CUDA, and a separate
+  real-`polarisd` RM-backed `ALLOC`/`FREE` lifetime test. They catch the
+  control-plane contract when the CUDA/UVM data path is not safe to run, but
+  they do not prove RM-backed byte movement because `POLARIS_RM_COPY` needs an
+  observed UVM `gpu_va_space_ptr`. It is build-covered by `cargo test`;
+  execution requires a freshly loaded `polaris.ko`.
 - Reload state-machine fix: overwriting an existing single-ref block now
   triggers synchronous fault resolution when the block is not resident,
   so `CpuOffloaded` blocks queue `RELOAD` instead of returning an unmapped
@@ -884,9 +888,11 @@ Still to do on the Polaris side for M1/M2:
   `LD_PRELOAD` for both the ordinary `cudaMalloc` path and the
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` / `cudaMallocManaged` path, and asserts
   that the shim bootstraps RM/UVM, registers a Polaris VA-space, routes real
-  llama allocations through Polaris, creates UVM external ranges, registers
-  static RM backing, records the expected per-API selected allocation counter,
-  and in strict mode increments both `uvm_hook_calls` and `uvm_handled`.
+  llama allocations through Polaris, creates UVM external ranges, starts
+  `polarisd` with daemon-owned RM backing, observes daemon RM allocation for
+  the deferred logical blocks, records the expected per-API selected allocation
+  counter, and in strict mode increments both `uvm_hook_calls` and
+  `uvm_handled` without static RM registration.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
@@ -907,25 +913,20 @@ Still to do on the Polaris side for M1/M2:
   UVM-map-plus-CUDA-copy experiment was rejected after `cuMemcpyHtoD_v2`
   returned `CUDA_ERROR_INVALID_CONTEXT` without a current context and segfaulted
   inside `libcuda` with a current runtime context.
-- Strict static-RM shim fault-path gate passes on the local SmolLM2
+- Strict daemon-backed shim fault-path gate is the current target for the local
+  SmolLM2
   `llama-bench` run for both llama.cpp allocator branches: the default probe
   selects KV allocations through runtime `cudaMalloc`, and the
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` probe selects KV allocations through
   runtime `cudaMallocManaged`. In both cases the shim passes copied model/init
   allocations through to real CUDA, accepts KV zero-fill initialization,
   disables CUDA Graph capture and CUDA PDL launch selection for the shim probe,
-  and completes with `uvm_hook_calls` and `uvm_handled` increasing and no
-  `uvm_no_pte` or `uvm_errors` increments. This validates the
-  no-source-change KV-only path through the UVM bridge for the integration-test
-  backend.
-- Run llama.cpp end-to-end against shim+polaris.ko+polarisd using the
-  daemon-backed spill/reload path. CUDA Graph mode may need to be disabled
-  (or KV ranges excluded from graph capture); document the decision per
-  integration option.
-- Remaining production shim work: replace the static RM test backend with the
-  daemon-backed spill/reload path, replace the fixed managed-window reservation
-  model with workload-appropriate VA management, and document or disable CUDA
-  Graph interactions.
+  and must complete with `uvm_hook_calls` and `uvm_handled` increasing and no
+  `uvm_no_pte` or `uvm_errors` increments. This validates the no-source-change
+  KV-only path through daemon-published RM backing.
+- Remaining production shim work: replace the fixed managed-window reservation
+  model with workload-appropriate VA management, broaden daemon-backed
+  spill/reload stress coverage, and document or disable CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

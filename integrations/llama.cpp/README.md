@@ -130,9 +130,9 @@ fault-path gate:
   both the default `cudaMalloc` path and the
   `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` / `cudaMallocManaged` path. Each probe
   bootstraps RM/UVM, registers a Polaris VA-space, routes real llama allocation
-  through Polaris, creates a UVM external range, allocates an RM vidmem object,
-  registers it with `POLARIS_REGISTER_STATIC_BLOCK` and
-  `POLARIS_REGISTER_BLOCK_BACKING`, requires the matching shim per-API counter
+  through Polaris, creates a UVM external range, starts `polarisd` with
+  `POLARISD_RM_BACKING=1`, requires daemon-owned RM backing to be published
+  through `POLARIS_COMPLETE_OPERATION`, requires the matching shim per-API counter
   (`api_runtime_alloc_selected` or
   `api_runtime_managed_alloc_selected`) to increase, and requires
   `/sys/kernel/polaris/stats` to show increased `uvm_hook_calls` and
@@ -159,27 +159,22 @@ then llama.cpp's tiny stories model. The default binary is `llama-bench` from
 `build-polaris/tools`, then the usual `build*/bin`/`tools` fallbacks. Override
 with `LLAMA_CPP_BIN=/path/to/binary`.
 
-`POLARIS_SHIM_STATIC_RM_BACKEND=1` is a test backend, not the final production
-spill/reload design. It proves the shim can allocate and register RM-backed
-external ranges for real llama.cpp allocations. The backend registers both the
-legacy static-block entry and the logical block's RM backing tuple, so the
-kernel can validate logical-block UVM bridge mapping without a separate static
-table entry. It does not make CUDA runtime host copies into Polaris external
-VA safe, and it still does not implement daemon-backed spill/reload.
-The kernel also accepts RM backing metadata on successful
-`POLARIS_COMPLETE_OPERATION` replies, which is the intended path for a future
-daemon/runtime executor to publish UVM-bridge-mapable resident blocks; the
-current llama shim strict gate still uses explicit static-RM test backing.
+`POLARIS_SHIM_STATIC_RM_BACKEND=1` remains available as a diagnostic backend,
+but the llama regression no longer uses it by default. The production-shaped
+gate leaves selected shim allocations as deferred logical blocks. Their first
+GPU access faults into polaris.ko, the kernel queues `ALLOC`, `polarisd`
+allocates daemon-owned RM vidmem and returns the RM tuple through
+`POLARIS_COMPLETE_OPERATION`, and the same fault is bridge-mapped through UVM
+before returning `HANDLED`. Daemon-backed `OFFLOAD` and `RELOAD` use
+`POLARIS_RM_COPY`; RM-backed `COW_BREAK` remains guarded.
 
 Set `POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1` to require that the shimmed
 `llama-bench` commands complete and `/sys/kernel/polaris/stats` shows both
 `uvm_hook_calls` and `uvm_handled` increasing for the default and
-unified-memory allocator branches. This strict static-RM gate passes for the
-local SmolLM2 CUDA runs when KV-scope selection is enabled. The gate sets
+unified-memory allocator branches. The gate sets
 `GGML_CUDA_DISABLE_GRAPHS=1` and `GGML_CUDA_PDL=0` by default because CUDA
 Graph capture/replay and programmatic dependent launch are not part of the
-current shim contract. It is still an integration-test backend:
-daemon-backed spill/reload remains separate production work.
+current shim contract.
 
 ## Workload Run Shape
 
@@ -198,8 +193,9 @@ sudo env \
   /path/to/llama.cpp/build/bin/<llama-binary> <args>
 ```
 
-The current static-RM regression validates llama.cpp's actual KV allocation and
+The current regression validates llama.cpp's actual KV allocation and
 kernel-deref path for both runtime `cudaMalloc` and runtime
-`cudaMallocManaged`. The next production milestone is replacing the static RM
-test backend with daemon-backed spill/reload, then moving from the fixed
-managed-window allocator to workload-appropriate VA management.
+`cudaMallocManaged` through daemon-owned RM backing. The next production
+milestone is moving from the fixed managed-window allocator to
+workload-appropriate VA management and broadening long-running spill/reload
+stress coverage.

@@ -222,13 +222,17 @@ struct polaris_rm_copy_arg {
     uint64_t user_cpu_addr;
     uint32_t direction;
     uint32_t _pad;
+    int32_t rm_control_fd;
+    uint32_t rm_h_client;
+    uint32_t rm_h_memory;
+    uint32_t _pad2;
     uint64_t page_size;
     uint64_t phys_addr_count;
     uint64_t first_phys_addr;
     uint64_t last_phys_addr;
     uint64_t flags;
     uint64_t bytes_copied;
-    uint64_t _reserved[4];
+    uint64_t _reserved[2];
 };
 
 enum {
@@ -300,6 +304,7 @@ struct polaris_complete_operation_arg {
 #define POLARIS_PROBE_RM_COPY _IOWR(POLARIS_IOCTL_MAGIC, 0x19, struct polaris_probe_rm_copy_arg)
 #define POLARIS_RM_COPY _IOWR(POLARIS_IOCTL_MAGIC, 0x1a, struct polaris_rm_copy_arg)
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
+#define POLARIS_RESERVE_FLAG_OVERWRITE (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
 #define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)
 
@@ -386,6 +391,15 @@ struct completion_executor_args {
     uint32_t gpu_id;
     uint64_t expected_base;
     uint64_t completed_block_id;
+    int result;
+};
+
+struct rm_spill_reload_args {
+    struct m2_state *state;
+    uint32_t gpu_id;
+    uint64_t block_id;
+    uint64_t cpu_addr;
+    NvHandle new_h_memory;
     int result;
 };
 
@@ -1578,6 +1592,379 @@ out:
     return rc;
 }
 
+static int allocate_rm_memory(struct m2_state *s, const char *what, uint64_t size, NvHandle *h_memory_out)
+{
+    NV_MEMORY_ALLOCATION_PARAMS memory_params = {
+        .size = size,
+        .owner = s->h_client,
+        .type = NVOS32_TYPE_IMAGE,
+        .attr = (NVOS32_ATTR_LOCATION_VIDMEM << 25),
+    };
+
+    *h_memory_out = 0;
+    if (rm_alloc(s->ctl_fd,
+                 s->h_client,
+                 s->h_device,
+                 h_memory_out,
+                 NV01_MEMORY_LOCAL_USER,
+                 &memory_params,
+                 sizeof(memory_params),
+                 what) != 0)
+        return -1;
+
+    printf("%s size=0x%llx hMemory=0x%x\n",
+           what,
+           (unsigned long long)memory_params.size,
+           *h_memory_out);
+    return 0;
+}
+
+static int complete_decision(struct m2_state *s,
+                             const struct polaris_decision *decision,
+                             int32_t result,
+                             uint64_t output_cpu_addr,
+                             NvHandle h_memory)
+{
+    struct polaris_complete_operation_arg complete = {
+        .decision_id = decision->decision_id,
+        .generation = decision->generation,
+        .result = result,
+        .rm_control_fd = h_memory ? s->ctl_fd : 0,
+        .output_handle = 0,
+        .output_cpu_addr = output_cpu_addr,
+        .rm_h_client = h_memory ? s->h_client : 0,
+        .rm_h_memory = h_memory,
+        .rm_backing_length = h_memory ? POLARIS_BLOCK_SIZE : 0,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_COMPLETE_OPERATION,
+                              &complete,
+                              "POLARIS_COMPLETE_OPERATION") != 0)
+        return -1;
+    return 0;
+}
+
+static int wait_for_one_decision(struct m2_state *s,
+                                 uint32_t expected_op,
+                                 uint64_t expected_block_id,
+                                 struct polaris_decision *decision_out)
+{
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        struct polaris_get_decision_arg get = {0};
+
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_GET_DECISION,
+                                  &get,
+                                  "POLARIS_GET_DECISION") != 0)
+            return -1;
+
+        for (uint32_t i = 0; i < get.count && i < POLARIS_MAX_DECISIONS_PER_POLL; ++i) {
+            const struct polaris_decision *decision = &get.decisions[i];
+            if (decision->op == expected_op && decision->block_id == expected_block_id) {
+                *decision_out = *decision;
+                return 0;
+            }
+
+            fprintf(stderr,
+                    "unexpected decision while waiting for op=%u block=%llu: op=%u block=%llu decision=%llu\n",
+                    expected_op,
+                    (unsigned long long)expected_block_id,
+                    decision->op,
+                    (unsigned long long)decision->block_id,
+                    (unsigned long long)decision->decision_id);
+            if (complete_decision(s, decision, -EINVAL, 0, 0) != 0)
+                return -1;
+        }
+
+        usleep(1000);
+    }
+
+    fprintf(stderr,
+            "timed out waiting for decision op=%u block=%llu\n",
+            expected_op,
+            (unsigned long long)expected_block_id);
+    return -1;
+}
+
+static int execute_rm_offload_decision(struct m2_state *s,
+                                       const struct polaris_decision *decision,
+                                       uint64_t *cpu_addr_out)
+{
+    uint8_t *cpu = NULL;
+    struct polaris_rm_copy_arg copy = {0};
+
+    if (posix_memalign((void **)&cpu, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign offload CPU buffer failed\n");
+        return -1;
+    }
+
+    copy.block_id = decision->block_id;
+    copy.length = POLARIS_BLOCK_SIZE;
+    copy.user_cpu_addr = (uint64_t)(uintptr_t)cpu;
+    copy.direction = POLARIS_RM_COPY_TO_CPU;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &copy,
+                              "POLARIS_RM_COPY OFFLOAD TO_CPU") != 0) {
+        free(cpu);
+        return -1;
+    }
+    if (copy.bytes_copied != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "OFFLOAD RM copy bytes=0x%llx expected=0x%llx\n",
+                (unsigned long long)copy.bytes_copied,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        free(cpu);
+        return -1;
+    }
+
+    if (complete_decision(s, decision, 0, (uint64_t)(uintptr_t)cpu, 0) != 0) {
+        free(cpu);
+        return -1;
+    }
+
+    *cpu_addr_out = (uint64_t)(uintptr_t)cpu;
+    printf("POLARIS RM OFFLOAD completed: block=%llu cpu=0x%llx bytes=0x%llx page=0x%llx flags=0x%llx\n",
+           (unsigned long long)decision->block_id,
+           (unsigned long long)*cpu_addr_out,
+           (unsigned long long)copy.bytes_copied,
+           (unsigned long long)copy.page_size,
+           (unsigned long long)copy.flags);
+    return 0;
+}
+
+static int execute_rm_reload_decision(struct m2_state *s,
+                                      const struct polaris_decision *decision,
+                                      NvHandle *new_h_memory_out)
+{
+    NvHandle new_h_memory = 0;
+    struct polaris_rm_copy_arg copy = {0};
+
+    if (decision->cpu_addr == 0) {
+        fprintf(stderr, "RELOAD decision missing cpu_addr for block=%llu\n",
+                (unsigned long long)decision->block_id);
+        return -1;
+    }
+
+    if (allocate_rm_memory(s, "RM_ALLOC reload memory", POLARIS_BLOCK_SIZE, &new_h_memory) != 0)
+        return -1;
+
+    copy.block_id = decision->block_id;
+    copy.length = POLARIS_BLOCK_SIZE;
+    copy.user_cpu_addr = decision->cpu_addr;
+    copy.direction = POLARIS_RM_COPY_FROM_CPU;
+    copy.rm_control_fd = s->ctl_fd;
+    copy.rm_h_client = s->h_client;
+    copy.rm_h_memory = new_h_memory;
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &copy,
+                              "POLARIS_RM_COPY RELOAD FROM_CPU") != 0) {
+        rm_free_object(s->ctl_fd, s->h_client, s->h_device, new_h_memory);
+        return -1;
+    }
+    if (copy.bytes_copied != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "RELOAD RM copy bytes=0x%llx expected=0x%llx\n",
+                (unsigned long long)copy.bytes_copied,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        rm_free_object(s->ctl_fd, s->h_client, s->h_device, new_h_memory);
+        return -1;
+    }
+
+    if (complete_decision(s, decision, 0, 0, new_h_memory) != 0) {
+        rm_free_object(s->ctl_fd, s->h_client, s->h_device, new_h_memory);
+        return -1;
+    }
+
+    free((void *)(uintptr_t)decision->cpu_addr);
+    *new_h_memory_out = new_h_memory;
+    printf("POLARIS RM RELOAD completed: block=%llu hMemory=0x%x bytes=0x%llx page=0x%llx flags=0x%llx\n",
+           (unsigned long long)decision->block_id,
+           new_h_memory,
+           (unsigned long long)copy.bytes_copied,
+           (unsigned long long)copy.page_size,
+           (unsigned long long)copy.flags);
+    return 0;
+}
+
+static void *rm_reload_executor(void *arg)
+{
+    struct rm_spill_reload_args *args = arg;
+    struct polaris_decision reload = {0};
+
+    args->result = -1;
+    if (wait_for_one_decision(args->state,
+                              POLARIS_DECISION_OP_RELOAD,
+                              args->block_id,
+                              &reload) != 0)
+        return NULL;
+    if (reload.cpu_addr != args->cpu_addr) {
+        fprintf(stderr,
+                "RELOAD cpu_addr=0x%llx expected=0x%llx\n",
+                (unsigned long long)reload.cpu_addr,
+                (unsigned long long)args->cpu_addr);
+        return NULL;
+    }
+    if (execute_rm_reload_decision(args->state, &reload, &args->new_h_memory) != 0)
+        return NULL;
+    args->result = 0;
+    return NULL;
+}
+
+static int rm_spill_reload_roundtrip(struct m2_state *s, uint64_t block_id)
+{
+    uint8_t *src = NULL;
+    uint8_t *dst = NULL;
+    uint64_t cpu_addr = 0;
+    NvHandle old_h_memory = s->h_memory;
+    NvHandle new_h_memory = 0;
+    const uint64_t seed = 0x5350494c4c524d31ULL;
+    int rc = -1;
+
+    if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign spill src failed\n");
+        goto out;
+    }
+    if (posix_memalign((void **)&dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign spill dst failed\n");
+        goto out;
+    }
+    for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+        src[i] = rm_copy_roundtrip_pattern(seed, i);
+        dst[i] = 0;
+    }
+
+    struct polaris_rm_copy_arg write_initial = {
+        .block_id = block_id,
+        .length = POLARIS_BLOCK_SIZE,
+        .user_cpu_addr = (uint64_t)(uintptr_t)src,
+        .direction = POLARIS_RM_COPY_FROM_CPU,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &write_initial,
+                              "POLARIS_RM_COPY initial FROM_CPU") != 0)
+        goto out;
+
+    struct polaris_spill_block_arg spill = {
+        .block_id = block_id,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_SPILL_BLOCK,
+                              &spill,
+                              "POLARIS_SPILL_BLOCK RM-backed") != 0)
+        goto out;
+    if (spill.decision_id == 0) {
+        fprintf(stderr, "POLARIS_SPILL_BLOCK did not queue an OFFLOAD decision\n");
+        goto out;
+    }
+    printf("POLARIS RM spill queued: block=%llu decision=%llu unmapped=%u\n",
+           (unsigned long long)block_id,
+           (unsigned long long)spill.decision_id,
+           spill.unmapped_count);
+
+    struct polaris_decision offload = {0};
+    if (wait_for_one_decision(s,
+                              POLARIS_DECISION_OP_OFFLOAD,
+                              block_id,
+                              &offload) != 0)
+        goto out;
+    if (execute_rm_offload_decision(s, &offload, &cpu_addr) != 0)
+        goto out;
+
+    rm_free_object(s->ctl_fd, s->h_client, s->h_device, old_h_memory);
+    s->h_memory = 0;
+
+    struct rm_spill_reload_args reload_args = {
+        .state = s,
+        .gpu_id = offload.gpu_id,
+        .block_id = block_id,
+        .cpu_addr = cpu_addr,
+        .new_h_memory = 0,
+        .result = -1,
+    };
+    pthread_t reload_thread;
+    int thread_ret = pthread_create(&reload_thread, NULL, rm_reload_executor, &reload_args);
+    if (thread_ret != 0) {
+        fprintf(stderr, "pthread_create reload executor failed: %s\n", strerror(thread_ret));
+        goto out;
+    }
+
+    struct polaris_block_reserve_arg reserve = {
+        .session_id = s->polaris_session_id,
+        .token_start = s->polaris_block_token_start,
+        .token_count = s->polaris_block_token_count,
+        .phase = 2,
+        .flags = POLARIS_RESERVE_FLAG_OVERWRITE,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RESERVE,
+                              &reserve,
+                              "POLARIS_BLOCK_RESERVE RM reload") != 0) {
+        (void)pthread_join(reload_thread, NULL);
+        goto out;
+    }
+    if (pthread_join(reload_thread, NULL) != 0) {
+        fprintf(stderr, "pthread_join reload executor failed\n");
+        goto out;
+    }
+    if (reload_args.result != 0 || reload_args.new_h_memory == 0) {
+        fprintf(stderr, "reload executor result=%d hMemory=0x%x\n",
+                reload_args.result,
+                (unsigned int)reload_args.new_h_memory);
+        goto out;
+    }
+    new_h_memory = reload_args.new_h_memory;
+    s->h_memory = new_h_memory;
+
+    if (dispatch_test_fault(s, reserve.gpu_vaddr) != 0)
+        goto out;
+
+    struct polaris_rm_copy_arg read_back = {
+        .block_id = block_id,
+        .length = POLARIS_BLOCK_SIZE,
+        .user_cpu_addr = (uint64_t)(uintptr_t)dst,
+        .direction = POLARIS_RM_COPY_TO_CPU,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_RM_COPY,
+                              &read_back,
+                              "POLARIS_RM_COPY final TO_CPU") != 0)
+        goto out;
+    if (read_back.bytes_copied != POLARIS_BLOCK_SIZE) {
+        fprintf(stderr,
+                "final RM copy bytes=0x%llx expected=0x%llx\n",
+                (unsigned long long)read_back.bytes_copied,
+                (unsigned long long)POLARIS_BLOCK_SIZE);
+        goto out;
+    }
+
+    for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+        if (dst[i] != src[i]) {
+            fprintf(stderr,
+                    "RM spill/reload mismatch at 0x%llx: expected=0x%x actual=0x%x\n",
+                    (unsigned long long)i,
+                    src[i],
+                    dst[i]);
+            goto out;
+        }
+    }
+
+    printf("POLARIS RM spill/reload roundtrip complete: block=%llu old_hMemory=0x%x new_hMemory=0x%x bytes=0x%llx\n",
+           (unsigned long long)block_id,
+           old_h_memory,
+           new_h_memory,
+           (unsigned long long)read_back.bytes_copied);
+    rc = 0;
+
+out:
+    free(dst);
+    free(src);
+    return rc;
+}
+
 static int expect_unresident_spill_rejected(struct m2_state *s, uint64_t block_id)
 {
     struct polaris_spill_block_arg spill = {
@@ -1808,6 +2195,7 @@ int main(int argc, char **argv)
     bool rm_phys_probe = false;
     bool rm_copy_probe = false;
     bool rm_copy_roundtrip_mode = false;
+    bool rm_spill_reload_roundtrip_mode = false;
     uint64_t block_id = 0;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -1864,6 +2252,12 @@ int main(int argc, char **argv)
             rm_copy_roundtrip_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--rm-spill-reload-roundtrip") == 0) {
+            dispatch_fault = true;
+            complete_backed_refault = true;
+            rm_spill_reload_roundtrip_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--complete-backed-refault") == 0) {
             dispatch_fault = true;
             block_unmap_refault = true;
@@ -1901,7 +2295,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -2019,7 +2413,7 @@ int main(int argc, char **argv)
                 goto out;
             }
         }
-        if (complete_backed_refault || deferred_complete_fault) {
+        if ((complete_backed_refault || deferred_complete_fault) && !rm_spill_reload_roundtrip_mode) {
             if (expect_rm_backed_spill_unsupported(&s, block_id) != 0)
                 goto out;
             if (dispatch_test_fault(&s, base) != 0)
@@ -2035,6 +2429,10 @@ int main(int argc, char **argv)
         }
         if (rm_copy_roundtrip_mode) {
             if (rm_copy_roundtrip(&s, block_id) != 0)
+                goto out;
+        }
+        if (rm_spill_reload_roundtrip_mode) {
+            if (rm_spill_reload_roundtrip(&s, block_id) != 0)
                 goto out;
         }
         if (block_unmap_refault) {
@@ -2064,6 +2462,8 @@ int main(int argc, char **argv)
 
     if (rm_phys_probe)
         puts("M3 Polaris RM phys probe passed.");
+    else if (rm_spill_reload_roundtrip_mode)
+        puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)
         puts("M3 Polaris deferred completion fault test passed.");
     else if (complete_backed_refault)

@@ -143,6 +143,7 @@ pub struct PolarisBlock {
     pub rm_h_memory: u32,
     pub rm_backing_length: u64,
     pub rm_backing_offset: u64,
+    pub copy_gpu_va_space_ptr: u64,
     pub cpu_buf_addr: u64,
     pub size_bytes: u64,
     pub refcount: u64,

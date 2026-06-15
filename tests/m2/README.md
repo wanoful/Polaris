@@ -48,7 +48,7 @@ POLARIS_BLOCK_RESERVE(block_id) without DEFER_FAULT
   -> POLARIS_COMPLETE_OPERATION carries RM hClient/hMemory/length metadata
   -> POLARIS_REGISTER_BLOCK_MAPPING(block_id, worker VA range)
   -> synthetic fault maps the completed logical block through the UVM bridge
-  -> POLARIS_SPILL_BLOCK rejects the RM-backed block with EOPNOTSUPP
+  -> POLARIS_SPILL_BLOCK can queue OFFLOAD once RM copy support is enabled
   -> POLARIS_UNMAP_BLOCK_MAPPINGS(block_id)
   -> second synthetic fault remaps through the completed logical backing
 ```
@@ -185,16 +185,15 @@ The probe prints page size, physical-address count, first/last physical address,
 and flags (`contiguous`, `sysmem`, `egm`, `fabricmem`). Passing this test means
 the RM allocation shape can expose the physical-address metadata a later
 UVM/kernel copy helper will need. It does not copy data, does not validate CE
-programming, and does not make RM-backed `POLARIS_SPILL_BLOCK` production-ready;
-the `EOPNOTSUPP` guards remain correct until a real RM-backed spill/reload
-round-trip validates byte integrity.
+programming, and does not by itself validate RM-backed `POLARIS_SPILL_BLOCK`;
+use `--rm-spill-reload-roundtrip` for byte-integrity coverage across spill and
+reload.
 
 ## RM CE Copy Probe
 
 This diagnostic builds on the physical-address probe. It follows the
 completion-backed resident path, fault-maps a harness-owned RM vidmem
-allocation, confirms `POLARIS_SPILL_BLOCK` still rejects RM-backed spill with
-`EOPNOTSUPP`, then calls `POLARIS_PROBE_RM_COPY`. The kernel asks UVM to
+allocation, then calls `POLARIS_PROBE_RM_COPY`. The kernel asks UVM to
 duplicate/query the RM allocation, stage a deterministic CPU pattern in
 UVM-owned sysmem DMA memory, CE-copy the pattern into the RM allocation's
 GPU-visible physical address, CE-copy it back to another sysmem staging buffer,
@@ -241,6 +240,30 @@ kernel/UVM helper can move bytes between an RM-backed block and an ordinary
 userspace CPU pointer, which is the primitive needed by daemon-backed
 `OFFLOAD` and `RELOAD`. `COW_BREAK` remains guarded until an RM-to-RM or
 staged copy path is integrated.
+
+## RM Spill / Reload Roundtrip
+
+This validates the production-shaped RM-backed spill/reload path without the
+old RM-backed spill guard. It follows the completion-backed resident path,
+writes a deterministic userspace pattern into RM backing with `POLARIS_RM_COPY`,
+calls `POLARIS_SPILL_BLOCK`, completes the queued `OFFLOAD` by copying RM
+backing to a CPU buffer, reloads into fresh RM backing through
+`POLARIS_RM_COPY`, refaults the block, and verifies the bytes survived:
+
+```sh
+sudo tests/m2/m2_static_block_setup --rm-spill-reload-roundtrip
+```
+
+Expected success ends with:
+
+```text
+M3 Polaris RM spill/reload roundtrip passed.
+```
+
+The test still uses harness-owned RM allocations and a tiny executor loop; it
+does not replace the long-running `polarisd` integration tests. It does prove
+the same kernel/UVM copy primitive used by `polarisd` can preserve bytes across
+RM-backed OFFLOAD and RELOAD.
 
 ## Synthetic Fault Dispatch
 
@@ -334,9 +357,8 @@ blocks. Unlike `--logical-backed-refault`, it does not call
 without `POLARIS_RESERVE_FLAG_DEFER_FAULT`, runs a small executor thread that
 polls `POLARIS_GET_DECISION`, completes the queued `ALLOC` decision with the
 diagnostic RM backing metadata in `POLARIS_COMPLETE_OPERATION`, registers the
-worker mapping, fault-maps through the completed logical backing, verifies that
-`POLARIS_SPILL_BLOCK` rejects this RM-backed resident block with `EOPNOTSUPP`
-without tearing down the observed mapping, unmaps by `block_id`, then refaults:
+worker mapping, fault-maps through the completed logical backing, unmaps by
+`block_id`, then refaults:
 
 ```sh
 sudo tests/m2/m2_static_block_setup --complete-backed-refault
@@ -352,11 +374,8 @@ This closes the kernel ABI gap for daemon/runtime executors to publish
 UVM-bridge-mapable RM backing as part of normal decision completion. It still
 uses a harness-created RM object. `polarisd` now has an opt-in
 `POLARISD_RM_BACKING=1` backend that exercises the same completion ABI with
-daemon-owned RM allocations and releases them on daemon `FREE` decisions, but
-host/device copy for production RM-backed spill/reload is still pending. Until
-that copy path is implemented, `POLARIS_SPILL_BLOCK` intentionally supports
-only legacy CUDA VMM resident blocks with `gpu_phys_handle`; RM-backed
-bridge-resident blocks are rejected before any PTE teardown.
+daemon-owned RM allocations, releases them on daemon `FREE` decisions, and
+uses `POLARIS_RM_COPY` for RM-backed `OFFLOAD` and `RELOAD`.
 
 ## Deferred Completion Fault Diagnostic
 
@@ -402,17 +421,17 @@ Expected success ends with:
 M3 Polaris spill ioctl validation passed.
 ```
 
-Positive spill execution still needs a daemon/runtime-created resident logical
-block. The static RM harness maps a diagnostic RM allocation through UVM, but
-that allocation is not stored as `gpu_phys_handle` in the logical block table,
-so it cannot prove device-to-host copy or RM allocation release.
+Positive RM-backed spill execution is covered by
+`--rm-spill-reload-roundtrip` and by the strict daemon-backed llama.cpp gate.
+The `--spill-validation` mode remains a negative ioctl validation for an
+unresident block.
 
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
-contains an ignored root-only test that uses a fake userspace executor to
-complete `ALLOC`, `OFFLOAD`, and `RELOAD` decisions. It validates that
-`POLARIS_SPILL_BLOCK` queues the expected `OFFLOAD` decision and that a later
-overwrite reserve of the same offloaded block queues `RELOAD`, without
-exercising NVIDIA UVM channel registration.
+contains ignored root-only tests that use fake userspace executors to complete
+legacy `ALLOC`, `OFFLOAD`, and `RELOAD` decisions, plus a real-`polarisd`
+RM-backed `ALLOC`/`FREE` lifetime test. They validate control-plane queueing
+and cleanup without exercising NVIDIA UVM channel registration or the observed
+`gpu_va_space_ptr` required by `POLARIS_RM_COPY`.
 
 The same ignored test file also covers the first M4 COW control-plane slice:
 branching a session increments parent block refcounts, overwrite reserve on

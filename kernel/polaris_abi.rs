@@ -270,13 +270,21 @@ pub struct PolarisRmCopyArg {
     pub user_cpu_addr: u64,
     pub direction: u32,
     pub _pad: u32,
+    // Optional explicit RM tuple. When zero, polaris.ko copies against the
+    // block's currently registered RM backing. A daemon may fill these fields
+    // to copy into freshly allocated RELOAD backing before COMPLETE_OPERATION
+    // makes that backing resident.
+    pub rm_control_fd: i32,
+    pub rm_h_client: u32,
+    pub rm_h_memory: u32,
+    pub _pad2: u32,
     pub page_size: u64,
     pub phys_addr_count: u64,
     pub first_phys_addr: u64,
     pub last_phys_addr: u64,
     pub flags: u64,
     pub bytes_copied: u64,
-    pub _reserved: [u64; 4],
+    pub _reserved: [u64; 2],
 }
 
 #[repr(C)]

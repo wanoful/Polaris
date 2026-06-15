@@ -14,7 +14,12 @@
 
 KDIR          ?= /lib/modules/$(shell uname -r)/build
 CC            ?= cc
-DEFAULT_NVIDIA_KO_DIR := $(abspath $(CURDIR)/third_party/open-gpu-kernel-modules)
+EXTERNAL_NVIDIA_KO_DIR := /home/wano/workspace/open-gpu-kernel-modules
+ifneq (,$(wildcard $(EXTERNAL_NVIDIA_KO_DIR)/kernel-open/Module.symvers))
+    DEFAULT_NVIDIA_KO_DIR := $(EXTERNAL_NVIDIA_KO_DIR)
+else
+    DEFAULT_NVIDIA_KO_DIR := $(abspath $(CURDIR)/third_party/open-gpu-kernel-modules)
+endif
 
 NVIDIA_KO_DIR ?= $(DEFAULT_NVIDIA_KO_DIR)
 
@@ -73,6 +78,7 @@ userspace:
 
 llama-e2e:
 	$(MAKE) -C libpolaris-shim all tests NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)"
+	cargo build -p polarisd
 	NVIDIA_KO_DIR="$(NVIDIA_KO_DIR)" bash tests/llama_cpp/run_llama_shim_e2e.sh
 
 clean:

@@ -163,9 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let rm_backing_enabled = env_enabled("POLARISD_RM_BACKING");
     let mut rm_backend = if rm_backing_enabled {
-        eprintln!(
-            "polarisd: daemon-owned RM backing enabled (POLARISD_RM_BACKING=1); RM-backed spill/reload copies remain unsupported"
-        );
+        eprintln!("polarisd: daemon-owned RM backing enabled (POLARISD_RM_BACKING=1)");
         Some(
             rm::RmBackend::new(info.index as i32)
                 .map_err(|e| format!("RM backing initialization failed: {e}"))?,

@@ -8,8 +8,9 @@
 # 1. A real llama.cpp workload can run on the local POLARIS backend when the
 #    available llama.cpp binary exposes POLARIS0.
 # 2. The LD_PRELOAD shim can bootstrap RM/UVM, register a Polaris VA-space,
-#    route real llama.cpp CUDA KV-cache allocations through Polaris static RM
-#    backing, service GPU replayable faults, and clean up before exit.
+#    route real llama.cpp CUDA KV-cache allocations through daemon-backed
+#    Polaris logical blocks, service GPU replayable faults through polarisd
+#    RM backing, and clean up before exit.
 #
 # Set POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1 to require the shim probe to
 # complete and increase both uvm_hook_calls and uvm_handled.
@@ -18,9 +19,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-/home/wano/workspace/llama.cpp}"
-NVIDIA_KO_DIR="${NVIDIA_KO_DIR:-$ROOT_DIR/third_party/open-gpu-kernel-modules}"
+NVIDIA_KO_DIR="${NVIDIA_KO_DIR:-/home/wano/workspace/open-gpu-kernel-modules}"
 SHIM_SO="${SHIM_SO:-$ROOT_DIR/libpolaris-shim/libpolaris-shim.so}"
 STATS_PATH="${STATS_PATH:-/sys/kernel/polaris/stats}"
+POLARISD_BIN="${POLARISD_BIN:-$ROOT_DIR/target/debug/polarisd}"
 
 die() {
     echo "error: $*" >&2
@@ -129,9 +131,21 @@ device_log="$tmpdir/list-devices.log"
 polaris_log="$tmpdir/llama-polaris-backend.log"
 shim_log="$tmpdir/llama-shim-probe.log"
 managed_shim_log="$tmpdir/llama-shim-managed-probe.log"
+polarisd_log="$tmpdir/polarisd.log"
 stats_before="$tmpdir/stats.before"
 stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
+
+polarisd_pid=""
+
+cleanup() {
+    if [[ -n "$polarisd_pid" ]]; then
+        kill "$polarisd_pid" 2>/dev/null || true
+        wait "$polarisd_pid" 2>/dev/null || true
+        polarisd_pid=""
+    fi
+}
+trap cleanup EXIT
 
 base_args=(
     -m "$LLAMA_CPP_MODEL"
@@ -179,18 +193,38 @@ if [[ "${POLARIS_LLAMA_RUN_SHIM_PROBE:-1}" == "0" ]]; then
     exit 0
 fi
 
+if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
+    require_executable "$POLARISD_BIN" "polarisd binary"
+    note "starting polarisd with daemon-owned RM backing"
+    POLARISD_RM_BACKING=1 "$POLARISD_BIN" >"$polarisd_log" 2>&1 &
+    polarisd_pid=$!
+    for _ in $(seq 1 200); do
+        if ! kill -0 "$polarisd_pid" 2>/dev/null; then
+            tail -n 160 "$polarisd_log" >&2 || true
+            die "polarisd exited during startup; see $polarisd_log"
+        fi
+        if [[ "$(stat_value daemon)" -ge 1 && "$(stat_value gpus)" -ge 1 ]]; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$(stat_value daemon)" -lt 1 || "$(stat_value gpus)" -lt 1 ]]; then
+        tail -n 160 "$polarisd_log" >&2 || true
+        die "polarisd did not register with polaris.ko; see $polarisd_log"
+    fi
+fi
+
 run_shim_probe() {
     local unified_memory="$1"
     local probe_env=(
         GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
         GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}"
         POLARIS_SHIM_BOOTSTRAP_RM_UVM=1
-        POLARIS_SHIM_STATIC_RM_BACKEND=1
         POLARIS_SHIM_STRICT_MANAGED_ALLOC=1
         POLARIS_SHIM_REPORT_STATS=1
         POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}"
         POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}"
-        POLARIS_SHIM_TRANSIENT_GPU=1
+        POLARIS_SHIM_TRANSIENT_GPU="${POLARIS_SHIM_TRANSIENT_GPU:-0}"
         POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}"
         POLARIS_SHIM_CUDA_ORDINAL="${POLARIS_SHIM_CUDA_ORDINAL:-0}"
         POLARIS_SHIM_BLOCK_SIZE="${POLARIS_SHIM_BLOCK_SIZE:-0x200000}"
@@ -217,6 +251,7 @@ verify_shim_probe() {
     local before_errors="$6"
     local expected_selected_key="$7"
     local rc="$8"
+    local before_blocks="$9"
     local after_hook
     local after_handled
     local after_no_pte
@@ -224,15 +259,20 @@ verify_shim_probe() {
     local managed_success
     local strict_failures
     local expected_selected
+    local blocks_before
+    local blocks_after
 
     grep -q '\[polaris-shim\] RM/UVM bootstrap ready' "$log" ||
         die "$label shim did not bootstrap RM/UVM VA-space; see $log"
     grep -q '\[polaris-shim\] registered VA-space' "$log" ||
         die "$label shim did not register the VA-space with polaris.ko; see $log"
-    grep -q '\[polaris-shim\] static RM backend block' "$log" ||
-        die "$label no shim-managed allocation registered static RM backing; see $log"
+    if grep -q '\[polaris-shim\] static RM backend block' "$log"; then
+        die "$label unexpectedly used shim static RM backing; see $log"
+    fi
     grep -q '\[polaris-shim\] managed allocation' "$log" ||
         die "$label no llama.cpp allocation was routed through Polaris; see $log"
+    grep -q 'polarisd: RM ALLOC block' "$polarisd_log" ||
+        die "$label polarisd did not publish daemon-owned RM backing; see $polarisd_log"
 
     after_hook="$(stat_value uvm_hook_calls)"
     after_handled="$(stat_value uvm_handled)"
@@ -288,6 +328,17 @@ verify_shim_probe() {
     if [[ "$after_errors" -gt "$before_errors" ]]; then
         die "$label kernel reported Polaris UVM hook errors ($before_errors -> $after_errors)"
     fi
+    blocks_before="$before_blocks"
+    for _ in $(seq 1 100); do
+        blocks_after="$(stat_value blocks)"
+        if [[ "$blocks_after" -le "$blocks_before" ]]; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$blocks_after" -gt "$blocks_before" ]]; then
+        die "$label leaked Polaris blocks ($blocks_before -> $blocks_after)"
+    fi
 
     note "PASS: $label llama.cpp shim allocation and GPU fault path reached Polaris"
     note "managed_success_calls=$managed_success"
@@ -300,6 +351,7 @@ before_hook_calls="$(stat_value uvm_hook_calls)"
 before_handled="$(stat_value uvm_handled)"
 before_no_pte="$(stat_value uvm_no_pte)"
 before_errors="$(stat_value uvm_errors)"
+before_blocks="$(stat_value blocks)"
 
 note "running LD_PRELOAD shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 set +e
@@ -307,12 +359,13 @@ run_shim_probe "" >"$shim_log" 2>&1
 rc=$?
 set -e
 verify_shim_probe "default" "$shim_log" "$before_hook_calls" "$before_handled" \
-    "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc"
+    "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks"
 
 before_hook_calls="$(stat_value uvm_hook_calls)"
 before_handled="$(stat_value uvm_handled)"
 before_no_pte="$(stat_value uvm_no_pte)"
 before_errors="$(stat_value uvm_errors)"
+before_blocks="$(stat_value blocks)"
 
 note "running LD_PRELOAD unified-memory shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 set +e
@@ -320,7 +373,7 @@ run_shim_probe "1" >"$managed_shim_log" 2>&1
 rc=$?
 set -e
 verify_shim_probe "unified-memory" "$managed_shim_log" "$before_hook_calls" "$before_handled" \
-    "$before_no_pte" "$before_errors" api_runtime_managed_alloc_selected "$rc"
+    "$before_no_pte" "$before_errors" api_runtime_managed_alloc_selected "$rc" "$before_blocks"
 
 cp "$STATS_PATH" "$stats_after"
 note "logs kept in $tmpdir"

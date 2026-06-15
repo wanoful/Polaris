@@ -119,22 +119,21 @@ Each allocation reserves a deferred logical Polaris block, registers a
 `block_id -> worker VA` mapping, and returns the Polaris VA to the worker.
 Pages are still unmapped; the next GPU dereference must fault through UVM and
 be serviced by polaris.ko.
-When `POLARIS_SHIM_STATIC_RM_BACKEND=1` is enabled for the integration-test
-backend, each selected allocation also receives a shim-created RM vidmem
-object. The shim registers that object with both `POLARIS_REGISTER_STATIC_BLOCK`
-and `POLARIS_REGISTER_BLOCK_BACKING`: the static entry preserves the current
-strict llama regression, while the logical backing entry lets the kernel fault
-hook map the registered logical block without relying on the static-block
-table. Real CUDA kernels may fault through CUDA's own UVM-registered VA-space
-rather than the shim-created RM/UVM VA-space; for that case polaris.ko services
-the fault only when a single unambiguous logical block mapping covers the
-faulting GPU/address. This remains test backing, not daemon-backed spill/reload.
-polaris.ko can also store RM backing from successful `POLARIS_COMPLETE_OPERATION`
-replies, which is the production-facing route for daemon/runtime executors.
-`polarisd` can now publish daemon-owned RM allocations behind
-`POLARISD_RM_BACKING=1`, but that backend is currently limited to allocation
-and free ownership. Copy-backed RM spill/reload is still pending, so the shim's
-static RM backend intentionally remains the strict llama integration-test path.
+For the production path, selected allocations are deferred logical blocks: the
+shim does not allocate RM memory and does not register static backing. The first
+GPU fault queues an `ALLOC` decision, `polarisd` publishes daemon-owned RM
+backing through `POLARIS_COMPLETE_OPERATION`, and polaris.ko bridge-maps that
+backing through UVM before returning `HANDLED`. Real CUDA kernels may fault
+through CUDA's own UVM-registered VA-space rather than the shim-created RM/UVM
+VA-space; for that case polaris.ko services the fault only when a single
+unambiguous logical block mapping covers the faulting GPU/address.
+`POLARISD_RM_BACKING=1` also wires daemon-backed `OFFLOAD` and `RELOAD`
+through `POLARIS_RM_COPY`, which copies between daemon-owned RM vidmem and the
+pinned CPU pool using UVM-owned staging and CE. `COW_BREAK` for RM-backed
+blocks is still guarded until an RM-to-RM or staged copy path is integrated.
+`POLARIS_SHIM_STATIC_RM_BACKEND=1` remains available only as a diagnostic
+backend: it allocates shim-owned RM vidmem and registers both
+`POLARIS_REGISTER_STATIC_BLOCK` and `POLARIS_REGISTER_BLOCK_BACKING`.
 Set `POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>` and/or
 `POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>` to restrict which allocation sizes
 are routed through Polaris. Allocations outside that inclusive policy range
@@ -268,15 +267,12 @@ mode implicitly; harness mode should set `POLARIS_SHIM_MANAGE_ALLOCATIONS=1`:
 
 This is not yet the full production shim for llama.cpp: it creates the
 fault-capable RM/UVM VA-space and per-allocation UVM external ranges, but it
-still uses the fixed managed window allocator model and the static RM
-integration-test backend. That backend now also registers logical-block RM
-backing, so the kernel can validate the non-static logical mapping path, but
-the RM object is still allocated by the shim for that regression. The daemon can
-allocate/free RM-backed logical blocks with `POLARISD_RM_BACKING=1`, but
-daemon-backed RM spill/reload copies remain pending. The local M5 regression
-validates llama.cpp's actual KV allocation and kernel-deref path for both
-runtime `cudaMalloc` and runtime `cudaMallocManaged` through the static RM test
-backend.
+still uses a fixed managed-window allocator model. The current M5 regression
+now runs against a real `polarisd` with `POLARISD_RM_BACKING=1`, so llama.cpp
+KV allocations are materialized through daemon-owned RM backing rather than
+the shim's static RM diagnostic backend. Remaining production work is focused
+on workload-appropriate VA/window management, broader stress coverage, and
+RM-backed COW.
 
 ## Why this is not a Cargo crate
 

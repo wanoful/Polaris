@@ -563,6 +563,58 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
         }
     }
 
+    if let Some(materialize) = polaris_find_single_materializable_fault_mapping(
+        gpu_id,
+        fault_address,
+    ) {
+        match polaris_resolve_gpu_fault(
+            gpu_id,
+            materialize.rm_client_token,
+            materialize.va_space_token,
+            fault_address,
+            access_type,
+        ) {
+            Ok(PolarisUvmFaultResult::Handled) => {
+                if let Some(mapping) = polaris_find_logical_fault_mapping(
+                    gpu_id,
+                    materialize.rm_client_token,
+                    materialize.va_space_token,
+                    fault_address,
+                ) {
+                    match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
+                        Ok(()) => {
+                            polaris_note_block_mapping_fault(
+                                gpu_id,
+                                fault_address,
+                                gpu_va_space_ptr,
+                            );
+                            POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                            POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
+                            return UVM_POLARIS_FAULT_HANDLED;
+                        }
+                        Err(()) => {
+                            POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
+                            POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
+                            return UVM_POLARIS_FAULT_ERROR;
+                        }
+                    }
+                }
+                POLARIS_UVM_FAULT_UNSERVICEABLE_MATCHES.fetch_add(1, Relaxed);
+                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
+                return UVM_POLARIS_FAULT_NOT_MINE;
+            }
+            Ok(PolarisUvmFaultResult::NotMine) => {
+                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
+                return UVM_POLARIS_FAULT_NOT_MINE;
+            }
+            Ok(PolarisUvmFaultResult::Error) | Err(_) => {
+                POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
+                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_ERROR, Relaxed);
+                return UVM_POLARIS_FAULT_ERROR;
+            }
+        }
+    }
+
     POLARIS_UVM_FAULT_FAST_MISSES.fetch_add(1, Relaxed);
     POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
     UVM_POLARIS_FAULT_NOT_MINE
@@ -677,6 +729,9 @@ fn polaris_note_block_mapping_fault(
             && fault_address < mapping.base.saturating_add(mapping.length)
         {
             mapping.last_gpu_va_space_ptr = gpu_va_space_ptr;
+            if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == mapping.block_id) {
+                block.copy_gpu_va_space_ptr = gpu_va_space_ptr;
+            }
         }
     }
 }
@@ -703,6 +758,17 @@ struct PolarisRmPhysProbeTarget {
 }
 
 #[derive(Clone, Copy)]
+struct PolarisRmCopyTarget {
+    block_id: u64,
+    gpu_id: u32,
+    gpu_va_space_ptr: u64,
+    rm_control_fd: i32,
+    h_client: u32,
+    h_memory: u32,
+    length: u64,
+}
+
+#[derive(Clone, Copy)]
 struct PolarisFaultMapping {
     base: u64,
     length: u64,
@@ -710,6 +776,12 @@ struct PolarisFaultMapping {
     rm_control_fd: i32,
     h_client: u32,
     h_memory: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PolarisMaterializableFaultMapping {
+    rm_client_token: u64,
+    va_space_token: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -850,6 +922,53 @@ fn polaris_find_single_observed_fault_mapping(
     found
 }
 
+fn polaris_find_single_materializable_fault_mapping(
+    gpu_id: u32,
+    fault_address: u64,
+) -> Option<PolarisMaterializableFaultMapping> {
+    let guard = POLARIS_STATE.lock();
+    let inner = guard.as_ref()?;
+    if inner.daemon_attached == 0 {
+        return None;
+    }
+
+    let mut found: Option<PolarisMaterializableFaultMapping> = None;
+    for mapping in &inner.block_mappings {
+        if mapping.gpu_id != gpu_id
+            || fault_address < mapping.base
+            || fault_address >= mapping.base.saturating_add(mapping.length)
+        {
+            continue;
+        }
+
+        let Some(block) = inner.blocks.iter().find(|b| b.block_id == mapping.block_id) else {
+            continue;
+        };
+        if block.home_gpu != gpu_id
+            || !matches!(
+                block.state,
+                PolarisBlockState::Unmapped
+                    | PolarisBlockState::CpuOffloaded
+                    | PolarisBlockState::CowPending
+            )
+        {
+            continue;
+        }
+
+        let candidate = PolarisMaterializableFaultMapping {
+            rm_client_token: mapping.rm_client_token,
+            va_space_token: mapping.va_space_token,
+        };
+
+        if found.is_some() {
+            return None;
+        }
+        found = Some(candidate);
+    }
+
+    found
+}
+
 fn polaris_forget_static_blocks_for_block(inner: &mut PolarisInner, block_id: u64) -> Result<()> {
     let mut to_forget: KVec<PolarisStaticBlockKey> = KVec::new();
 
@@ -891,6 +1010,36 @@ fn polaris_clear_block_rm_backing(block: &mut PolarisBlock) {
     block.rm_h_memory = 0;
     block.rm_backing_length = 0;
     block.rm_backing_offset = 0;
+}
+
+fn polaris_forget_block_copy_context(block: &mut PolarisBlock) {
+    block.copy_gpu_va_space_ptr = 0;
+}
+
+fn polaris_forget_copy_context_for_vaspace(
+    inner: &mut PolarisInner,
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+) {
+    let mut affected_blocks: KVec<u64> = KVec::new();
+    for mapping in &inner.block_mappings {
+        if mapping.gpu_id == gpu_id
+            && mapping.rm_client_token == rm_client_token
+            && mapping.va_space_token == va_space_token
+            && !affected_blocks.iter().any(|&bid| bid == mapping.block_id)
+        {
+            if affected_blocks.push(mapping.block_id, GFP_KERNEL).is_err() {
+                break;
+            }
+        }
+    }
+
+    for block in &mut inner.blocks {
+        if affected_blocks.iter().any(|&bid| bid == block.block_id) {
+            polaris_forget_block_copy_context(block);
+        }
+    }
 }
 
 fn polaris_block_has_rm_backing(block: &PolarisBlock) -> bool {
@@ -996,7 +1145,7 @@ fn polaris_snapshot_rm_phys_probe_target(
         return Err(ENOENT);
     }
 
-    let mut found_gpu_va_space_ptr = 0u64;
+    let mut found_gpu_va_space_ptr = block.copy_gpu_va_space_ptr;
     for mapping in &inner.block_mappings {
         if mapping.block_id != block_id || mapping.last_gpu_va_space_ptr == 0 {
             continue;
@@ -1012,6 +1161,82 @@ fn polaris_snapshot_rm_phys_probe_target(
     }
 
     Ok(PolarisRmPhysProbeTarget {
+        block_id: block.block_id,
+        gpu_id: block.home_gpu,
+        gpu_va_space_ptr: found_gpu_va_space_ptr,
+        rm_control_fd: block.rm_control_fd,
+        h_client: block.rm_h_client,
+        h_memory: block.rm_h_memory,
+        length: block.rm_backing_length,
+    })
+}
+
+fn polaris_snapshot_rm_copy_target(
+    inner: &PolarisInner,
+    arg: &PolarisRmCopyArg,
+) -> Result<PolarisRmCopyTarget> {
+    let block = inner
+        .blocks
+        .iter()
+        .find(|b| b.block_id == arg.block_id)
+        .ok_or(ENOENT)?;
+
+    let mut found_gpu_va_space_ptr = block.copy_gpu_va_space_ptr;
+    for mapping in &inner.block_mappings {
+        if mapping.block_id != arg.block_id || mapping.last_gpu_va_space_ptr == 0 {
+            continue;
+        }
+        if found_gpu_va_space_ptr != 0 && found_gpu_va_space_ptr != mapping.last_gpu_va_space_ptr {
+            return Err(EBUSY);
+        }
+        found_gpu_va_space_ptr = mapping.last_gpu_va_space_ptr;
+    }
+    if found_gpu_va_space_ptr == 0 {
+        return Err(ENOENT);
+    }
+
+    let explicit_backing =
+        arg.rm_control_fd != 0 || arg.rm_h_client != 0 || arg.rm_h_memory != 0;
+    if explicit_backing {
+        if arg.rm_h_client == 0 || arg.rm_h_memory == 0 {
+            return Err(EINVAL);
+        }
+        if arg.length == 0 {
+            return Err(EINVAL);
+        }
+        if !matches!(
+            block.state,
+            PolarisBlockState::Resident | PolarisBlockState::ReloadPending
+        ) {
+            return Err(ENOENT);
+        }
+        return Ok(PolarisRmCopyTarget {
+            block_id: block.block_id,
+            gpu_id: block.home_gpu,
+            gpu_va_space_ptr: found_gpu_va_space_ptr,
+            rm_control_fd: arg.rm_control_fd,
+            h_client: arg.rm_h_client,
+            h_memory: arg.rm_h_memory,
+            length: arg.length,
+        });
+    }
+
+    let copy_allowed = match arg.direction {
+        POLARIS_RM_COPY_TO_CPU => matches!(
+            block.state,
+            PolarisBlockState::Resident | PolarisBlockState::OffloadPending
+        ),
+        POLARIS_RM_COPY_FROM_CPU => matches!(
+            block.state,
+            PolarisBlockState::Resident | PolarisBlockState::ReloadPending
+        ),
+        _ => false,
+    };
+    if !copy_allowed || !polaris_block_has_rm_backing(block) {
+        return Err(ENOENT);
+    }
+
+    Ok(PolarisRmCopyTarget {
         block_id: block.block_id,
         gpu_id: block.home_gpu,
         gpu_va_space_ptr: found_gpu_va_space_ptr,
@@ -1088,10 +1313,7 @@ fn polaris_queue_offload_decision(inner: &mut PolarisInner, block_idx: usize) ->
     if block.state != PolarisBlockState::Resident {
         return Err(ENOENT);
     }
-    if polaris_block_has_rm_backing(block) && block.gpu_phys_handle == 0 {
-        return Err(polaris_unsupported());
-    }
-    if block.gpu_phys_handle == 0 {
+    if block.gpu_phys_handle == 0 && !polaris_block_has_rm_backing(block) {
         return Err(ENOENT);
     }
 
@@ -1395,6 +1617,7 @@ fn polaris_resolve_gpu_fault(
                             rm_h_memory: 0,
                             rm_backing_length: 0,
                             rm_backing_offset: 0,
+                            copy_gpu_va_space_ptr: 0,
                             cpu_buf_addr: 0,
                             size_bytes: sz,
                             refcount: 1,
@@ -2152,6 +2375,7 @@ impl PinnedDrop for PolarisDevice {
                             block.state = PolarisBlockState::Evicted;
                             block.pending_decision_id = 0;
                             polaris_clear_block_rm_backing(block);
+                            polaris_forget_block_copy_context(block);
                             // Wake any bounded fault waiter.
                             let comp_ptr = block.completion_ptr;
                             block.completion_ptr = core::ptr::null_mut();
@@ -2172,6 +2396,7 @@ impl PinnedDrop for PolarisDevice {
             let v4_client = self.registered_v4_client.load(Relaxed);
             let mut guard = POLARIS_STATE.lock();
             if let Some(inner) = guard.as_mut() {
+                polaris_forget_copy_context_for_vaspace(inner, v4_gpu, v4_client, v4_token);
                 inner.va_spaces.retain(|v| {
                     !(v.gpu_id == v4_gpu
                         && v.rm_client_token == v4_client
@@ -2774,6 +2999,7 @@ impl PolarisDevice {
                         rm_h_memory: 0,
                         rm_backing_length: 0,
                         rm_backing_offset: 0,
+                        copy_gpu_va_space_ptr: 0,
                         cpu_buf_addr: 0,
                         size_bytes,
                         refcount: 1,
@@ -2874,6 +3100,7 @@ impl PolarisDevice {
                 rm_h_memory: 0,
                 rm_backing_length: 0,
                 rm_backing_offset: 0,
+                copy_gpu_va_space_ptr: 0,
                 cpu_buf_addr: 0,
                 size_bytes,
                 refcount: 1,
@@ -3363,6 +3590,7 @@ impl PolarisDevice {
                     );
                     inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                     polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
+                    polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                     inner.blocks[block_idx].pending_decision_id = 0;
                     inner.blocks[block_idx].pending_fault_id = 0;
                     inner.blocks[block_idx].pending_generation = 0;
@@ -3380,6 +3608,7 @@ impl PolarisDevice {
                 }
                 inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                 polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
+                polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                 inner.blocks[block_idx].pending_decision_id = 0;
                 inner.blocks[block_idx].pending_fault_id = 0;
                 inner.blocks[block_idx].pending_generation = 0;
@@ -3393,6 +3622,7 @@ impl PolarisDevice {
                 );
                 inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                 polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
+                polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                 inner.blocks[block_idx].pending_decision_id = 0;
                 inner.blocks[block_idx].pending_fault_id = 0;
                 inner.blocks[block_idx].pending_generation = 0;
@@ -3416,6 +3646,7 @@ impl PolarisDevice {
                     );
                     inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                     polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
+                    polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                     inner.blocks[block_idx].pending_decision_id = 0;
                     inner.blocks[block_idx].pending_fault_id = 0;
                     inner.blocks[block_idx].pending_generation = 0;
@@ -3431,6 +3662,7 @@ impl PolarisDevice {
                 );
                 inner.blocks[block_idx].state = PolarisBlockState::Evicted;
                 polaris_clear_block_rm_backing(&mut inner.blocks[block_idx]);
+                polaris_forget_block_copy_context(&mut inner.blocks[block_idx]);
                 inner.blocks[block_idx].pending_decision_id = 0;
                 inner.blocks[block_idx].pending_fault_id = 0;
                 inner.blocks[block_idx].pending_generation = 0;
@@ -3710,6 +3942,12 @@ impl PolarisDevice {
                 && v.va_space_token == arg.va_space_token
         }).ok_or(ENOENT)?;
         let _ = inner.va_spaces.remove(idx);
+        polaris_forget_copy_context_for_vaspace(
+            inner,
+            arg.gpu_id,
+            arg.rm_client_token,
+            arg.va_space_token,
+        );
         inner.static_blocks.retain(|b| {
             !(b.gpu_id == arg.gpu_id
                 && b.rm_client_token == arg.rm_client_token
@@ -4188,7 +4426,7 @@ impl PolarisDevice {
         let target = {
             let guard = POLARIS_STATE.lock();
             let inner = guard.as_ref().ok_or(ENODEV)?;
-            polaris_snapshot_rm_phys_probe_target(inner, arg.block_id)?
+            polaris_snapshot_rm_copy_target(inner, &arg)?
         };
 
         let query_length = if arg.length == 0 {

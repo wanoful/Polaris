@@ -1,5 +1,8 @@
 use crate::cuda_vmm;
+use crate::decision::ExecutionResult;
 use crate::gpu;
+use crate::rm;
+use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::collections::HashMap;
 
@@ -315,6 +318,217 @@ pub fn execute_reload(
     );
 
     (0, new_phys, 0)
+}
+
+/// Execute RM-backed OFFLOAD:
+///   1. Allocate a CPU pool buffer
+///   2. Copy RM backing -> CPU buffer through the kernel/UVM CE helper
+///   3. Release daemon-owned RM backing
+///   4. Keep the VA reservation for eventual refault/reload
+pub fn execute_rm_offload(
+    fd: i32,
+    dec: &PolarisDecision,
+    gpu: &mut gpu::GpuState,
+    cpu_pool: &mut CpuPool,
+    backend: &mut rm::RmBackend,
+) -> ExecutionResult {
+    let size = snap_up(dec.size_bytes, gpu.granule)
+        .max(gpu.get_va_alloc(dec.block_id).map(|v| v.size).unwrap_or(0));
+    if size == 0 {
+        eprintln!("polarisd: RM OFFLOAD block {} has zero size", dec.block_id);
+        return ExecutionResult {
+            result: -(libc::EINVAL as i32),
+            ..Default::default()
+        };
+    }
+    if !backend.has_block(dec.block_id) {
+        eprintln!("polarisd: RM OFFLOAD block {} has no daemon RM backing", dec.block_id);
+        return ExecutionResult {
+            result: -(libc::ENOENT as i32),
+            ..Default::default()
+        };
+    }
+
+    let cpu_addr = match cpu_pool.allocate(size) {
+        Some(addr) => addr,
+        None => {
+            eprintln!(
+                "polarisd: RM OFFLOAD block {} CPU pool exhausted (used={} total={})",
+                dec.block_id,
+                cpu_pool.used_bytes(),
+                cpu_pool.total
+            );
+            return ExecutionResult {
+                result: -(libc::ENOMEM as i32),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut copy = PolarisRmCopyArg {
+        block_id: dec.block_id,
+        offset: 0,
+        length: size,
+        user_cpu_addr: cpu_addr,
+        direction: POLARIS_RM_COPY_TO_CPU,
+        ..Default::default()
+    };
+    if let Err(errno) = ioctl::rm_copy(fd, &mut copy) {
+        eprintln!(
+            "polarisd: RM OFFLOAD copy block {} failed: errno={errno}",
+            dec.block_id
+        );
+        cpu_pool.free(cpu_addr, size);
+        return ExecutionResult {
+            result: -errno,
+            ..Default::default()
+        };
+    }
+    if copy.bytes_copied != size {
+        eprintln!(
+            "polarisd: RM OFFLOAD short copy block {} bytes=0x{:x} expected=0x{:x}",
+            dec.block_id,
+            copy.bytes_copied,
+            size
+        );
+        cpu_pool.free(cpu_addr, size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    if let Err(e) = backend.free_block(dec.block_id) {
+        eprintln!("polarisd: RM OFFLOAD free RM backing failed for block {}: {e}", dec.block_id);
+        cpu_pool.free(cpu_addr, size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    cpu_pool.track(dec.block_id, cpu_addr);
+    gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
+    gpu.clear_handle(dec.block_id);
+    if let Some(va) = gpu.get_va_alloc(dec.block_id) {
+        gpu.track_va(dec.block_id, va.vaddr, va.size, false);
+    }
+
+    eprintln!(
+        "polarisd: RM OFFLOAD block {} complete: bytes=0x{:x} cpu_buf={cpu_addr:#x} page=0x{:x} flags=0x{:x}",
+        dec.block_id,
+        copy.bytes_copied,
+        copy.page_size,
+        copy.flags
+    );
+
+    ExecutionResult {
+        result: 0,
+        output_cpu_addr: cpu_addr,
+        ..Default::default()
+    }
+}
+
+/// Execute RM-backed RELOAD:
+///   1. Allocate fresh daemon-owned RM backing
+///   2. Copy CPU buffer -> RM backing through the kernel/UVM CE helper
+///   3. Return RM metadata to polaris.ko for bridge mapping on the fault path
+///   4. Release the CPU pool buffer
+pub fn execute_rm_reload(
+    fd: i32,
+    dec: &PolarisDecision,
+    gpu: &mut gpu::GpuState,
+    cpu_pool: &mut CpuPool,
+    backend: &mut rm::RmBackend,
+) -> ExecutionResult {
+    let size = snap_up(dec.size_bytes, gpu.granule)
+        .max(gpu.get_va_alloc(dec.block_id).map(|v| v.size).unwrap_or(0));
+    if size == 0 || dec.cpu_addr == 0 {
+        eprintln!(
+            "polarisd: RM RELOAD block {} invalid size/address size=0x{:x} cpu_addr={:#x}",
+            dec.block_id,
+            size,
+            dec.cpu_addr
+        );
+        return ExecutionResult {
+            result: -(libc::EINVAL as i32),
+            ..Default::default()
+        };
+    }
+
+    let allocation = match backend.alloc_for_block(dec.block_id, size) {
+        Ok(allocation) => allocation,
+        Err(e) => {
+            eprintln!("polarisd: RM RELOAD alloc failed for block {}: {e}", dec.block_id);
+            return ExecutionResult {
+                result: -(libc::ENOMEM as i32),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut copy = PolarisRmCopyArg {
+        block_id: dec.block_id,
+        offset: 0,
+        length: size,
+        user_cpu_addr: dec.cpu_addr,
+        direction: POLARIS_RM_COPY_FROM_CPU,
+        rm_control_fd: backend.rm_control_fd(),
+        rm_h_client: backend.h_client,
+        rm_h_memory: allocation.h_memory,
+        ..Default::default()
+    };
+    if let Err(errno) = ioctl::rm_copy(fd, &mut copy) {
+        eprintln!(
+            "polarisd: RM RELOAD copy block {} failed: errno={errno}",
+            dec.block_id
+        );
+        let _ = backend.free_block(dec.block_id);
+        return ExecutionResult {
+            result: -errno,
+            ..Default::default()
+        };
+    }
+    if copy.bytes_copied != size {
+        eprintln!(
+            "polarisd: RM RELOAD short copy block {} bytes=0x{:x} expected=0x{:x}",
+            dec.block_id,
+            copy.bytes_copied,
+            size
+        );
+        let _ = backend.free_block(dec.block_id);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    cpu_pool.untrack(dec.block_id);
+    cpu_pool.free(dec.cpu_addr, size);
+
+    if let Some(va) = gpu.get_va_alloc(dec.block_id) {
+        gpu.track_va(dec.block_id, va.vaddr, va.size, false);
+    }
+    gpu.used_bytes += size;
+
+    eprintln!(
+        "polarisd: RM RELOAD block {} complete: bytes=0x{:x} hClient=0x{:x} hMemory=0x{:x} page=0x{:x} flags=0x{:x}",
+        dec.block_id,
+        copy.bytes_copied,
+        backend.h_client,
+        allocation.h_memory,
+        copy.page_size,
+        copy.flags
+    );
+
+    ExecutionResult {
+        result: 0,
+        rm_control_fd: backend.rm_control_fd(),
+        rm_h_client: backend.h_client,
+        rm_h_memory: allocation.h_memory,
+        rm_backing_length: allocation.size,
+        ..Default::default()
+    }
 }
 
 fn snap_up(val: u64, align: u64) -> u64 {

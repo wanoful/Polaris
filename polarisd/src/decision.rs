@@ -32,7 +32,7 @@ fn decision_name(op: u32) -> &'static str {
 
 /// Execute a single kernel decision against the real GPU.
 pub fn execute(
-    _fd: c_int,
+    fd: c_int,
     dec: &PolarisDecision,
     gpu: &mut GpuState,
     cpu_pool: &mut CpuPool,
@@ -80,7 +80,7 @@ pub fn execute(
     }
 
     let started = Instant::now();
-    let outcome = dispatch(dec, gpu, cpu_pool, rm_backend);
+    let outcome = dispatch(fd, dec, gpu, cpu_pool, rm_backend);
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if dec.timeout_ms != 0 && elapsed_ms > dec.timeout_ms as u64 {
         eprintln!(
@@ -95,6 +95,7 @@ pub fn execute(
 }
 
 fn dispatch(
+    fd: c_int,
     dec: &PolarisDecision,
     gpu: &mut GpuState,
     cpu_pool: &mut CpuPool,
@@ -336,18 +337,10 @@ fn dispatch(
 
         // ─── OFFLOAD: copy GPU VA→CPU, unmap VA, report CPU buffer addr ──
         x if x == PolarisDecisionOp::Offload as u32 => {
-            if rm_backend
-                .as_ref()
-                .is_some_and(|backend| backend.has_block(dec.block_id) && dec.src_handle == 0)
-            {
-                eprintln!(
-                    "polarisd: OFFLOAD for RM-backed block {} is not wired yet",
-                    dec.block_id
-                );
-                return ExecutionResult {
-                    result: -(libc::EOPNOTSUPP as i32),
-                    ..Default::default()
-                };
+            if let Some(backend) = rm_backend.as_mut() {
+                if backend.has_block(dec.block_id) && dec.src_handle == 0 {
+                    return crate::offload::execute_rm_offload(fd, dec, gpu, cpu_pool, backend);
+                }
             }
             let (res, handle, cpu_addr) = crate::offload::execute_offload(dec, gpu, cpu_pool);
             result = res;
@@ -362,18 +355,10 @@ fn dispatch(
 
         // ─── RELOAD: alloc + map + copy CPU→GPU VA, report new phys handle ──
         x if x == PolarisDecisionOp::Reload as u32 => {
-            if rm_backend
-                .as_ref()
-                .is_some_and(|backend| backend.has_block(dec.block_id))
-            {
-                eprintln!(
-                    "polarisd: RELOAD into RM backing for block {} is not wired yet",
-                    dec.block_id
-                );
-                return ExecutionResult {
-                    result: -(libc::EOPNOTSUPP as i32),
-                    ..Default::default()
-                };
+            if let Some(backend) = rm_backend.as_mut() {
+                if dec.src_handle == 0 {
+                    return crate::offload::execute_rm_reload(fd, dec, gpu, cpu_pool, backend);
+                }
             }
             let (res, handle, cpu_addr) = crate::offload::execute_reload(dec, gpu, cpu_pool);
             result = res;
