@@ -440,6 +440,7 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
               "$(stat_value static_blocks)" == "0" &&
               "$(stat_value block_mappings)" == "0" &&
               "$(stat_value v4_va_spaces)" == "0" &&
+              "$(stat_value v4_worker_pids)" == "0" &&
               "$(stat_value gpus)" == "$baseline_gpu_count" ]]; then
             break
         fi
@@ -453,6 +454,7 @@ if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
           "$(stat_value static_blocks)" != "0" ||
           "$(stat_value block_mappings)" != "0" ||
           "$(stat_value v4_va_spaces)" != "0" ||
+          "$(stat_value v4_worker_pids)" != "0" ||
           "$(stat_value gpus)" != "$baseline_gpu_count" ]]; then
         sed -n '1,140p' "$STATS_PATH" >&2 || true
         die "llama shim cleanup did not return to baseline gpus=$baseline_gpu_count"

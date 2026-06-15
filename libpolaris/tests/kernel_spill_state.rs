@@ -1075,6 +1075,7 @@ fn unregister_vaspace_reaps_only_that_workers_block_mappings() {
     }
 
     assert_stat("v4_va_spaces", 2);
+    assert_stat("v4_worker_pids", 2);
     assert_stat("block_mappings", 2);
 
     let unregister_a = PolarisUnregisterVaSpaceArg {
@@ -1083,12 +1084,21 @@ fn unregister_vaspace_reaps_only_that_workers_block_mappings() {
         va_space_token: vas_a.va_space_token,
         ..Default::default()
     };
+    let err = ioctl::unregister_vaspace(worker_b_fd, &unregister_a)
+        .expect_err("non-owner fd must not unregister another worker's VA-space");
+    assert_eq!(err, libc::EPERM);
+    assert_stat("v4_va_spaces", 2);
+    assert_stat("v4_worker_pids", 2);
+    assert_stat("block_mappings", 2);
+
     ioctl::unregister_vaspace(worker_a_fd, &unregister_a).expect("POLARIS_UNREGISTER_VASPACE A");
     assert_stat("v4_va_spaces", 1);
+    assert_stat("v4_worker_pids", 1);
     assert_stat("block_mappings", 1);
 
     drop(worker_b);
     assert_stat("v4_va_spaces", 0);
+    assert_stat("v4_worker_pids", 0);
     assert_stat("block_mappings", 0);
 
     let destroy = PolarisSessionDestroyArg {

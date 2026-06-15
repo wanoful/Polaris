@@ -137,6 +137,7 @@ assert_clean_kernel_state() {
     wait_for_stat_eq static_blocks 0 "$label cleanup"
     wait_for_stat_eq block_mappings 0 "$label cleanup"
     wait_for_stat_eq v4_va_spaces 0 "$label cleanup"
+    wait_for_stat_eq v4_worker_pids 0 "$label cleanup"
 }
 
 assert_no_gpu_accounting() {
@@ -203,6 +204,7 @@ done
     die "timeout waiting for registered worker holder"
 }
 wait_for_stat_eq v4_va_spaces 1 "registered worker holder"
+wait_for_stat_eq v4_worker_pids 1 "registered worker holder"
 wait_for_stat_eq block_mappings 1 "registered worker holder"
 wait_for_stat_eq static_blocks 0 "static RM guard"
 
@@ -222,6 +224,7 @@ kill "$holder_pid" 2>/dev/null || true
 wait "$holder_pid"
 holder_pid=""
 wait_for_stat_eq v4_va_spaces 0 "registered worker cleanup"
+wait_for_stat_eq v4_worker_pids 0 "registered worker cleanup"
 wait_for_stat_eq block_mappings 0 "registered worker cleanup"
 assert_no_gpu_accounting "registered worker cleanup"
 

@@ -4563,6 +4563,13 @@ impl PolarisDevice {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisUnregisterVaSpaceArg = reader.read()?;
 
+        if self.registered_v4_gpu.load(Relaxed) != arg.gpu_id
+            || self.registered_v4_client.load(Relaxed) != arg.rm_client_token
+            || self.registered_v4_token.load(Relaxed) != arg.va_space_token
+        {
+            return Err(EPERM);
+        }
+
         let mut guard = POLARIS_STATE.lock();
         let inner = guard.as_mut().ok_or(ENODEV)?;
 
@@ -4594,14 +4601,9 @@ impl PolarisDevice {
             arg.rm_client_token,
             arg.va_space_token,
         );
-        if self.registered_v4_gpu.load(Relaxed) == arg.gpu_id
-            && self.registered_v4_client.load(Relaxed) == arg.rm_client_token
-            && self.registered_v4_token.load(Relaxed) == arg.va_space_token
-        {
-            self.registered_v4_gpu.store(0, Relaxed);
-            self.registered_v4_client.store(0, Relaxed);
-            self.registered_v4_token.store(0, Relaxed);
-        }
+        self.registered_v4_gpu.store(0, Relaxed);
+        self.registered_v4_client.store(0, Relaxed);
+        self.registered_v4_token.store(0, Relaxed);
 
         dev_info!(
             self.dev,

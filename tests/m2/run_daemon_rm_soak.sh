@@ -191,6 +191,7 @@ assert_clean_kernel_state() {
     wait_for_stat_eq static_blocks 0 "$label cleanup"
     wait_for_stat_eq block_mappings 0 "$label cleanup"
     wait_for_stat_eq v4_va_spaces 0 "$label cleanup"
+    wait_for_stat_eq v4_worker_pids 0 "$label cleanup"
 }
 
 assert_no_gpu_accounting() {
