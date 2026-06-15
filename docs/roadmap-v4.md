@@ -697,6 +697,18 @@ Still to do on the Polaris side for M1/M2:
   block, and drains daemon `FREE` cleanup. This broadens coverage beyond a
   single block while keeping static RM diagnostic-only; dynamic KV growth,
   fragmentation, and OOM pressure remain broader M6 work.
+- Daemon-backed RM dynamic fragmentation stress wired:
+  `tests/m2/m2_static_block_setup --daemon-rm-dynamic-fragmentation-stress`
+  reserves five deferred logical blocks in one Polaris session, materializes
+  them through real daemon-backed `ALLOC`, writes deterministic bytes into
+  daemon-owned RM backing, releases alternating blocks to create holes, waits
+  for daemon `FREE` cleanup and kernel block removal, regrows those token ranges
+  as fresh deferred blocks, writes new deterministic bytes, spills all live
+  blocks, waits for daemon `OFFLOAD`, reloads/refaults them, verifies byte
+  integrity for survivor and regrown blocks, and checks `pending_decs=0` plus
+  `static_blocks=0`. This covers the first dynamic-growth / fragmentation M6
+  slice on the production daemon-backed RM path; OOM pressure remains separate
+  M6 work because it needs controlled VRAM or host-pool budgeting.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM

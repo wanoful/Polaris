@@ -564,8 +564,42 @@ M6 Polaris daemon-backed RM multi-block stress passed.
 ```
 
 This catches cross-block cleanup and queued decision ordering issues while
-remaining a focused gate. Fragmentation, dynamic KV growth, and OOM pressure
-remain broader M6 work.
+remaining a focused gate. Dynamic growth and fragmentation coverage lives in
+the next daemon-backed gate; OOM pressure remains broader M6 work.
+
+## Daemon-Backed RM Dynamic Fragmentation Stress
+
+This adds a small dynamic-growth and fragmentation gate on top of the same real
+daemon-backed RM path. It still avoids static RM registration, harness-owned
+logical backing, and harness-side decision execution. Start `polarisd` with
+daemon-owned RM backing first:
+
+```sh
+POLARISD_RM_BACKING=1 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-dynamic-fragmentation-stress
+```
+
+The mode registers one UVM external range, reserves five deferred logical
+blocks in one Polaris session, fault-materializes each block through daemon
+`ALLOC`, and writes deterministic bytes into every daemon-owned RM object with
+`POLARIS_RM_COPY`. It then releases alternating blocks to create holes, waits
+for daemon `FREE` cleanup and kernel block removal, regrows those token ranges
+as fresh deferred logical blocks, writes new deterministic bytes into the
+regrown backing, spills all live blocks, waits for daemon `OFFLOAD`, reloads
+them, refaults, and verifies byte integrity for both survivor and regrown
+blocks. The gate also checks that `pending_decs` drains and `static_blocks`
+stays zero.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM dynamic fragmentation stress passed.
+```
+
+This covers the first dynamic-growth / fragmentation slice for the production
+daemon-backed RM path. OOM pressure remains separate M6 work because it needs a
+controlled VRAM or host-pool budget rather than an incidental allocation
+failure.
 
 For non-CUDA control-plane coverage, `libpolaris/tests/kernel_spill_state.rs`
 contains ignored root-only tests that use fake userspace executors to complete

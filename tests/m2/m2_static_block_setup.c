@@ -53,6 +53,7 @@
 #define POLARIS_DAEMON_RM_STRESS_ITERS 4U
 #define POLARIS_DAEMON_RM_MULTI_BLOCKS 3U
 #define POLARIS_DAEMON_RM_MULTI_ITERS 2U
+#define POLARIS_DAEMON_RM_DYNAMIC_BLOCKS 5U
 
 struct polaris_register_gpu_arg {
     uint32_t gpu_id;
@@ -1465,6 +1466,94 @@ static void cleanup_multi_deferred_blocks(struct m2_state *s,
 
     (void)wait_for_sysfs_stat_u64("blocks", 0, "daemon-backed multi BLOCK_RELEASE cleanup");
     (void)wait_for_sysfs_stat_u64("pending_decs", 0, "daemon-backed multi FREE queue drain");
+}
+
+static int reserve_deferred_daemon_block(struct m2_state *s,
+                                         uint32_t gpu_id,
+                                         uint64_t rm_client_token,
+                                         uint64_t va_space_token,
+                                         uint64_t session_id,
+                                         uint64_t base,
+                                         uint32_t token_start,
+                                         struct daemon_rm_stress_block *block,
+                                         const char *what)
+{
+    uint64_t expected_vaddr = base + ((uint64_t)token_start * POLARIS_BLOCK_SIZE);
+    struct polaris_block_reserve_arg reserve = {
+        .session_id = session_id,
+        .token_start = token_start,
+        .token_count = 1,
+        .phase = 2,
+        .flags = POLARIS_RESERVE_FLAG_DEFER_FAULT,
+    };
+
+    if (block == NULL)
+        return -1;
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RESERVE,
+                              &reserve,
+                              what) != 0)
+        return -1;
+    if (reserve.block_id == 0 || reserve.gpu_vaddr != expected_vaddr) {
+        fprintf(stderr,
+                "%s returned block=%llu vaddr=0x%llx expected_vaddr=0x%llx\n",
+                what,
+                (unsigned long long)reserve.block_id,
+                (unsigned long long)reserve.gpu_vaddr,
+                (unsigned long long)expected_vaddr);
+        return -1;
+    }
+
+    struct polaris_register_block_mapping_arg mapping = {
+        .block_id = reserve.block_id,
+        .gpu_id = gpu_id,
+        .rm_client_token = rm_client_token,
+        .va_space_token = va_space_token,
+        .base = reserve.gpu_vaddr,
+        .length = POLARIS_BLOCK_SIZE,
+    };
+
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_REGISTER_BLOCK_MAPPING,
+                              &mapping,
+                              "POLARIS_REGISTER_BLOCK_MAPPING daemon deferred") != 0)
+        return -1;
+
+    block->block_id = reserve.block_id;
+    block->token_start = reserve.token_start;
+    block->token_count = reserve.token_count;
+    block->vaddr = reserve.gpu_vaddr;
+
+    printf("POLARIS registered daemon deferred block: block=%llu token=%u vaddr=0x%llx\n",
+           (unsigned long long)block->block_id,
+           block->token_start,
+           (unsigned long long)block->vaddr);
+    return 0;
+}
+
+static int release_daemon_block(struct m2_state *s,
+                                const struct daemon_rm_stress_block *block,
+                                const char *what)
+{
+    if (block == NULL || block->block_id == 0)
+        return 0;
+
+    struct polaris_block_release_arg release = {
+        .session_id = s->polaris_session_id,
+        .token_start = block->token_start,
+        .token_count = block->token_count,
+    };
+    if (polaris_ioctl_checked(s->polaris_fd,
+                              POLARIS_BLOCK_RELEASE,
+                              &release,
+                              what) != 0)
+        return -1;
+
+    printf("POLARIS released daemon block: block=%llu token=%u\n",
+           (unsigned long long)block->block_id,
+           block->token_start);
+    return 0;
 }
 
 static int get_block_state(struct m2_state *s,
@@ -2991,6 +3080,300 @@ out:
     return rc;
 }
 
+static int daemon_rm_dynamic_fragmentation_stress(struct m2_state *s,
+                                                  uint32_t gpu_id,
+                                                  uint64_t rm_client_token,
+                                                  uint64_t va_space_token,
+                                                  uint64_t session_id,
+                                                  uint64_t base,
+                                                  struct daemon_rm_stress_block *blocks,
+                                                  uint32_t block_count)
+{
+    uint8_t *src = NULL;
+    uint8_t *dst = NULL;
+    const uint64_t seed = 0x44594e4652414731ULL;
+    bool live[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
+    uint64_t expected_seeds[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
+    uint64_t released_block_ids[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
+    int rc = -1;
+
+    if (block_count != POLARIS_DAEMON_RM_DYNAMIC_BLOCKS) {
+        fprintf(stderr,
+                "daemon dynamic fragmentation stress requires %u blocks, got %u\n",
+                POLARIS_DAEMON_RM_DYNAMIC_BLOCKS,
+                block_count);
+        return -1;
+    }
+
+    if (posix_memalign((void **)&src, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon dynamic src failed\n");
+        goto out;
+    }
+    if (posix_memalign((void **)&dst, 4096, POLARIS_BLOCK_SIZE) != 0) {
+        fprintf(stderr, "posix_memalign daemon dynamic dst failed\n");
+        goto out;
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+            goto out;
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 blocks[block_idx].token_start,
+                                 blocks[block_idx].token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon dynamic initial ALLOC",
+                                 NULL) != 0)
+            goto out;
+
+        expected_seeds[block_idx] = seed ^
+            ((uint64_t)(block_idx + 1) * 0x9e3779b97f4a7c15ULL);
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            src[i] = rm_copy_roundtrip_pattern(expected_seeds[block_idx], i);
+            dst[i] = 0;
+        }
+
+        struct polaris_rm_copy_arg write_initial = {
+            .block_id = blocks[block_idx].block_id,
+            .length = POLARIS_BLOCK_SIZE,
+            .user_cpu_addr = (uint64_t)(uintptr_t)src,
+            .direction = POLARIS_RM_COPY_FROM_CPU,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_RM_COPY,
+                                  &write_initial,
+                                  "POLARIS_RM_COPY daemon dynamic initial FROM_CPU") != 0)
+            goto out;
+        if (write_initial.bytes_copied != POLARIS_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "daemon dynamic initial write bytes=0x%llx expected=0x%llx block=%u\n",
+                    (unsigned long long)write_initial.bytes_copied,
+                    (unsigned long long)POLARIS_BLOCK_SIZE,
+                    block_idx);
+            goto out;
+        }
+        live[block_idx] = true;
+    }
+
+    for (uint32_t block_idx = 1; block_idx < block_count; block_idx += 2) {
+        uint64_t old_block_id = blocks[block_idx].block_id;
+        uint64_t blocks_before = 0;
+
+        if (read_sysfs_stat_u64("blocks", &blocks_before) != 0 || blocks_before == 0)
+            goto out;
+
+        if (release_daemon_block(s,
+                                 &blocks[block_idx],
+                                 "POLARIS_BLOCK_RELEASE daemon dynamic hole") != 0)
+            goto out;
+        live[block_idx] = false;
+        released_block_ids[block_idx] = old_block_id;
+        blocks[block_idx].block_id = 0;
+        if (wait_for_sysfs_stat_u64("blocks",
+                                    blocks_before - 1,
+                                    "daemon dynamic hole block removal") != 0)
+            goto out;
+        if (wait_for_sysfs_stat_u64("pending_decs",
+                                    0,
+                                    "daemon dynamic hole FREE queue drain") != 0)
+            goto out;
+    }
+
+    for (uint32_t block_idx = 1; block_idx < block_count; block_idx += 2) {
+        struct daemon_rm_stress_block regrown = {0};
+
+        if (reserve_deferred_daemon_block(s,
+                                          gpu_id,
+                                          rm_client_token,
+                                          va_space_token,
+                                          session_id,
+                                          base,
+                                          block_idx,
+                                          &regrown,
+                                          "POLARIS_BLOCK_RESERVE daemon dynamic regrow") != 0)
+            goto out;
+        if (regrown.block_id == released_block_ids[block_idx]) {
+            fprintf(stderr,
+                    "daemon dynamic regrow[%u] reused released block id %llu\n",
+                    block_idx,
+                    (unsigned long long)regrown.block_id);
+            goto out;
+        }
+
+        blocks[block_idx] = regrown;
+        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+            goto out;
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 blocks[block_idx].token_start,
+                                 blocks[block_idx].token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon dynamic regrow ALLOC",
+                                 NULL) != 0)
+            goto out;
+
+        expected_seeds[block_idx] = seed ^
+            ((uint64_t)(block_idx + 1) * 0xbf58476d1ce4e5b9ULL);
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            src[i] = rm_copy_roundtrip_pattern(expected_seeds[block_idx], i);
+            dst[i] = 0;
+        }
+
+        struct polaris_rm_copy_arg write_regrown = {
+            .block_id = blocks[block_idx].block_id,
+            .length = POLARIS_BLOCK_SIZE,
+            .user_cpu_addr = (uint64_t)(uintptr_t)src,
+            .direction = POLARIS_RM_COPY_FROM_CPU,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_RM_COPY,
+                                  &write_regrown,
+                                  "POLARIS_RM_COPY daemon dynamic regrow FROM_CPU") != 0)
+            goto out;
+        if (write_regrown.bytes_copied != POLARIS_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "daemon dynamic regrow write bytes=0x%llx expected=0x%llx block=%u\n",
+                    (unsigned long long)write_regrown.bytes_copied,
+                    (unsigned long long)POLARIS_BLOCK_SIZE,
+                    block_idx);
+            goto out;
+        }
+        live[block_idx] = true;
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        struct polaris_spill_block_arg spill = {
+            .block_id = blocks[block_idx].block_id,
+        };
+
+        if (!live[block_idx])
+            continue;
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_SPILL_BLOCK,
+                                  &spill,
+                                  "POLARIS_SPILL_BLOCK daemon dynamic") != 0)
+            goto out;
+        if (spill.decision_id == 0) {
+            fprintf(stderr,
+                    "POLARIS_SPILL_BLOCK did not queue daemon dynamic OFFLOAD for block=%u\n",
+                    block_idx);
+            goto out;
+        }
+        printf("POLARIS daemon RM dynamic spill block_index=%u block=%llu decision=%llu unmapped=%u\n",
+               block_idx,
+               (unsigned long long)blocks[block_idx].block_id,
+               (unsigned long long)spill.decision_id,
+               spill.unmapped_count);
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        if (!live[block_idx])
+            continue;
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 blocks[block_idx].token_start,
+                                 blocks[block_idx].token_count,
+                                 POLARIS_BLOCK_STATE_CPU_OFFLOADED,
+                                 "daemon dynamic OFFLOAD completion",
+                                 NULL) != 0)
+            goto out;
+    }
+
+    for (uint32_t block_idx = 0; block_idx < block_count; ++block_idx) {
+        if (!live[block_idx])
+            continue;
+
+        struct polaris_block_reserve_arg reserve = {
+            .session_id = session_id,
+            .token_start = blocks[block_idx].token_start,
+            .token_count = blocks[block_idx].token_count,
+            .phase = 2,
+            .flags = POLARIS_RESERVE_FLAG_OVERWRITE,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_BLOCK_RESERVE,
+                                  &reserve,
+                                  "POLARIS_BLOCK_RESERVE daemon dynamic reload") != 0)
+            goto out;
+        if (reserve.block_id != blocks[block_idx].block_id ||
+            reserve.gpu_vaddr != blocks[block_idx].vaddr) {
+            fprintf(stderr,
+                    "daemon dynamic reload returned block=%llu vaddr=0x%llx expected block=%llu vaddr=0x%llx\n",
+                    (unsigned long long)reserve.block_id,
+                    (unsigned long long)reserve.gpu_vaddr,
+                    (unsigned long long)blocks[block_idx].block_id,
+                    (unsigned long long)blocks[block_idx].vaddr);
+            goto out;
+        }
+        if (wait_for_block_state(s,
+                                 session_id,
+                                 blocks[block_idx].token_start,
+                                 blocks[block_idx].token_count,
+                                 POLARIS_BLOCK_STATE_RESIDENT,
+                                 "daemon dynamic RELOAD completion",
+                                 NULL) != 0)
+            goto out;
+        if (dispatch_test_fault(s, blocks[block_idx].vaddr) != 0)
+            goto out;
+
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            src[i] = rm_copy_roundtrip_pattern(expected_seeds[block_idx], i);
+            dst[i] = 0;
+        }
+
+        struct polaris_rm_copy_arg read_back = {
+            .block_id = blocks[block_idx].block_id,
+            .length = POLARIS_BLOCK_SIZE,
+            .user_cpu_addr = (uint64_t)(uintptr_t)dst,
+            .direction = POLARIS_RM_COPY_TO_CPU,
+        };
+        if (polaris_ioctl_checked(s->polaris_fd,
+                                  POLARIS_RM_COPY,
+                                  &read_back,
+                                  "POLARIS_RM_COPY daemon dynamic TO_CPU") != 0)
+            goto out;
+        if (read_back.bytes_copied != POLARIS_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "daemon dynamic read bytes=0x%llx expected=0x%llx block=%u\n",
+                    (unsigned long long)read_back.bytes_copied,
+                    (unsigned long long)POLARIS_BLOCK_SIZE,
+                    block_idx);
+            goto out;
+        }
+
+        for (uint64_t i = 0; i < POLARIS_BLOCK_SIZE; ++i) {
+            if (dst[i] != src[i]) {
+                fprintf(stderr,
+                        "daemon dynamic mismatch block=%u at 0x%llx: expected=0x%x actual=0x%x\n",
+                        block_idx,
+                        (unsigned long long)i,
+                        src[i],
+                        dst[i]);
+                goto out;
+            }
+        }
+    }
+
+    if (wait_for_sysfs_stat_u64("pending_decs",
+                                0,
+                                "daemon dynamic decision drain") != 0)
+        goto out;
+    if (wait_for_sysfs_stat_u64("static_blocks",
+                                0,
+                                "daemon dynamic static-block guard") != 0)
+        goto out;
+
+    printf("POLARIS daemon RM dynamic fragmentation stress complete: blocks=%u bytes_per_block=0x%llx\n",
+           block_count,
+           (unsigned long long)POLARIS_BLOCK_SIZE);
+    rc = 0;
+
+out:
+    free(dst);
+    free(src);
+    return rc;
+}
+
 static int rm_cow_roundtrip(struct m2_state *s,
                             uint32_t gpu_id,
                             uint64_t rm_client_token,
@@ -3460,10 +3843,11 @@ int main(int argc, char **argv)
     bool daemon_rm_spill_reload_roundtrip_mode = false;
     bool daemon_rm_spill_reload_stress_mode = false;
     bool daemon_rm_multi_block_stress_mode = false;
+    bool daemon_rm_dynamic_fragmentation_stress_mode = false;
     bool rm_cow_roundtrip_mode = false;
     bool daemon_rm_cow_roundtrip_mode = false;
     uint64_t block_id = 0;
-    struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_MULTI_BLOCKS] = {0};
+    struct daemon_rm_stress_block daemon_multi_blocks[POLARIS_DAEMON_RM_DYNAMIC_BLOCKS] = {0};
     bool daemon_multi_blocks_setup = false;
     struct m2_state s = {
         .ctl_fd = -1,
@@ -3542,6 +3926,10 @@ int main(int argc, char **argv)
             daemon_rm_multi_block_stress_mode = true;
             continue;
         }
+        if (strcmp(argv[i], "--daemon-rm-dynamic-fragmentation-stress") == 0) {
+            daemon_rm_dynamic_fragmentation_stress_mode = true;
+            continue;
+        }
         if (strcmp(argv[i], "--daemon-rm-cow-roundtrip") == 0) {
             dispatch_fault = true;
             deferred_complete_fault = true;
@@ -3591,7 +3979,7 @@ int main(int argc, char **argv)
                 break;
             default:
                 fprintf(stderr,
-                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
+                        "usage: %s [--dispatch-fault|--unmap-refault|--block-unmap-refault|--logical-backed-refault|--rm-phys-probe|--rm-copy-probe|--rm-copy-roundtrip|--rm-spill-reload-roundtrip|--daemon-rm-spill-reload-roundtrip|--daemon-rm-spill-reload-stress|--daemon-rm-multi-block-stress|--daemon-rm-dynamic-fragmentation-stress|--rm-cow-roundtrip|--daemon-rm-cow-roundtrip|--complete-backed-refault|--deferred-complete-fault|--spill-validation|--cuda-copy-probe|--rm-cpu-map-probe] [cuda_ordinal] [polaris_gpu_id] [base]\n",
                         argv[0]);
                 goto out;
         }
@@ -3614,17 +4002,22 @@ int main(int argc, char **argv)
                  !daemon_rm_spill_reload_roundtrip_mode &&
                      !daemon_rm_spill_reload_stress_mode &&
                      !daemon_rm_multi_block_stress_mode &&
+                     !daemon_rm_dynamic_fragmentation_stress_mode &&
                      !daemon_rm_cow_roundtrip_mode) != 0)
         goto out;
-    uint64_t managed_length = daemon_rm_multi_block_stress_mode
-        ? ((uint64_t)POLARIS_DAEMON_RM_MULTI_BLOCKS * POLARIS_BLOCK_SIZE)
+    uint64_t managed_length = (daemon_rm_multi_block_stress_mode ||
+                               daemon_rm_dynamic_fragmentation_stress_mode)
+        ? ((uint64_t)(daemon_rm_dynamic_fragmentation_stress_mode
+                          ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
+                          : POLARIS_DAEMON_RM_MULTI_BLOCKS) * POLARIS_BLOCK_SIZE)
         : ((rm_cow_roundtrip_mode || daemon_rm_cow_roundtrip_mode)
                ? (2 * POLARIS_MANAGED_SIZE)
                : POLARIS_MANAGED_SIZE);
     if (setup_uvm(&s,
                   base,
                   managed_length,
-                  !dispatch_fault && !daemon_rm_multi_block_stress_mode) != 0)
+                  !dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+                      !daemon_rm_dynamic_fragmentation_stress_mode) != 0)
         goto out;
     polaris_va_space_token = s.h_vaspace;
     if (probe_uvm_dispatch_key(&s,
@@ -3641,9 +4034,14 @@ int main(int argc, char **argv)
                       managed_length,
                       !logical_backed_refault && !complete_backed_refault &&
                           !deferred_complete_fault &&
-                          !daemon_rm_multi_block_stress_mode) != 0)
+                          !daemon_rm_multi_block_stress_mode &&
+                          !daemon_rm_dynamic_fragmentation_stress_mode) != 0)
         goto out;
-    if (daemon_rm_multi_block_stress_mode) {
+    if (daemon_rm_multi_block_stress_mode || daemon_rm_dynamic_fragmentation_stress_mode) {
+        uint32_t daemon_block_count = daemon_rm_dynamic_fragmentation_stress_mode
+            ? POLARIS_DAEMON_RM_DYNAMIC_BLOCKS
+            : POLARIS_DAEMON_RM_MULTI_BLOCKS;
+
         if (setup_multi_deferred_blocks(&s,
                                         polaris_gpu_id,
                                         polaris_rm_client_token,
@@ -3651,19 +4049,31 @@ int main(int argc, char **argv)
                                         base,
                                         managed_length,
                                         daemon_multi_blocks,
-                                        POLARIS_DAEMON_RM_MULTI_BLOCKS,
+                                        daemon_block_count,
                                         &s.polaris_session_id) != 0)
             goto out;
         daemon_multi_blocks_setup = true;
-        if (daemon_rm_multi_block_stress(&s,
-                                         s.polaris_session_id,
-                                         daemon_multi_blocks,
-                                         POLARIS_DAEMON_RM_MULTI_BLOCKS,
-                                         POLARIS_DAEMON_RM_MULTI_ITERS) != 0)
-            goto out;
+        if (daemon_rm_dynamic_fragmentation_stress_mode) {
+            if (daemon_rm_dynamic_fragmentation_stress(&s,
+                                                       polaris_gpu_id,
+                                                       polaris_rm_client_token,
+                                                       polaris_va_space_token,
+                                                       s.polaris_session_id,
+                                                       base,
+                                                       daemon_multi_blocks,
+                                                       daemon_block_count) != 0)
+                goto out;
+        } else {
+            if (daemon_rm_multi_block_stress(&s,
+                                             s.polaris_session_id,
+                                             daemon_multi_blocks,
+                                             daemon_block_count,
+                                             POLARIS_DAEMON_RM_MULTI_ITERS) != 0)
+                goto out;
+        }
         cleanup_multi_deferred_blocks(&s,
                                       daemon_multi_blocks,
-                                      POLARIS_DAEMON_RM_MULTI_BLOCKS);
+                                      daemon_block_count);
         daemon_multi_blocks_setup = false;
     }
     if (complete_backed_refault ||
@@ -3861,6 +4271,8 @@ int main(int argc, char **argv)
         puts("M6 Polaris daemon-backed RM spill/reload stress passed.");
     else if (daemon_rm_multi_block_stress_mode)
         puts("M6 Polaris daemon-backed RM multi-block stress passed.");
+    else if (daemon_rm_dynamic_fragmentation_stress_mode)
+        puts("M6 Polaris daemon-backed RM dynamic fragmentation stress passed.");
     else if (rm_spill_reload_roundtrip_mode)
         puts("M3 Polaris RM spill/reload roundtrip passed.");
     else if (deferred_complete_fault)
@@ -3877,7 +4289,8 @@ int main(int argc, char **argv)
         puts("M2 Polaris unmap/refault test passed.");
     else
         puts(dispatch_fault ? "M2 Polaris fault-dispatch test passed." : "M2 static-block setup passed.");
-    if (!dispatch_fault && !daemon_rm_multi_block_stress_mode)
+    if (!dispatch_fault && !daemon_rm_multi_block_stress_mode &&
+        !daemon_rm_dynamic_fragmentation_stress_mode)
         puts("Next step: add an RM GPFIFO channel bound to this VA-space and submit a write to the unmapped block.");
     rc = 0;
 
@@ -3885,7 +4298,7 @@ out:
     if (daemon_multi_blocks_setup) {
         cleanup_multi_deferred_blocks(&s,
                                       daemon_multi_blocks,
-                                      POLARIS_DAEMON_RM_MULTI_BLOCKS);
+                                      POLARIS_DAEMON_RM_DYNAMIC_BLOCKS);
         daemon_multi_blocks_setup = false;
     }
     if (completion_executor_started)
