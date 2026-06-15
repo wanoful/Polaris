@@ -38,7 +38,14 @@ use polaris_types::*;
 enum PolarisUvmFaultResult {
     NotMine,
     Handled,
+    Queued,
     Error,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PolarisFaultResolveMode {
+    ProcessWait,
+    UvmHook,
 }
 
 #[repr(C)]
@@ -493,6 +500,7 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                 va_space_token,
                 fault_address,
                 access_type,
+                PolarisFaultResolveMode::UvmHook,
             ) {
                 Ok(PolarisUvmFaultResult::Handled) => {
                     if let Some(mapping) = polaris_find_logical_fault_mapping(
@@ -526,6 +534,11 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                 Ok(PolarisUvmFaultResult::NotMine) => {
                     POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
                     return UVM_POLARIS_FAULT_NOT_MINE;
+                }
+                Ok(PolarisUvmFaultResult::Queued) => {
+                    POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                    POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
+                    return UVM_POLARIS_FAULT_HANDLED;
                 }
                 Ok(PolarisUvmFaultResult::Error) | Err(_) => {
                     POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
@@ -573,6 +586,7 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             materialize.va_space_token,
             fault_address,
             access_type,
+            PolarisFaultResolveMode::UvmHook,
         ) {
             Ok(PolarisUvmFaultResult::Handled) => {
                 if let Some(mapping) = polaris_find_logical_fault_mapping(
@@ -606,6 +620,11 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             Ok(PolarisUvmFaultResult::NotMine) => {
                 POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_NOT_MINE, Relaxed);
                 return UVM_POLARIS_FAULT_NOT_MINE;
+            }
+            Ok(PolarisUvmFaultResult::Queued) => {
+                POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                POLARIS_UVM_LAST_RESULT.store(UVM_POLARIS_FAULT_HANDLED, Relaxed);
+                return UVM_POLARIS_FAULT_HANDLED;
             }
             Ok(PolarisUvmFaultResult::Error) | Err(_) => {
                 POLARIS_UVM_FAULT_ERRORS.fetch_add(1, Relaxed);
@@ -1404,60 +1423,69 @@ fn polaris_queue_free_decision(inner: &mut PolarisInner, block_idx: usize) -> Re
     Ok(decision_id)
 }
 
-fn polaris_schedule_budget_victim(
+fn polaris_schedule_post_residency_budget_victims(
     inner: &mut PolarisInner,
     requesting_session_id: u64,
     target_gpu: u32,
-    needed_bytes: u64,
-    protected_phys_handle: u64,
     protected_block_id: u64,
-) -> Result<()> {
-    if needed_bytes == 0 {
-        return Ok(());
-    }
-
-    let (used_bytes, budget_bytes, cpu_pool_used, cpu_pool_total) = {
-        let gpu = inner.gpus.iter().find(|g| g.gpu_id == target_gpu).ok_or(ENODEV)?;
-        (
+) {
+    let (used_bytes, budget_bytes, cpu_pool_used, cpu_pool_total) = match inner
+        .gpus
+        .iter()
+        .find(|g| g.gpu_id == target_gpu)
+    {
+        Some(gpu) => (
             gpu.used_bytes,
             gpu.budget_bytes,
             gpu.cpu_pool_used_bytes,
             gpu.cpu_pool_total_bytes,
-        )
+        ),
+        None => return,
     };
 
-    if budget_bytes == 0 || used_bytes.saturating_add(needed_bytes) <= budget_bytes {
-        return Ok(());
+    if budget_bytes == 0 || used_bytes <= budget_bytes {
+        return;
     }
 
-    let deficit = used_bytes.saturating_add(needed_bytes).saturating_sub(budget_bytes);
-    let Some((victim_idx, _victim_id, victim_size, _victim_gpu)) =
-        polaris_policy::select_victim(
-            inner,
-            requesting_session_id,
-            target_gpu,
-            protected_phys_handle,
-            protected_block_id,
-        )
-    else {
-        return Err(ENOMEM);
-    };
-
-    // Keep the first production scheduler slice deliberately simple: one
-    // policy-selected victim must satisfy the deficit. Multi-victim planning
-    // belongs in the resident-set scheduler.
-    if victim_size < deficit {
-        return Err(ENOMEM);
-    }
-    if cpu_pool_used.saturating_add(victim_size) > cpu_pool_total {
-        return Err(ENOMEM);
-    }
-    if inner.pending_decisions.len().saturating_add(2) > POLARIS_MAX_PENDING_DECISIONS {
-        return Err(ENOMEM);
+    let mut cpu_pool_reserved = cpu_pool_used;
+    for block in inner.blocks.iter() {
+        if block.home_gpu == target_gpu && block.state == PolarisBlockState::OffloadPending {
+            cpu_pool_reserved = cpu_pool_reserved.saturating_add(block.size_bytes);
+        }
     }
 
-    polaris_queue_offload_decision(inner, victim_idx)?;
-    Ok(())
+    let mut deficit = used_bytes.saturating_sub(budget_bytes);
+    while deficit > 0 {
+        if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+            return;
+        }
+
+        let Some((victim_idx, _victim_id, victim_size, _victim_gpu)) =
+            polaris_policy::select_victim(
+                inner,
+                requesting_session_id,
+                target_gpu,
+                0,
+                protected_block_id,
+            )
+        else {
+            return;
+        };
+
+        if victim_size == 0 {
+            return;
+        }
+        if cpu_pool_reserved.saturating_add(victim_size) > cpu_pool_total {
+            return;
+        }
+
+        if polaris_queue_offload_decision(inner, victim_idx).is_err() {
+            return;
+        }
+
+        cpu_pool_reserved = cpu_pool_reserved.saturating_add(victim_size);
+        deficit = deficit.saturating_sub(victim_size);
+    }
 }
 
 fn polaris_current_pid() -> i32 {
@@ -1518,6 +1546,7 @@ fn polaris_resolve_gpu_fault(
     va_space_token: u64,
     fault_address: u64,
     access_type: u32,
+    mode: PolarisFaultResolveMode,
 ) -> Result<PolarisUvmFaultResult> {
     let mut guard = POLARIS_STATE.lock();
     let inner = guard.as_mut().ok_or(ENODEV)?;
@@ -1732,38 +1761,23 @@ fn polaris_resolve_gpu_fault(
     let fault_id = inner.next_fault_id;
     inner.next_fault_id += 1;
     let generation = inner.fault_generation;
-    let op = match inner.blocks[block_idx].state {
+    let block_state = inner.blocks[block_idx].state;
+    let op = match block_state {
         PolarisBlockState::Unmapped => PolarisDecisionOp::Alloc,
         PolarisBlockState::CpuOffloaded => PolarisDecisionOp::Reload,
         PolarisBlockState::CowPending => PolarisDecisionOp::CowBreak,
         PolarisBlockState::Resident => PolarisDecisionOp::MapExisting,
-        _ => PolarisDecisionOp::Alloc,
+        PolarisBlockState::AllocPending
+        | PolarisBlockState::ReloadPending
+        | PolarisBlockState::OffloadPending
+        | PolarisBlockState::FreePending => {
+            if mode == PolarisFaultResolveMode::UvmHook {
+                return Ok(PolarisUvmFaultResult::Queued);
+            }
+            return Ok(PolarisUvmFaultResult::Error);
+        }
+        PolarisBlockState::Evicted => return Ok(PolarisUvmFaultResult::Error),
     };
-    if matches!(
-        op,
-        PolarisDecisionOp::Alloc | PolarisDecisionOp::Reload | PolarisDecisionOp::CowBreak
-    ) {
-        let requesting_session_id = inner.blocks[block_idx].session_id;
-        let needed_bytes = inner.blocks[block_idx].size_bytes;
-        let protected_phys_handle = if op == PolarisDecisionOp::CowBreak {
-            inner.blocks[block_idx].cow_src_handle
-        } else {
-            0
-        };
-        let protected_block_id = if op == PolarisDecisionOp::CowBreak {
-            inner.blocks[block_idx].cow_src_block_id
-        } else {
-            0
-        };
-        polaris_schedule_budget_victim(
-            inner,
-            requesting_session_id,
-            gpu_id,
-            needed_bytes,
-            protected_phys_handle,
-            protected_block_id,
-        )?;
-    }
     let decision_id = inner.next_decision_id;
     inner.next_decision_id += 1;
     let (
@@ -1820,6 +1834,9 @@ fn polaris_resolve_gpu_fault(
         },
         GFP_KERNEL,
     )?;
+
+    let should_wait = mode == PolarisFaultResolveMode::ProcessWait
+        || !matches!(op, PolarisDecisionOp::Reload);
     inner.pending_decisions.push(
         PolarisDecision {
             decision_id,
@@ -1850,6 +1867,11 @@ fn polaris_resolve_gpu_fault(
         },
         GFP_KERNEL,
     )?;
+
+    if !should_wait {
+        return Ok(PolarisUvmFaultResult::Queued);
+    }
+
     let mut comp: bindings::completion = unsafe { core::mem::zeroed() };
     unsafe { bindings::init_completion(&raw mut comp); }
     inner.blocks[block_idx].completion_ptr = &raw mut comp;
@@ -3108,6 +3130,7 @@ impl PolarisDevice {
                     0,
                     gpu_vaddr,
                     1, // write fault for COW break
+                    PolarisFaultResolveMode::ProcessWait,
                 )?;
                 if fault_result != PolarisUvmFaultResult::Handled {
                     return Err(EIO);
@@ -3136,6 +3159,7 @@ impl PolarisDevice {
                     0,
                     resolve_vaddr,
                     0,
+                    PolarisFaultResolveMode::ProcessWait,
                 )?;
                 if fault_result != PolarisUvmFaultResult::Handled {
                     return Err(EIO);
@@ -3212,6 +3236,7 @@ impl PolarisDevice {
             0,
             gpu_vaddr,
             0,
+            PolarisFaultResolveMode::ProcessWait,
         )?;
         if fault_result != PolarisUvmFaultResult::Handled {
             return Err(EIO);
@@ -3317,8 +3342,10 @@ impl PolarisDevice {
             va_space_token,
             fault_address,
             access_type,
+            PolarisFaultResolveMode::ProcessWait,
         )? {
             PolarisUvmFaultResult::Handled => Ok(0),
+            PolarisUvmFaultResult::Queued => Err(EAGAIN),
             PolarisUvmFaultResult::NotMine => Err(ENOENT),
             PolarisUvmFaultResult::Error => Err(EIO),
         }
@@ -3501,6 +3528,8 @@ impl PolarisDevice {
             let sz;
             let comp_ptr: *mut bindings::completion;
             let was_cpu_offloaded: bool;
+            let completed_session_id: u64;
+            let completed_block_id: u64;
             {
                 let block = &mut inner.blocks[block_idx];
                 block.retry_count = 0;
@@ -3511,6 +3540,8 @@ impl PolarisDevice {
                 gpu_id = block.home_gpu;
                 sz = block.size_bytes;
                 was_cpu_offloaded = block.cpu_buf_addr != 0;
+                completed_session_id = block.session_id;
+                completed_block_id = block.block_id;
                 match block.state {
                     PolarisBlockState::AllocPending => {
                         block.state = PolarisBlockState::Resident;
@@ -3599,6 +3630,20 @@ impl PolarisDevice {
                     should_remove = true;
                 }
                 _ => {}
+            }
+
+            if matches!(
+                prev_state,
+                PolarisBlockState::AllocPending
+                    | PolarisBlockState::ReloadPending
+                    | PolarisBlockState::CowPending
+            ) {
+                polaris_schedule_post_residency_budget_victims(
+                    inner,
+                    completed_session_id,
+                    gpu_id,
+                    completed_block_id,
+                );
             }
 
             if should_remove {

@@ -632,15 +632,25 @@ Still to do on the Polaris side for M1/M2:
   session-destroy cleanup.
 - Deferred logical-block materialization wired: when the UVM hook sees a
   registered logical block mapping with no RM backing yet, it can enter the
-  existing bounded `ALLOC`/`RELOAD` decision path, wait for userspace to
-  complete the operation with RM backing metadata, and bridge-map the same
-  fault before returning `HANDLED`. The M2
+  existing bounded `ALLOC` decision path, wait for userspace to complete the
+  operation with RM backing metadata, and bridge-map the same fault before
+  returning `HANDLED`. The M2
   `--deferred-complete-fault` diagnostic reserves a block with
   `DEFER_FAULT`, registers only the worker mapping, completes the first
   synthetic fault through `POLARIS_COMPLETE_OPERATION`, and verifies
   unmap/refault still uses the completed logical backing. This closes the
   kernel-side gap between the shim's deferred allocation shape and the
   completion-backed RM residency contract.
+- UVM-hook reload hardening wired: when a replayable UVM fault hits a
+  `CpuOffloaded` daemon-backed RM block, polaris.ko now queues one real daemon
+  `RELOAD` decision and returns `HANDLED`/retry instead of waiting inside the
+  hook for the daemon copy/allocation to finish. Replayed faults that arrive
+  while the block is already `ReloadPending` / `AllocPending` /
+  `OffloadPending` / `FreePending` are also treated as queued rather than
+  enqueueing duplicate decisions or reporting a fatal error. Process-context
+  synthetic fault paths still use the bounded wait mode. The production reload
+  remains real daemon-backed RM allocation plus `POLARIS_RM_COPY`; static RM is
+  still diagnostic/integration-only.
 - Real CUDA-kernel compatibility slice wired: exact UVM hook lookup remains
   keyed by `(gpu_id, rm_client_token, va_space_token)`, but when a real
   runtime CUDA kernel faults on a Polaris VA from CUDA's own registered
@@ -742,8 +752,23 @@ Still to do on the Polaris side for M1/M2:
   `uvm_last_map_ret` is unchanged so the bridge was not the failure source, and
   cleans up with `blocks=0`, `pending_decs=0`, `static_blocks=0`, and
   `block_mappings=0`. This covers the VRAM/RM allocation side of the M6 OOM
-  requirement with deterministic RM allocation pressure; broader near-capacity
-  fragmentation soak remains useful.
+  requirement with deterministic RM allocation pressure.
+- Daemon-backed RM near-capacity soak wired and verified on 2026-06-15:
+  `tests/m2/m2_static_block_setup --daemon-rm-near-capacity-soak` runs against
+  a real `polarisd` started with
+  `POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304`, reserves four
+  deferred 2 MiB logical blocks in one Polaris session, materializes them
+  through daemon-backed `ALLOC`, writes deterministic bytes with
+  `POLARIS_RM_COPY`, and verifies the two-block/4 MiB resident-set cap via
+  `resident=2`, `gpu_used_mib=4`, and `offloaded=2`. The reload/refault phase
+  exercises the async UVM-hook reload path: the first fault on a CPU-offloaded
+  block queues daemon `RELOAD` and returns handled for replay, the harness waits
+  for daemon completion to publish fresh RM backing, and a second refault maps
+  the daemon-owned backing before byte-integrity verification. Cleanup checks
+  `pending_decs=0`, `blocks=0`, and `static_blocks=0`. Local validation used
+  the patched NVIDIA module, real `polaris.ko`, and real daemon-backed
+  `polarisd`; daemon logs showed real `RM ALLOC` / `RM OFFLOAD` / `RM RELOAD` /
+  `RM FREE` operations with no timeout or stale-completion lines.
 - Focused daemon-backed RM COW gate wired:
   `tests/m2/m2_static_block_setup --daemon-rm-cow-roundtrip` requires the same
   real daemon-backed RM path, reserves a deferred parent block without static RM
@@ -767,8 +792,10 @@ Still to do on the Polaris side for M1/M2:
   triggers synchronous fault resolution when the block is not resident,
   so `CpuOffloaded` blocks queue `RELOAD` instead of returning an unmapped
   VA.
-- Reload on fault: re-allocate RM device memory, copy host → device, call
-  bridge, return HANDLED.
+- Reload on fault: process-context callers still wait for fresh RM backing,
+  copy host → device, bridge-map, and return `HANDLED`; UVM-hook callers queue
+  daemon `RELOAD`, return `HANDLED` for replay, and map on a later refault once
+  daemon-published backing is resident.
 - Single-worker microbenchmark: register external range larger than the
   block pool, drive a deref pattern that forces spill/reload, validate
   data integrity.
@@ -1028,8 +1055,9 @@ Still to do on the Polaris side for M1/M2:
   no-source-change KV-only llama.cpp path through daemon-published RM backing
   without static RM registration for the strict gate.
 - Remaining production shim work: replace the fixed managed-window reservation
-  model with workload-appropriate VA management, add longer near-capacity
-  daemon-backed soak coverage, and document or disable CUDA Graph interactions.
+  model with workload-appropriate VA management, extend long-duration
+  daemon-backed soak coverage beyond the focused near-capacity gate, and
+  document or disable CUDA Graph interactions.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening
@@ -1050,7 +1078,9 @@ Still to do on the Polaris side for M1/M2:
 - Stress: dynamic KV growth, fragmentation pressure, OOM behavior on
   both VRAM (RM alloc fails) and host pinned pool sides. The host pinned-pool
   side and the RM allocation-failure side now have deterministic daemon-backed
-  gates; broader near-capacity fragmentation soak remains useful.
+  gates, and the focused near-capacity daemon-backed RM soak covers resident-set
+  budget pressure plus async UVM-hook reload/refault behavior. Longer duration
+  soak and module-unload stress remain useful before M7.
 
 ### M7: PyTorch / vLLM integration
 

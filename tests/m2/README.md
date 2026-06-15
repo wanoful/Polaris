@@ -598,7 +598,44 @@ M6 Polaris daemon-backed RM dynamic fragmentation stress passed.
 
 This covers the first dynamic-growth / fragmentation slice for the production
 daemon-backed RM path. The host-pool and RM allocation OOM sides live in the
-next daemon-backed gates.
+next daemon-backed gates. Near-capacity resident-set pressure lives in the
+focused soak gate below.
+
+## Daemon-Backed RM Near-Capacity Soak
+
+This validates budget-pressure spill/reload behavior on the production-shaped
+daemon RM path. It still avoids static RM registration, harness-owned logical
+backing, and harness-side decision execution. Start `polarisd` with
+daemon-owned RM backing and a two-block GPU budget:
+
+```sh
+POLARISD_RM_BACKING=1 POLARISD_GPU_BUDGET_BYTES=4194304 target/debug/polarisd
+sudo tests/m2/m2_static_block_setup --daemon-rm-near-capacity-soak
+```
+
+The mode reserves four deferred 2 MiB logical blocks in one Polaris session,
+fault-materializes each block through daemon `ALLOC`, and writes deterministic
+bytes into daemon-owned RM backing with `POLARIS_RM_COPY`. With a 4 MiB budget,
+the gate requires the kernel/daemon path to hold the resident set at two blocks:
+`resident=2`, `gpu_used_mib=4`, and `offloaded=2`, while `static_blocks` stays
+zero.
+
+The reload phase intentionally exercises the UVM-hook async reload behavior. If
+a block is `CpuOffloaded`, the first synthetic fault queues a real daemon
+`RELOAD` and returns handled for replay; the harness waits for the block to
+become `Resident`, then dispatches a second fault to map the daemon-published RM
+backing and verifies byte integrity with `POLARIS_RM_COPY_TO_CPU`. Cleanup
+releases all blocks through daemon `FREE` and checks the decision queue drains.
+
+Expected success ends with:
+
+```text
+M6 Polaris daemon-backed RM near-capacity soak passed.
+```
+
+Passing this gate proves the focused near-capacity resident-set cap and
+reload/refault path on the live daemon-backed RM route without static RM or fake
+test errors.
 
 ## Daemon-Backed RM Host-Pool OOM Pressure
 
