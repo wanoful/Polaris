@@ -84,6 +84,11 @@ sudo env \
   bash tests/llama_cpp/run_llama_shim_e2e.sh
 ```
 
+For a longer opt-in KV pressure probe, add
+`POLARIS_LLAMA_RUN_SUSTAINED_PRESSURE_PROBE=1`. It uses larger
+`llama-bench` prompt/generation/repetition defaults while keeping the same
+KV-only shim contract.
+
 Run the daemon-backed RM soak:
 
 ```sh

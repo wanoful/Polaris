@@ -220,3 +220,12 @@ the CPU pool into the shim-registered transient GPU, runs a real CUDA
 allocator with VA management that is aware of llama.cpp KV lifecycle events
 such as context growth, context shift, prompt cache reuse, and long-running
 server churn.
+
+Set `POLARIS_LLAMA_RUN_SUSTAINED_PRESSURE_PROBE=1` to add a longer version of
+the same KV-only pressure gate. By default it runs the pressure probe with
+`POLARIS_LLAMA_SUSTAINED_PROMPT_TOKENS=256`,
+`POLARIS_LLAMA_SUSTAINED_GEN_TOKENS=32`, and
+`POLARIS_LLAMA_SUSTAINED_REPETITIONS=2`; override those values to scale the
+run up or down for local hardware. The gate still selects only ggml KV-scope
+allocations and still requires daemon-backed offload/reload plus stable UVM
+error counters.

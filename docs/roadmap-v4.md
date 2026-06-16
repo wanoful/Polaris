@@ -1125,6 +1125,14 @@ Still to do on the Polaris side for M1/M2:
   `uvm_no_pte` and `uvm_errors` stable. Local validation with the SmolLM2 model
   observed `offloads: 34 -> 45`, `reloads: 28 -> 37`, and bridge maps
   `calls 2644 -> 2838` / `ok 2594 -> 2785`.
+- Sustained llama.cpp KV pressure gate added and validated on 2026-06-16:
+  `POLARIS_LLAMA_RUN_SUSTAINED_PRESSURE_PROBE=1` reuses the same KV-only
+  daemon-backed pressure machinery with a longer `llama-bench` profile
+  (`POLARIS_LLAMA_SUSTAINED_PROMPT_TOKENS`, `POLARIS_LLAMA_SUSTAINED_GEN_TOKENS`,
+  `POLARIS_LLAMA_SUSTAINED_REPETITIONS`) so short smoke coverage and longer
+  local pressure coverage share one verification path. Local SmolLM2 validation
+  observed `offloads: 12 -> 206`, `reloads: 10 -> 202`, and bridge maps
+  `calls 930 -> 5903` / `ok 912 -> 5882`.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed

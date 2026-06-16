@@ -151,8 +151,10 @@ shim_log="$tmpdir/llama-shim-probe.log"
 managed_shim_log="$tmpdir/llama-shim-managed-probe.log"
 dynamic_shim_log="$tmpdir/llama-shim-dynamic-window.log"
 pressure_shim_log="$tmpdir/llama-shim-pressure.log"
+sustained_shim_log="$tmpdir/llama-shim-sustained-pressure.log"
 polarisd_log="$tmpdir/polarisd.log"
 pressure_polarisd_log="$tmpdir/polarisd-pressure.log"
+sustained_polarisd_log="$tmpdir/polarisd-sustained-pressure.log"
 stats_before="$tmpdir/stats.before"
 stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
@@ -222,22 +224,35 @@ start_polarisd() {
     fi
 }
 
-base_args=(
-    -m "$LLAMA_CPP_MODEL"
-    -p "${LLAMA_CPP_PROMPT_TOKENS:-32}"
-    -n "${LLAMA_CPP_GEN_TOKENS:-4}"
-    -r "${LLAMA_CPP_REPETITIONS:-1}"
-    --no-warmup
-    -ngl "${LLAMA_CPP_GPU_LAYERS:-999}"
-    -fa 0
-    -o json
-)
+build_llama_args() {
+    local -n out_args="$1"
+    local prompt_tokens="$2"
+    local gen_tokens="$3"
+    local repetitions="$4"
 
-if [[ -n "${LLAMA_CPP_EXTRA_ARGS:-}" ]]; then
-    # shellcheck disable=SC2206
-    extra_args=( ${LLAMA_CPP_EXTRA_ARGS} )
-    base_args+=( "${extra_args[@]}" )
-fi
+    out_args=(
+        -m "$LLAMA_CPP_MODEL"
+        -p "$prompt_tokens"
+        -n "$gen_tokens"
+        -r "$repetitions"
+        --no-warmup
+        -ngl "${LLAMA_CPP_GPU_LAYERS:-999}"
+        -fa 0
+        -o json
+    )
+
+    if [[ -n "${LLAMA_CPP_EXTRA_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206
+        extra_args=( ${LLAMA_CPP_EXTRA_ARGS} )
+        out_args+=( "${extra_args[@]}" )
+    fi
+}
+
+base_args=()
+build_llama_args base_args \
+    "${LLAMA_CPP_PROMPT_TOKENS:-32}" \
+    "${LLAMA_CPP_GEN_TOKENS:-4}" \
+    "${LLAMA_CPP_REPETITIONS:-1}"
 
 note "llama.cpp binary: $LLAMA_CPP_BIN"
 note "model: $LLAMA_CPP_MODEL"
@@ -276,6 +291,8 @@ run_shim_probe() {
     local unified_memory="$1"
     local dynamic_window="${2:-0}"
     local pressure="${3:-0}"
+    local workload_profile="${4:-default}"
+    local llama_args=()
     local probe_env=(
         GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
         GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}"
@@ -313,8 +330,23 @@ run_shim_probe() {
         probe_env+=(GGML_CUDA_ENABLE_UNIFIED_MEMORY=1)
     fi
 
+    case "$workload_profile" in
+        default)
+            llama_args=( "${base_args[@]}" )
+            ;;
+        sustained)
+            build_llama_args llama_args \
+                "${POLARIS_LLAMA_SUSTAINED_PROMPT_TOKENS:-256}" \
+                "${POLARIS_LLAMA_SUSTAINED_GEN_TOKENS:-32}" \
+                "${POLARIS_LLAMA_SUSTAINED_REPETITIONS:-2}"
+            ;;
+        *)
+            die "unknown llama workload profile: $workload_profile"
+            ;;
+    esac
+
     env "${probe_env[@]}" \
-        "$LLAMA_CPP_BIN" "${base_args[@]}" -dev "${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+        "$LLAMA_CPP_BIN" "${llama_args[@]}" -dev "${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
 }
 
 verify_shim_probe() {
@@ -442,6 +474,98 @@ verify_shim_probe() {
     note "uvm_handled:    $before_handled -> $after_handled"
 }
 
+run_pressure_gate() {
+    local label="$1"
+    local workload_profile="$2"
+    local shim_log_path="$3"
+    local daemon_log_path="$4"
+    local budget_bytes="$5"
+    local cpu_pool_bytes="$6"
+    local min_offloads="$7"
+    local min_reloads="$8"
+    local before_hook_calls
+    local before_handled
+    local before_no_pte
+    local before_errors
+    local before_blocks
+    local before_offloads
+    local before_reloads
+    local before_bridge_calls
+    local before_bridge_ok
+    local after_offloads
+    local after_reloads
+    local after_bridge_calls
+    local after_bridge_ok
+    local after_no_pte
+    local after_errors
+    local offload_delta
+    local reload_delta
+    local rc
+
+    if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" != "1" ]]; then
+        die "pressure probes require POLARIS_LLAMA_START_POLARISD=1"
+    fi
+
+    stop_polarisd
+    wait_for_kernel_cleanup "pre-$label"
+    start_polarisd "$label budget" "$daemon_log_path" \
+        POLARISD_GPU_BUDGET_BYTES="$budget_bytes" \
+        POLARISD_CPU_POOL_BYTES="$cpu_pool_bytes"
+
+    before_hook_calls="$(stat_value uvm_hook_calls)"
+    before_handled="$(stat_value uvm_handled)"
+    before_no_pte="$(stat_value uvm_no_pte)"
+    before_errors="$(stat_value uvm_errors)"
+    before_blocks="$(stat_value blocks)"
+    before_offloads="$(stat_value offloads)"
+    before_reloads="$(stat_value reloads)"
+    before_bridge_calls="$(stat_value uvm_bridge_map_calls)"
+    before_bridge_ok="$(stat_value uvm_bridge_map_ok)"
+
+    note "running LD_PRELOAD $label shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+    set +e
+    run_shim_probe "" "0" "1" "$workload_profile" >"$shim_log_path" 2>&1
+    rc=$?
+    set -e
+    verify_shim_probe "$label" "$shim_log_path" "$before_hook_calls" "$before_handled" \
+        "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 0
+
+    after_offloads="$(stat_value offloads)"
+    after_reloads="$(stat_value reloads)"
+    after_bridge_calls="$(stat_value uvm_bridge_map_calls)"
+    after_bridge_ok="$(stat_value uvm_bridge_map_ok)"
+    after_no_pte="$(stat_value uvm_no_pte)"
+    after_errors="$(stat_value uvm_errors)"
+    offload_delta=$((after_offloads - before_offloads))
+    reload_delta=$((after_reloads - before_reloads))
+
+    if [[ "$offload_delta" -lt "$min_offloads" ]]; then
+        tail -n 200 "$daemon_log_path" >&2 || true
+        die "$label probe did not increase offloads enough ($before_offloads -> $after_offloads, need +$min_offloads)"
+    fi
+    if [[ "$reload_delta" -lt "$min_reloads" ]]; then
+        tail -n 200 "$daemon_log_path" >&2 || true
+        die "$label probe did not increase reloads enough ($before_reloads -> $after_reloads, need +$min_reloads)"
+    fi
+    if [[ "$after_bridge_calls" -le "$before_bridge_calls" ||
+          "$after_bridge_ok" -le "$before_bridge_ok" ]]; then
+        die "$label probe did not increase bridge map telemetry: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
+    fi
+    if [[ "$after_no_pte" -gt "$before_no_pte" ||
+          "$after_errors" -gt "$before_errors" ]]; then
+        die "$label probe reported UVM faults/errors: no_pte $before_no_pte -> $after_no_pte errors $before_errors -> $after_errors"
+    fi
+    grep -q 'polarisd: RM OFFLOAD block' "$daemon_log_path" ||
+        die "$label probe did not log daemon RM OFFLOAD; see $daemon_log_path"
+    grep -q 'polarisd: RM RELOAD block' "$daemon_log_path" ||
+        die "$label probe did not log daemon RM RELOAD; see $daemon_log_path"
+
+    note "PASS: $label llama.cpp shim probe exercised daemon KV offload/reload"
+    note "offloads: $before_offloads -> $after_offloads"
+    note "reloads:  $before_reloads -> $after_reloads"
+    note "bridge maps: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
+}
+
 before_hook_calls="$(stat_value uvm_hook_calls)"
 before_handled="$(stat_value uvm_handled)"
 before_no_pte="$(stat_value uvm_no_pte)"
@@ -487,69 +611,27 @@ if [[ "${POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE:-0}" == "1" ]]; then
 fi
 
 if [[ "${POLARIS_LLAMA_RUN_PRESSURE_PROBE:-0}" == "1" ]]; then
-    if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" != "1" ]]; then
-        die "POLARIS_LLAMA_RUN_PRESSURE_PROBE=1 requires POLARIS_LLAMA_START_POLARISD=1"
-    fi
+    run_pressure_gate \
+        "pressure" \
+        "default" \
+        "$pressure_shim_log" \
+        "$pressure_polarisd_log" \
+        "${POLARIS_LLAMA_PRESSURE_BUDGET_BYTES:-4194304}" \
+        "${POLARIS_LLAMA_PRESSURE_CPU_POOL_BYTES:-4294967296}" \
+        "${POLARIS_LLAMA_PRESSURE_MIN_OFFLOADS:-1}" \
+        "${POLARIS_LLAMA_PRESSURE_MIN_RELOADS:-1}"
+fi
 
-    pressure_budget="${POLARIS_LLAMA_PRESSURE_BUDGET_BYTES:-4194304}"
-    pressure_cpu_pool="${POLARIS_LLAMA_PRESSURE_CPU_POOL_BYTES:-4294967296}"
-
-    stop_polarisd
-    wait_for_kernel_cleanup "pre-pressure"
-    start_polarisd "pressure budget" "$pressure_polarisd_log" \
-        POLARISD_GPU_BUDGET_BYTES="$pressure_budget" \
-        POLARISD_CPU_POOL_BYTES="$pressure_cpu_pool"
-
-    before_hook_calls="$(stat_value uvm_hook_calls)"
-    before_handled="$(stat_value uvm_handled)"
-    before_no_pte="$(stat_value uvm_no_pte)"
-    before_errors="$(stat_value uvm_errors)"
-    before_blocks="$(stat_value blocks)"
-    before_offloads="$(stat_value offloads)"
-    before_reloads="$(stat_value reloads)"
-    before_bridge_calls="$(stat_value uvm_bridge_map_calls)"
-    before_bridge_ok="$(stat_value uvm_bridge_map_ok)"
-
-    note "running LD_PRELOAD pressure shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
-    set +e
-    run_shim_probe "" "0" "1" >"$pressure_shim_log" 2>&1
-    rc=$?
-    set -e
-    verify_shim_probe "pressure" "$pressure_shim_log" "$before_hook_calls" "$before_handled" \
-        "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 0
-
-    after_offloads="$(stat_value offloads)"
-    after_reloads="$(stat_value reloads)"
-    after_bridge_calls="$(stat_value uvm_bridge_map_calls)"
-    after_bridge_ok="$(stat_value uvm_bridge_map_ok)"
-    after_no_pte="$(stat_value uvm_no_pte)"
-    after_errors="$(stat_value uvm_errors)"
-
-    if [[ "$after_offloads" -le "$before_offloads" ]]; then
-        tail -n 200 "$pressure_polarisd_log" >&2 || true
-        die "pressure probe did not increase offloads ($before_offloads -> $after_offloads)"
-    fi
-    if [[ "$after_reloads" -le "$before_reloads" ]]; then
-        tail -n 200 "$pressure_polarisd_log" >&2 || true
-        die "pressure probe did not increase reloads ($before_reloads -> $after_reloads)"
-    fi
-    if [[ "$after_bridge_calls" -le "$before_bridge_calls" ||
-          "$after_bridge_ok" -le "$before_bridge_ok" ]]; then
-        die "pressure probe did not increase bridge map telemetry: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
-    fi
-    if [[ "$after_no_pte" -gt "$before_no_pte" ||
-          "$after_errors" -gt "$before_errors" ]]; then
-        die "pressure probe reported UVM faults/errors: no_pte $before_no_pte -> $after_no_pte errors $before_errors -> $after_errors"
-    fi
-    grep -q 'polarisd: RM OFFLOAD block' "$pressure_polarisd_log" ||
-        die "pressure probe did not log daemon RM OFFLOAD; see $pressure_polarisd_log"
-    grep -q 'polarisd: RM RELOAD block' "$pressure_polarisd_log" ||
-        die "pressure probe did not log daemon RM RELOAD; see $pressure_polarisd_log"
-
-    note "PASS: pressure llama.cpp shim probe exercised daemon KV offload/reload"
-    note "offloads: $before_offloads -> $after_offloads"
-    note "reloads:  $before_reloads -> $after_reloads"
-    note "bridge maps: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
+if [[ "${POLARIS_LLAMA_RUN_SUSTAINED_PRESSURE_PROBE:-0}" == "1" ]]; then
+    run_pressure_gate \
+        "sustained-pressure" \
+        "sustained" \
+        "$sustained_shim_log" \
+        "$sustained_polarisd_log" \
+        "${POLARIS_LLAMA_SUSTAINED_PRESSURE_BUDGET_BYTES:-${POLARIS_LLAMA_PRESSURE_BUDGET_BYTES:-4194304}}" \
+        "${POLARIS_LLAMA_SUSTAINED_PRESSURE_CPU_POOL_BYTES:-${POLARIS_LLAMA_PRESSURE_CPU_POOL_BYTES:-4294967296}}" \
+        "${POLARIS_LLAMA_SUSTAINED_MIN_OFFLOADS:-1}" \
+        "${POLARIS_LLAMA_SUSTAINED_MIN_RELOADS:-1}"
 fi
 
 if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
