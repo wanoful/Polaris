@@ -161,3 +161,20 @@ Recorded real-model results:
 - `benchmarks/reports/framework-kv-real-model-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-trend-20260616.md`
+
+Regenerate a cross-engine report from existing artifacts:
+
+```sh
+python3 benchmarks/scripts/generate_framework_comparison_report.py \
+  --title "llama.cpp + POLARIS vs Original Framework Trend - 2026-06-16" \
+  --llama-run 128/32:benchmarks/results/llama_cpp/llama-polaris-128x32-20260616T1325Z \
+  --llama-run 512/128:benchmarks/results/llama_cpp/llama-polaris-512x128-r3-20260616T1336Z \
+  --llama-run 1024/128:benchmarks/results/llama_cpp/llama-polaris-1024x128-r3-20260616T1340Z \
+  --framework-run 128/32:vllm:benchmarks/results/frameworks/original-vllm-clean-128x32-20260616T1327Z \
+  --framework-run 128/32:sglang:benchmarks/results/frameworks/original-128x32-20260616T1324Z \
+  --framework-run 512/128:vllm:benchmarks/results/frameworks/original-512x128-r3-20260616T1334Z \
+  --framework-run 512/128:sglang:benchmarks/results/frameworks/original-512x128-r3-20260616T1334Z \
+  --framework-run 1024/128:vllm:benchmarks/results/frameworks/original-1024x128-r3-20260616T1338Z \
+  --framework-run 1024/128:sglang:benchmarks/results/frameworks/original-1024x128-r3-20260616T1338Z \
+  --output /tmp/polaris-framework-comparison.md
+```
