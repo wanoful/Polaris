@@ -1171,7 +1171,20 @@ Still to do on the Polaris side for M1/M2:
   model with workload-appropriate VA reclamation/rebalancing for long-running
   server churn, and, if needed for performance, explicitly validate and enable
   CUDA PDL launch behavior with live Polaris allocations.
-- Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
+- Initial llama.cpp/POLARIS KV benchmark harness wired:
+  `benchmarks/scripts/run_llama_kv_bench.sh` runs `native_cuda`,
+  `polaris_no_pressure`, `polaris_pressure`, and `polaris_sustained_pressure`
+  modes over a prompt/generation matrix, captures raw `llama-bench` JSON,
+  `/sys/kernel/polaris/stats` before/after snapshots, and derived fault,
+  bridge-map, offload, and reload deltas into `runs.jsonl`. It also writes a
+  compact `summary.md` table for quick inspection. A local smoke run with
+  prompt=32/gen=4 verified native CUDA and POLARIS pressure records, including
+  nonzero daemon-backed offload/reload and bridge-map deltas.
+- vLLM/SGLang comparison support is currently KV allocator trace-level:
+  `benchmarks/scripts/kv_trace_summary.py` consumes the existing trace patch
+  CSV format and reports logical reservation, release, peak-live-block, token,
+  and session metrics. This is the honest comparison layer until M7 adds live
+  POLARIS KV allocator backends for those frameworks.
 
 ### M6: Hardening
 

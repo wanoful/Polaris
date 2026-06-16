@@ -103,13 +103,26 @@ sudo -E make m6-module-unload-stress \
   NVIDIA_KO_DIR=../open-gpu-kernel-modules
 ```
 
+Run the initial llama.cpp / POLARIS KV benchmark harness:
+
+```sh
+sudo env \
+  NVIDIA_KO_DIR=../open-gpu-kernel-modules \
+  LLAMA_CPP_DIR=../llama.cpp \
+  POLARIS_BENCH_PROMPTS=128,512 \
+  POLARIS_BENCH_GENS=32 \
+  POLARIS_BENCH_MODES=native_cuda,polaris_no_pressure,polaris_pressure \
+  benchmarks/scripts/run_llama_kv_bench.sh
+```
+
 ## Status
 
 The v4 codebase has the UVM hook, fault-capable VA-space registration,
 external-range bridge mapping, daemon-owned RM backing, RM-backed
 spill/reload, overwrite COW, llama.cpp KV-only shim selection, per-chunk KV
 residency inside a contiguous llama.cpp allocation, an opt-in real llama.cpp
-pressure gate, and focused M6 stress gates wired.
+pressure gate, focused M6 stress gates, and an initial llama.cpp/POLARIS KV
+benchmark harness wired.
 
 Still open:
 
@@ -119,7 +132,9 @@ Still open:
   grow/shrink allocator.
 - Permission-based write-fault COW for shared KV pages.
 - PyTorch/vLLM allocator backend integration.
-- Benchmark automation and vLLM/SGLang comparison results.
+- Full benchmark matrix results and live vLLM/SGLang POLARIS allocator
+  backends. Current vLLM/SGLang comparison support is KV allocator trace
+  summarization, not live POLARIS execution.
 
 ## Documentation
 
@@ -128,5 +143,7 @@ Still open:
 - [integrations/llama.cpp/README.md](integrations/llama.cpp/README.md):
   llama.cpp KV-only integration details.
 - [tests/m2/README.md](tests/m2/README.md): staged UVM/RM bridge diagnostics.
+- [benchmarks/README.md](benchmarks/README.md): llama.cpp/POLARIS benchmark
+  harness and vLLM/SGLang KV trace comparison entry points.
 - [docs/fault-driven-analysis.md](docs/fault-driven-analysis.md): historical
   analysis showing why raw CUDA VMM holes were abandoned.
