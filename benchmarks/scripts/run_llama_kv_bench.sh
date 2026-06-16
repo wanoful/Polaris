@@ -256,7 +256,10 @@ def load_llama(path):
     text = Path(path).read_text()
     if not text.strip():
         return []
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return []
 
 before_s = parse_stats(before)
 after_s = parse_stats(after)
@@ -294,6 +297,20 @@ print(json.dumps(record, sort_keys=True))
 PY
 }
 
+run_bench_command() {
+    local stdout_json="$1"
+    local stderr_log="$2"
+    shift 2
+    local timeout_sec="${POLARIS_BENCH_RUN_TIMEOUT_SEC:-0}"
+    local kill_after_sec="${POLARIS_BENCH_RUN_TIMEOUT_KILL_AFTER_SEC:-30}"
+
+    if [[ "$timeout_sec" != "0" && -n "$timeout_sec" ]]; then
+        timeout --kill-after="${kill_after_sec}s" "${timeout_sec}s" "$@" >"$stdout_json" 2>"$stderr_log"
+    else
+        "$@" >"$stdout_json" 2>"$stderr_log"
+    fi
+}
+
 run_one() {
     local mode="$1"
     local prompt_tokens="$2"
@@ -318,7 +335,7 @@ run_one() {
     case "$mode" in
         native_cuda)
             set +e
-            "$LLAMA_CPP_BIN" "${args[@]}" >"$stdout_json" 2>"$stderr_log"
+            run_bench_command "$stdout_json" "$stderr_log" "$LLAMA_CPP_BIN" "${args[@]}"
             rc=$?
             set -e
             ;;
@@ -327,7 +344,8 @@ run_one() {
                 POLARISD_GPU_BUDGET_BYTES="$budget_bytes" \
                 POLARISD_CPU_POOL_BYTES="$cpu_pool_bytes"
             set +e
-            env \
+            run_bench_command "$stdout_json" "$stderr_log" \
+                env \
                 GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}" \
                 GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}" \
                 POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
@@ -345,7 +363,7 @@ run_one() {
                 POLARIS_SHIM_GPU_BUDGET_BYTES="$budget_bytes" \
                 POLARIS_SHIM_CPU_POOL_BYTES="$cpu_pool_bytes" \
                 LD_PRELOAD="$SHIM_SO${LD_PRELOAD:+:$LD_PRELOAD}" \
-                "$LLAMA_CPP_BIN" "${args[@]}" >"$stdout_json" 2>"$stderr_log"
+                "$LLAMA_CPP_BIN" "${args[@]}"
             rc=$?
             set -e
             stop_polarisd
@@ -362,7 +380,11 @@ run_one() {
 
     if [[ "$rc" -ne 0 ]]; then
         tail -n 160 "$stderr_log" >&2 || true
-        die "benchmark mode=$mode failed with rc=$rc; see $stderr_log"
+        if [[ "${POLARIS_BENCH_ALLOW_FAILURES:-0}" == "1" ]]; then
+            note "benchmark mode=$mode failed with rc=$rc; continuing because POLARIS_BENCH_ALLOW_FAILURES=1"
+        else
+            die "benchmark mode=$mode failed with rc=$rc; see $stderr_log"
+        fi
     fi
 }
 

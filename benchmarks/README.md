@@ -55,6 +55,9 @@ POLARIS_BENCH_PRESSURE_BUDGET_BYTES=4194304
 POLARIS_BENCH_NO_PRESSURE_BUDGET_BYTES=17179869184
 POLARIS_BENCH_CPU_POOL_BYTES=4294967296
 POLARIS_BENCH_DAEMON_STARTUP_TIMEOUT_SEC=60
+POLARIS_BENCH_RUN_TIMEOUT_SEC=240
+POLARIS_BENCH_RUN_TIMEOUT_KILL_AFTER_SEC=15
+POLARIS_BENCH_ALLOW_FAILURES=1
 LLAMA_CPP_MODEL=/path/to/model.gguf
 LLAMA_CPP_BIN=/path/to/llama-bench
 ```
@@ -182,6 +185,7 @@ Recorded real-model results:
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-trend-20260616.md`
 - `benchmarks/reports/pressure-sweep-512x128-20260616T1420Z.md`
 - `benchmarks/reports/qwen14b-polaris-kv-16k-20260616.md`
+- `benchmarks/reports/qwen14b-polaris-pressure-sweep-20260616.md`
 
 Regenerate a cross-engine report from existing artifacts:
 
