@@ -58,6 +58,24 @@ LLAMA_CPP_MODEL=/path/to/model.gguf
 LLAMA_CPP_BIN=/path/to/llama-bench
 ```
 
+Run a POLARIS pressure-budget sweep for one workload:
+
+```sh
+sudo -v
+POLARIS_SWEEP_RUN_ID=pressure-sweep-512x128-$(date -u +%Y%m%dT%H%M%SZ) \
+POLARIS_SWEEP_PROMPTS=512 \
+POLARIS_SWEEP_GENS=128 \
+POLARIS_SWEEP_REPETITIONS=3 \
+POLARIS_SWEEP_BUDGETS_MIB=4,16,64,256 \
+NVIDIA_KO_DIR=../open-gpu-kernel-modules \
+LLAMA_CPP_DIR=../llama.cpp \
+LLAMA_CPP_MODEL=/path/to/model.gguf \
+benchmarks/scripts/run_polaris_pressure_sweep.sh
+```
+
+The sweep writes one benchmark artifact directory per GPU budget plus a
+markdown report under `benchmarks/reports/`.
+
 ## vLLM / SGLang KV Trace Comparison
 
 For a real-model offline benchmark against unmodified vLLM/SGLang, use:
@@ -161,6 +179,7 @@ Recorded real-model results:
 - `benchmarks/reports/framework-kv-real-model-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-trend-20260616.md`
+- `benchmarks/reports/pressure-sweep-512x128-20260616T1420Z.md`
 
 Regenerate a cross-engine report from existing artifacts:
 
