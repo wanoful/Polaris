@@ -86,6 +86,27 @@ sudo env \
   benchmarks/scripts/run_llama_kv_bench.sh
 ```
 
+Or run a real-model framework benchmark that collects both traces:
+
+```sh
+FRAMEWORK_BENCH_MODEL=/home/wano/workspace/models/SmolLM2-135M-Instruct \
+FRAMEWORK_BENCH_NUM_PROMPTS=16 \
+FRAMEWORK_BENCH_INPUT_LEN=128 \
+FRAMEWORK_BENCH_OUTPUT_LEN=32 \
+FRAMEWORK_BENCH_MAX_MODEL_LEN=256 \
+benchmarks/scripts/run_framework_kv_bench.sh
+```
+
+The first recorded real-model run is documented in
+`benchmarks/reports/framework-kv-real-model-20260616.md`.
+
+For the 16 x 128-input / 32-output run, the KV trace summary was:
+
+| source | total reserved blocks | peak live blocks | total reserved tokens | peak live tokens |
+|---|---:|---:|---:|---:|
+| vLLM | 144 | 121 | 2304 | 1936 |
+| SGLang | 640 | 640 | 2560 | 2560 |
+
 ## Interpretation
 
 - `native_cuda` is the normal llama.cpp CUDA baseline.

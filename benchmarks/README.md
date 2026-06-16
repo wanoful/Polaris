@@ -60,6 +60,46 @@ LLAMA_CPP_BIN=/path/to/llama-bench
 
 ## vLLM / SGLang KV Trace Comparison
 
+For a real-model offline benchmark against both frameworks, use:
+
+```sh
+FRAMEWORK_BENCH_MODEL=/home/wano/workspace/models/SmolLM2-135M-Instruct \
+FRAMEWORK_BENCH_NUM_PROMPTS=16 \
+FRAMEWORK_BENCH_INPUT_LEN=128 \
+FRAMEWORK_BENCH_OUTPUT_LEN=32 \
+FRAMEWORK_BENCH_MAX_MODEL_LEN=256 \
+benchmarks/scripts/run_framework_kv_bench.sh
+```
+
+The runner:
+
+- applies the vLLM and SGLang trace patches if needed;
+- runs `vllm bench throughput` and `sglang.bench_offline_throughput`;
+- writes framework throughput artifacts, KV traces, `runs.jsonl`, and
+  `summary.md` under `benchmarks/results/frameworks/<timestamp>/`.
+
+Useful knobs:
+
+```sh
+FRAMEWORK_BENCH_MODES=vllm,sglang
+FRAMEWORK_BENCH_MODEL=/path/to/hf/model
+FRAMEWORK_BENCH_NUM_PROMPTS=16
+FRAMEWORK_BENCH_INPUT_LEN=128
+FRAMEWORK_BENCH_OUTPUT_LEN=32
+FRAMEWORK_BENCH_MAX_MODEL_LEN=256
+FRAMEWORK_BENCH_GPU_MEMORY_UTILIZATION=0.45
+FRAMEWORK_BENCH_VLLM_RANDOM_RANGE_RATIO=0.0
+FRAMEWORK_BENCH_SGLANG_RANDOM_RANGE_RATIO=1.0
+VLLM_BIN=/path/to/vllm
+VLLM_PYTHON=/path/to/python
+SGLANG_PYTHON=/path/to/python
+SGLANG_DIR=/path/to/sglang
+```
+
+The vLLM and SGLang random dataset flags do not use the same range-ratio
+semantics in the tested versions. The runner defaults to vLLM `0.0` and SGLang
+`1.0` for controlled 128/32 token-length runs.
+
 Apply the trace patches from:
 
 ```text
@@ -105,3 +145,7 @@ The trace summary reports allocator-level metrics:
 This is the right comparison layer until vLLM/SGLang get explicit POLARIS KV
 allocator backends. End-to-end throughput comparisons across different engines
 should be labeled separately from these KV allocator metrics.
+
+Recorded real-model results:
+
+- `benchmarks/reports/framework-kv-real-model-20260616.md`

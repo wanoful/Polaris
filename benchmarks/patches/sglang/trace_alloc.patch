@@ -1,30 +1,107 @@
+diff --git a/python/sglang/bench_offline_throughput.py b/python/sglang/bench_offline_throughput.py
+index 0943acd8dc..a7e9043785 100644
+--- a/python/sglang/bench_offline_throughput.py
++++ b/python/sglang/bench_offline_throughput.py
+@@ -58,6 +58,7 @@ class BenchArgs:
+     prompt_suffix: str = ""
+     return_logprob: bool = False
+     logprob_start_len: int = -1
++    tokenize_prompt: bool = False
+
+     @staticmethod
+     def add_cli_args(parser: argparse.ArgumentParser):
+@@ -69,7 +70,7 @@ class BenchArgs:
+             "--dataset-name",
+             type=str,
+             default="sharegpt",
+-            choices=["sharegpt", "random", "generated-shared-prefix"],
++            choices=["sharegpt", "random", "random-ids", "generated-shared-prefix"],
+             help="Name of the dataset to benchmark on.",
+         )
+         parser.add_argument(
+@@ -196,6 +197,11 @@ class BenchArgs:
+             default=-1,
+             help="Start length for logprob. -1 means only return logprobs for output tokens (default). 0 means return logprobs for all tokens including input.",
+         )
++        parser.add_argument(
++            "--tokenize-prompt",
++            action="store_true",
++            help="Use integer ids instead of string for inputs. Useful to control prompt lengths accurately.",
++        )
+
+     @classmethod
+     def from_cli_args(cls, args: argparse.Namespace):
+@@ -212,6 +218,7 @@ def throughput_test_once(
+     profile: bool,
+     return_logprob: bool = False,
+     logprob_start_len: int = -1,
++    tokenize_prompt: bool = False,
+ ):
+     measurement_results = {
+         "backend": backend_name,
+@@ -244,12 +251,16 @@ def throughput_test_once(
+         backend.start_profile()
+
+     st = time.perf_counter()
+-    gen_out = backend.generate(
+-        prompt=prompt,
+-        sampling_params=sampling_params,
+-        return_logprob=return_logprob,
+-        logprob_start_len=logprob_start_len,
+-    )
++    generate_kwargs = {
++        "sampling_params": sampling_params,
++        "return_logprob": return_logprob,
++        "logprob_start_len": logprob_start_len,
++    }
++    if tokenize_prompt:
++        generate_kwargs["input_ids"] = prompt
++    else:
++        generate_kwargs["prompt"] = prompt
++    gen_out = backend.generate(**generate_kwargs)
+     latency = time.perf_counter() - st
+
+     if profile:
+@@ -444,6 +455,7 @@ def throughput_test(
+             profile=False,
+             return_logprob=bench_args.return_logprob,
+             logprob_start_len=bench_args.logprob_start_len,
++            tokenize_prompt=bench_args.tokenize_prompt,
+         )
+         time.sleep(0.5)
+
+@@ -457,6 +469,7 @@ def throughput_test(
+         profile=bench_args.profile,
+         return_logprob=bench_args.return_logprob,
+         logprob_start_len=bench_args.logprob_start_len,
++        tokenize_prompt=bench_args.tokenize_prompt,
+     )
+     backend.shutdown()
+
 diff --git a/python/sglang/srt/mem_cache/common.py b/python/sglang/srt/mem_cache/common.py
-index 56fccdd..dbf5e3d 100644
+index f52e668df9..d1163bfe2f 100644
 --- a/python/sglang/srt/mem_cache/common.py
 +++ b/python/sglang/srt/mem_cache/common.py
 @@ -1,6 +1,8 @@
  from __future__ import annotations
- 
+
  import logging
 +import os
 +import time
- from typing import TYPE_CHECKING
- 
+ from typing import TYPE_CHECKING, Optional
+
  import numpy as np
-@@ -24,6 +26,86 @@ if TYPE_CHECKING:
- MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+@@ -36,6 +38,80 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+ MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
  MAMBA_STATE_PER_REQ_NO_CACHE = 1
- 
-+# ── POLARIS trace collection (Phase 4b benchmark) ──────────────────────────
-+# Activated by environment variable POLARIS_TRACE=<output_path>.
-+# Produces a CSV trace file in the format:
-+#   timestamp_ns,op,session_id,token_start,token_count
-+# Ops: SESSION_CREATE, BLOCK_RESERVE, BLOCK_RELEASE, SESSION_DESTROY
+
++# POLARIS KV trace collection for benchmark comparison.
++# Activated by POLARIS_TRACE=<output_path>.
 +_POLARIS_TRACE_PATH = os.environ.get("POLARIS_TRACE", "")
-+_POLARIS_TRACE_FD = None  # opened lazily on first write
-+_POLARIS_SESSION_TOKENS: dict[str, int] = {}  # req.rid -> total allocated tokens
-+_POLARIS_SEEN: set[str] = set()  # req.rid that had SESSION_CREATE emitted
-+POLARIS_BLOCK_SIZE = 16  # tokens per POLARIS KV block
++_POLARIS_TRACE_FD = None
++_POLARIS_SESSION_TOKENS: dict[str, int] = {}
++_POLARIS_SEEN: set[str] = set()
++_POLARIS_BLOCK_TOKENS = int(os.environ.get("POLARIS_TRACE_BLOCK_TOKENS", "16"))
 +
 +
 +def _polaris_trace_fd():
@@ -37,89 +114,83 @@ index 56fccdd..dbf5e3d 100644
 +    return _POLARIS_TRACE_FD
 +
 +
-+def _polaris_emit(op: str, session_id: str,
-+                  token_start: int, token_count: int) -> None:
++def _polaris_emit(
++    op: str, session_id: str, token_start: int, token_count: int
++) -> None:
 +    fd = _polaris_trace_fd()
 +    if fd is None:
 +        return
-+    ts = time.time_ns()
-+    fd.write(f"{ts},{op},{session_id},{token_start},{token_count}\n")
++    fd.write(f"{time.time_ns()},{op},{session_id},{token_start},{token_count}\n")
 +    fd.flush()
 +
 +
++def _polaris_req_id(req: "Req") -> str:
++    return str(getattr(req, "rid", id(req)))
++
++
++def _polaris_trace_reserve(req: "Req", token_count: int) -> None:
++    if token_count <= 0:
++        return
++
++    rid = _polaris_req_id(req)
++    old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
++
++    if rid not in _POLARIS_SEEN:
++        _polaris_emit("SESSION_CREATE", rid, 0, 0)
++        _POLARIS_SEEN.add(rid)
++
++    for start in range(0, token_count, _POLARIS_BLOCK_TOKENS):
++        chunk = min(_POLARIS_BLOCK_TOKENS, token_count - start)
++        _polaris_emit("BLOCK_RESERVE", rid, old_total + start, chunk)
++
++    _POLARIS_SESSION_TOKENS[rid] = old_total + token_count
++
++
 +def _polaris_trace_extend(reqs: list["Req"], extend_lens: list[int]) -> None:
-+    """Emit SESSION_CREATE and BLOCK_RESERVE for prefill reservations."""
-+    for req, ext_len in zip(reqs, extend_lens):
-+        if ext_len <= 0:
-+            continue
-+        rid = req.rid
-+        old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
-+
-+        if rid not in _POLARIS_SEEN:
-+            _polaris_emit("SESSION_CREATE", rid, 0, 0)
-+            _POLARIS_SEEN.add(rid)
-+
-+        # Emit BLOCK_RESERVE in POLARIS block-sized chunks
-+        for start in range(0, ext_len, POLARIS_BLOCK_SIZE):
-+            tok_start = old_total + start
-+            tok_count = min(POLARIS_BLOCK_SIZE, ext_len - start)
-+            _polaris_emit("BLOCK_RESERVE", rid, tok_start, tok_count)
-+
-+        _POLARIS_SESSION_TOKENS[rid] = old_total + ext_len
++    for req, extend_len in zip(reqs, extend_lens):
++        _polaris_trace_reserve(req, int(extend_len))
 +
 +
 +def _polaris_trace_decode(reqs: list["Req"], token_per_req: int) -> None:
-+    """Emit BLOCK_RESERVE for decode reservations."""
 +    for req in reqs:
-+        rid = req.rid
-+        old_total = _POLARIS_SESSION_TOKENS.get(rid, 0)
-+
-+        for start in range(0, token_per_req, POLARIS_BLOCK_SIZE):
-+            tok_start = old_total + start
-+            tok_count = min(POLARIS_BLOCK_SIZE, token_per_req - start)
-+            _polaris_emit("BLOCK_RESERVE", rid, tok_start, tok_count)
-+
-+        _POLARIS_SESSION_TOKENS[rid] = old_total + token_per_req
++        _polaris_trace_reserve(req, int(token_per_req))
 +
 +
 +def _polaris_trace_release(req: "Req") -> None:
-+    """Emit BLOCK_RELEASE and SESSION_DESTROY."""
-+    rid = req.rid
++    rid = _polaris_req_id(req)
 +    total = _POLARIS_SESSION_TOKENS.pop(rid, 0)
 +    if total == 0 and rid not in _POLARIS_SEEN:
 +        return
-+    # Emit one BLOCK_RELEASE per allocated block
-+    num_blocks = (total + POLARIS_BLOCK_SIZE - 1) // POLARIS_BLOCK_SIZE
++
++    num_blocks = (total + _POLARIS_BLOCK_TOKENS - 1) // _POLARIS_BLOCK_TOKENS
 +    for _ in range(num_blocks):
 +        _polaris_emit("BLOCK_RELEASE", rid, 0, 0)
 +    _polaris_emit("SESSION_DESTROY", rid, 0, 0)
 +    _POLARIS_SEEN.discard(rid)
 +
++
  logger = logging.getLogger(__name__)
- 
- 
-@@ -489,6 +571,9 @@ def alloc_for_extend(
+
+
+@@ -448,6 +524,8 @@ def alloc_for_extend(
          batch.req_to_token_pool,
      )
- 
-+    # ── POLARIS trace ──
+
 +    _polaris_trace_extend(batch.reqs, batch.extend_lens)
 +
-     return out_cache_loc, req_pool_indices_device, req_pool_indices
- 
- 
-@@ -560,10 +645,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
+     return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
+
+
+@@ -520,10 +598,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
          (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
      )
- 
-+    # ── POLARIS trace ──
+
 +    _polaris_trace_decode(batch.reqs, token_per_req)
 +
      return out_cache_loc
- 
- 
+
+
  def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-+    # ── POLARIS trace ──
 +    _polaris_trace_release(req)
 +
      # MambaRadixCache may alloc mamba state before alloc KV cache
