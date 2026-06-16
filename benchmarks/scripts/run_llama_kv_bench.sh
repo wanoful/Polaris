@@ -156,10 +156,15 @@ wait_for_kernel_cleanup() {
 start_polarisd() {
     local log="$1"
     shift
+    local timeout_sec="${POLARIS_BENCH_DAEMON_STARTUP_TIMEOUT_SEC:-10}"
+    local loops=$((timeout_sec * 20))
+    if [[ "$loops" -lt 1 ]]; then
+        loops=1
+    fi
     note "starting polarisd for benchmark"
     env POLARISD_RM_BACKING=1 "$@" "$POLARISD_BIN" >"$log" 2>&1 &
     polarisd_pid=$!
-    for _ in $(seq 1 200); do
+    for _ in $(seq 1 "$loops"); do
         if ! kill -0 "$polarisd_pid" 2>/dev/null; then
             tail -n 160 "$log" >&2 || true
             die "polarisd exited during startup; see $log"
@@ -170,7 +175,7 @@ start_polarisd() {
         sleep 0.05
     done
     tail -n 160 "$log" >&2 || true
-    die "polarisd did not register with polaris.ko; see $log"
+    die "polarisd did not register with polaris.ko within ${timeout_sec}s; see $log"
 }
 
 stop_polarisd() {
