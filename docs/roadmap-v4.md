@@ -13,16 +13,19 @@ The worker is oblivious. polarisd decides. polaris.ko executes.
 
 ## Direction
 
-> Transparent kernel-directed KV paging on a UVM-registered fault-capable
-> VA-space. A small LD_PRELOAD shim hides VA-space setup and registers each
-> KV range as a UVM external range. polaris.ko owns a VRAM partition (RM
-> allocations whose handles UVM can map) and the policy mirror that drives
-> fault servicing; PTE installs go through UVM's existing external-range map
-> path via a new GPL-exported bridge. polarisd owns the block table and
-> policy. Workers run with a CUDA-driver-visible managed/external pointer
-> and require no source changes for the basic `cudaMalloc` / `cudaMallocManaged`
-> + kernel access
-> + free path.
+> KV-cache-only, kernel-directed paging on a UVM-registered fault-capable
+> VA-space. A small LD_PRELOAD shim hides VA-space setup, identifies
+> llama.cpp KV-cache allocations, and registers only those KV ranges as UVM
+> external ranges. Model weights, tensor upload buffers, CUDA workspaces, and
+> unrelated CUDA allocations stay on the application's normal CUDA path.
+> polaris.ko owns the logical KV block registry, RM-backed residency metadata,
+> and fault hook implementation; PTE installs go through UVM's existing
+> external-range map path via GPL-exported bridges. polarisd owns daemon RM
+> allocation, pinned-host spill slots, copy execution, and policy.
+
+v4 is **not** a general-purpose transparent CUDA memory pager. The production
+claim is narrower and more useful: no-source-change llama.cpp execution where
+KV cache storage is Polaris-managed and model weights are not.
 
 The lease API from v3 is not part of the production path. v3 lease code may
 remain as a fallback for diagnostics and for non-fault-capable contexts but
@@ -53,12 +56,12 @@ that actually landed on the `polaris-v4` driver branch
   `rm_client_token` is the user RM client handle from the same registration.
   The shim must pass both handles to polaris.ko because RM object handles are
   scoped to an RM client.
-- Application transparency is downgraded from "no source changes ever" to:
-  llama.cpp allocator interception is the first target, but transparent
-  execution still requires either avoiding host copy/fill APIs on intercepted
-  buffers or implementing a real host/device copy path for Polaris external
-  VA. PyTorch / vLLM still require an allocator backend in M7 because their
-  caching allocators bypass driver-API interception.
+- Application transparency is downgraded from "no source changes ever" to a
+  KV-only contract. llama.cpp allocator interception is the first target:
+  `POLARIS_SHIM_REQUIRE_KV_SCOPE=1` must leave copied model/init buffers on
+  real CUDA memory and route KV-cache allocations through Polaris. PyTorch /
+  vLLM still require an allocator backend in M7 because their caching
+  allocators bypass driver-API interception.
 
 ## Why this works where raw CUDA VMM did not
 
@@ -77,8 +80,8 @@ that actually landed on the `polaris-v4` driver branch
 worker process                shim (LD_PRELOAD)         polaris.ko             polarisd
 ─────────────────             ─────────────────         ──────────             ────────
 CUDA app code                 intercept allocator,      block→worker map,      logical block
-(unmodified)                  steer into Polaris        VRAM partition,        table, policy,
-                              fault-capable VA-space    CE channel,            pinned host pool
+(unmodified)                  steer KV cache into       RM-backed residency,   table, policy,
+                              fault-capable VA-space    UVM fault hook         pinned host pool
                                                         UVM fault hook         orchestration
 ```
 
@@ -86,7 +89,7 @@ CUDA app code                 intercept allocator,      block→worker map,     
 |-------|------|--------------|
 | worker | its CUDA context, the VA-space object, its own kernels | mapping, unmapping, block IDs, eviction |
 | shim | per-process VA-space creation, allocator interception, UVM external-range registration for KV VA, ioctl registration with polaris.ko | data movement, policy, block state, PTE programming |
-| polaris.ko | block→worker map, policy mirror, fault hook implementation, RM allocation pool for KV chunks, host pinned pool DMA mapping, scheduling slow-path upcalls to polarisd | direct PTE writes (delegated to UVM through the bridge), the fault buffer, CE channel state |
+| polaris.ko | block→worker map, policy mirror, fault hook implementation, RM-backed residency metadata for KV chunks, scheduling slow-path upcalls to polarisd | direct PTE writes (delegated to UVM through the bridge), the fault buffer, CE channel state, model-weight ownership |
 | polarisd | block table, eviction/spill policy, host pinned pool slot assignment, COW arbitration, mirror push to polaris.ko | PTE writes, fault servicing, hot-path decisions |
 
 ## Driver-side changes (open-gpu-kernel-modules)
@@ -243,29 +246,32 @@ New in v4. The transparency layer that v3 did not need.
 - Intercept `cuMemAlloc`, `cudaMalloc`, and the PyTorch/llama.cpp
   allocator-backend entry points used by target workloads. For each
   allocation:
-  1. Reserve VA inside the Polaris VA-space (return the pointer).
+  1. Reserve a contiguous VA range inside the Polaris VA-space and return
+     that pointer to the worker.
   2. Register the VA range with UVM as an **external range**
      (`UvmCreateExternalRange` or equivalent) — required by the bridge,
      because `uvm_polaris_map_external_allocation` looks up an existing
      `uvm_va_range_external_t` covering the fault address.
-  3. Tell polaris.ko which VA range backs which logical Polaris allocation
-     via `POLARIS_REGISTER_RANGE` (so the fault hook can resolve
+  3. Split the range into Polaris-sized KV chunks and tell polaris.ko which
+     VA chunk backs each logical Polaris block via
+     `POLARIS_REGISTER_BLOCK_MAPPING` (so the fault hook can resolve
      `rm_client_token + va_space_token + addr → block_id`).
   4. Do **not** map any pages. Faults populate them on demand.
 - Intercept `cuMemFree` / `cudaFree` to unregister the range, drop the
   external range, and let polaris.ko reclaim block table state.
-- Application transparency limits (see also "Application transparency"
+- KV-only transparency limits (see also "KV-Only Transparency Contract"
   below):
-  - The basic `cudaMalloc` + kernel-deref + `cudaMemcpy` + `cudaFree` path
-    is transparent.
-  - CUDA IPC (`cuIpcGetMemHandle`) and CUDA Graph capture of KV
-    accesses are not transparent; KV ranges in those APIs are out of
-    scope for v1 and must either fall back to the v3 lease path or be
-    documented as unsupported.
-  - PyTorch caching allocator ownership of KV memory remains out of scope
-    for M5. The shim now covers runtime stream-ordered symbols for smoke
-    tests, but M7 still needs an explicit allocator backend to make
-    framework-owned KV allocations intentional.
+  - The supported llama.cpp path is KV allocation + direct kernel dereference
+    + free. Model-weight upload and unrelated CUDA buffers intentionally pass
+    through to CUDA.
+  - General CUDA host copies/fills involving Polaris pointers are unsupported
+    except for the explicit KV zero-fill contract used by llama.cpp.
+  - CUDA IPC (`cuIpcGetMemHandle`) and CUDA Graph capture of KV accesses are
+    out of scope for v4 and documented as unsupported.
+  - PyTorch caching allocator ownership of KV memory remains out of scope for
+    M5. The shim now covers runtime stream-ordered symbols for smoke tests,
+    but M7 still needs an explicit allocator backend to make framework-owned
+    KV allocations intentional.
 
 ### polarisd
 
@@ -402,38 +408,51 @@ fault with access=WRITE on block B with refcount>1
    in flight; `uvm_polaris_unregister_hook()` waits via
    `synchronize_rcu()` before returning to the caller's module exit.
 
-## Application transparency
+## KV-Only Transparency Contract
 
 This section replaces the original v4 claim of unconditional zero source
-changes. The honest position:
+changes. The production contract is deliberately KV-cache-only:
 
-**Transparent through shim, no source changes**:
-- `cudaMalloc` / `cuMemAlloc_v2` / `cudaFree` paths
-- Direct kernel dereference (`kernel<<<...>>>(p)` then `p[i]`)
-- Pointer arithmetic and sub-range arguments
+**Transparent through shim, no source changes for llama.cpp KV cache**:
+- The shim interposes llama.cpp's runtime/driver allocation APIs
+  (`cudaMalloc`, `cudaMallocManaged`, stream-ordered allocation variants, and
+  `cuMemAlloc*`) but selects an allocation only when the ggml KV-scope hook
+  marks the current allocation context as KV cache.
+- Selected KV allocations return stable Polaris VA pointers. Their physical
+  RM backing is materialized on first GPU access through UVM replayable faults
+  and later can be spilled/reloaded without changing the worker pointer.
+- Model weights, tensor upload buffers, CUDA runtime/control allocations,
+  temporary workspaces, and copied model/init buffers remain on the normal
+  CUDA allocator path.
+- KV zero-fill initialization is accepted only under the explicit
+  `POLARIS_SHIM_ALLOW_ZERO_MEMSET=1` contract. Nonzero host copy/fill into a
+  Polaris pointer remains guarded.
 
-**Requires Polaris allocations to be registered as external ranges**:
-- `cuPointerGetAttribute` queries for `CU_POINTER_ATTRIBUTE_MEMORY_TYPE`
-  and `CU_POINTER_ATTRIBUTE_DEVICE_POINTER` — driver must recognize the
-  VA. The shim's external-range registration is what makes this work.
+**Requires Polaris KV allocations to be registered as external ranges**:
+- Every selected KV VA range must be a UVM external range and must have a
+  matching `POLARIS_REGISTER_BLOCK_MAPPING` entry so the fault hook can
+  resolve `(worker key, fault address) -> logical block`.
+- Pointer metadata queries for selected KV pointers are answered by the shim;
+  the driver must still see the VA as an external range for the bridge path to
+  install PTEs.
 
-**Not transparent in v1**:
-- `cudaMemcpy` / `cudaMemset` involving Polaris pointers. The current shim
-  guards these calls with `cudaErrorNotSupported`; llama.cpp's first
-  intercepted CUDA model-buffer allocation currently hits this path during
-  tensor upload before any replayable GPU fault can reach Polaris.
-- `cuIpcGetMemHandle` and IPC-based sharing.
-- CUDA Graph capture of accesses that depend on faulting in KV pages.
-- PyTorch caching allocator ownership of KV memory — even though the shim can
-  interpose runtime allocation symbols such as `cudaMallocAsync`, M7 still
-  needs an allocator backend to force PyTorch KV allocations through Polaris
+**Explicitly not transparent in v4**:
+- Arbitrary CUDA buffers. POLARIS does not try to page model weights,
+  activations, cuBLAS/cuDNN workspaces, temporary upload buffers, or general
+  application allocations.
+- General `cudaMemcpy` / `cudaMemset` involving Polaris pointers. Only the
+  KV-specific zero-fill contract is allowed today; daemon-backed spill/reload
+  data movement uses `POLARIS_RM_COPY` through UVM-owned staging instead.
+- `cuIpcGetMemHandle` / CUDA IPC for Polaris pointers.
+- CUDA Graph capture/replay and CUDA PDL while Polaris allocations are live.
+- PyTorch caching allocator ownership of KV memory. M7 needs an explicit
+  allocator backend to force PyTorch/vLLM KV allocations through Polaris
   deliberately.
 
-The course / paper claim should be: **the UVM hook/PTE bridge and shim
-allocator registration path are wired; fully transparent llama.cpp execution
-still needs the host-copy gap closed or a KV-only allocation selection that
-does not use CUDA host copy/fill APIs**. vLLM and PyTorch require an explicit
-backend.
+The course / paper claim should be: **the UVM hook/PTE bridge, daemon-owned
+RM backing path, and llama.cpp KV-only shim registration path are wired; the
+remaining work is KV workload hardening and pressure benchmarking, not
+general CUDA-buffer transparent paging**.
 
 ## Non-Goals
 
@@ -1082,6 +1101,12 @@ Still to do on the Polaris side for M1/M2:
   the deferred logical blocks, records the expected per-API selected allocation
   counter, and in strict mode increments both `uvm_hook_calls` and
   `uvm_handled` without static RM registration.
+- Per-chunk llama.cpp KV residency wired: selected llama.cpp KV allocations
+  still return one contiguous Polaris VA range to ggml, but the shim now
+  reserves/registers one logical Polaris block per `POLARIS_SHIM_BLOCK_SIZE`
+  chunk inside that range. This keeps llama.cpp's pointer/range semantics
+  intact while giving polaris.ko multiple independently evictable resident
+  units for a single KV allocation.
 - Dynamic-window llama.cpp regression variant added:
   `POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1` runs an additional unmodified
   CUDA `llama-bench` probe with a one-block initial registered v4 fault window
@@ -1090,6 +1115,16 @@ Still to do on the Polaris side for M1/M2:
   workload still reaches daemon-published RM backing and UVM handled faults.
   This validates the grow/reclaim allocator policy against the real
   no-source-change llama KV path without static RM.
+- Small-budget llama.cpp KV pressure gate added and validated on 2026-06-16:
+  `POLARIS_LLAMA_RUN_PRESSURE_PROBE=1` restarts `polarisd` with
+  `POLARISD_RM_BACKING=1` and a 4 MiB default budget
+  (`POLARIS_LLAMA_PRESSURE_BUDGET_BYTES`), mirrors that budget and the CPU pool
+  into the shim-registered transient GPU policy state, runs an unmodified CUDA
+  `llama-bench` workload, and requires daemon-backed `offloads`, `reloads`,
+  `uvm_bridge_map_calls`, and `uvm_bridge_map_ok` to increase with
+  `uvm_no_pte` and `uvm_errors` stable. Local validation with the SmolLM2 model
+  observed `offloads: 34 -> 45`, `reloads: 28 -> 37`, and bridge maps
+  `calls 2644 -> 2838` / `ok 2594 -> 2785`.
 - Static RM backend wired for integration testing only:
   `POLARIS_SHIM_STATIC_RM_BACKEND=1` requires in-shim RM/UVM bootstrap,
   allocates/frees RM `NV01_MEMORY_LOCAL_USER` objects per shim-managed
@@ -1125,9 +1160,9 @@ Still to do on the Polaris side for M1/M2:
   while Polaris allocations are live, the shim now rejects the PDL-specific
   extended launch attributes instead of allowing an unaudited launch ordering.
 - Remaining production shim work: replace the bounded managed-window capacity
-  model with workload-appropriate VA reclamation/rebalancing and, if needed for
-  performance, explicitly validate and enable CUDA PDL launch behavior with live
-  Polaris allocations.
+  model with workload-appropriate VA reclamation/rebalancing for long-running
+  server churn, and, if needed for performance, explicitly validate and enable
+  CUDA PDL launch behavior with live Polaris allocations.
 - Compare throughput vs v3-lease path and vs vLLM/SGLang baselines.
 
 ### M6: Hardening

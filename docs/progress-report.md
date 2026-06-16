@@ -2,6 +2,13 @@
 
 **Generated:** 2026-06-02
 
+> Current status note: this report predates the v4 UVM external-range path and
+> is retained as historical context. The current production direction is
+> documented in `docs/roadmap-v4.md`: llama.cpp KV-cache-only fault-driven
+> paging through a UVM-registered fault-capable VA-space, with model weights
+> and ordinary CUDA buffers left on the normal CUDA path. Do not use the older
+> raw-CUDA-VMM limitation language below as the current v4 status.
+
 ## Project Summary
 
 POLARIS (**P**aged **O**perating **L**ayer for **A**ccelerated **R**outing and **I**nference **S**ystems) is a Linux kernel module + CUDA Virtual Memory Management (VMM) system that provides OS-level paged KV Cache management for LLM inference. It implements kernel-directed page fault decisions via CUDA VMM, CPU offload/reload under memory pressure, and reference-counted copy-on-write (COW) for beam search, benchmarked against vLLM and SGLang on real NVIDIA GPU hardware.

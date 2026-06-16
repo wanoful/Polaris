@@ -1,11 +1,13 @@
 # llama.cpp POLARIS v4 Integration
 
-The v4 llama.cpp path is an unmodified-worker path: build llama.cpp normally,
-load `polaris.ko`, and run the binary with `libpolaris-shim.so` in
-`LD_PRELOAD`. The shim creates a fault-capable RM/UVM VA-space, registers the
-same RM client and user VA-space handles with `polaris.ko`, and intercepts CUDA
-allocation calls so selected buffers are returned from the Polaris-managed VA
-window.
+The v4 llama.cpp path is an unmodified-worker, KV-cache-only path: build
+llama.cpp normally, load `polaris.ko`, start `polarisd` with daemon-owned RM
+backing, and run the binary with `libpolaris-shim.so` in `LD_PRELOAD`. The shim
+creates a fault-capable RM/UVM VA-space, registers the same RM client and user
+VA-space handles with `polaris.ko`, and intercepts CUDA allocation calls so
+only selected KV-cache buffers are returned from the Polaris-managed VA window.
+Model weights, model upload buffers, CUDA workspaces, and unrelated
+allocations stay on llama.cpp's normal CUDA path.
 
 This replaces the older source-patch plan that linked `polaris-runtime` into
 llama.cpp and used raw CUDA VMM reservations. Raw CUDA VMM VA is not
@@ -22,10 +24,12 @@ The shim currently covers the llama.cpp CUDA allocation paths needed for M5:
 - `cuMemAlloc_v2` / `cuMemFree_v2`
 - `cuMemAllocAsync_v2` / `cuMemFreeAsync_v2`
 
-Use the shim size policy to select likely KV-sized allocations without
-capturing small CUDA runtime/control allocations:
+Use the ggml KV-scope policy to avoid capturing copied model/init buffers, and
+use the size policy only as an additional guardrail around expected KV sizes:
 
 ```sh
+POLARIS_SHIM_REQUIRE_KV_SCOPE=1
+POLARIS_SHIM_ALLOW_ZERO_MEMSET=1
 POLARIS_SHIM_MIN_MANAGED_ALLOC=<bytes>
 POLARIS_SHIM_MAX_MANAGED_ALLOC=<bytes>
 POLARIS_SHIM_STRICT_MANAGED_ALLOC=1
@@ -66,8 +70,11 @@ Polaris-managed, fault-capable memory.
 ## Guarded Surfaces
 
 CUDA copies/fills involving Polaris pointers currently return
-`cudaErrorNotSupported`. This is intentional until the production
-reload/offload data path wires transparent host/device copies.
+`cudaErrorNotSupported`, except for the explicit KV zero-fill contract enabled
+by `POLARIS_SHIM_ALLOW_ZERO_MEMSET=1`. This is intentional: POLARIS v4 is not
+trying to page arbitrary CUDA buffers, and model-weight upload should never use
+Polaris pointers. Daemon-backed KV spill/reload copies use `POLARIS_RM_COPY`
+through UVM-owned staging, not ordinary CUDA host copy APIs.
 
 CUDA IPC export for Polaris pointers is also rejected.
 
@@ -161,9 +168,12 @@ with `LLAMA_CPP_BIN=/path/to/binary`.
 
 `POLARIS_SHIM_STATIC_RM_BACKEND=1` remains available as a diagnostic backend,
 but the llama regression no longer uses it by default. The production-shaped
-gate leaves selected shim allocations as deferred logical blocks. Their first
-GPU access faults into polaris.ko, the kernel queues `ALLOC`, `polarisd`
-allocates daemon-owned RM vidmem and returns the RM tuple through
+gate leaves selected shim allocations as deferred logical blocks. A single
+llama.cpp KV allocation is still returned as one contiguous GPU VA range, but
+the shim reserves and registers one Polaris logical block per
+`POLARIS_SHIM_BLOCK_SIZE` chunk inside that range. A first GPU access to each
+chunk faults into polaris.ko, the kernel queues `ALLOC`, `polarisd` allocates
+daemon-owned RM vidmem and returns the RM tuple through
 `POLARIS_COMPLETE_OPERATION`, and the same fault is bridge-mapped through UVM
 before returning `HANDLED`. Daemon-backed `OFFLOAD` and `RELOAD` use
 `POLARIS_RM_COPY`; overwrite-reserve RM-backed `COW_BREAK` uses the same copy
@@ -188,6 +198,8 @@ sudo env \
   POLARIS_SHIM_BOOTSTRAP_RM_UVM=1 \
   POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
   POLARIS_SHIM_REPORT_STATS=1 \
+  POLARIS_SHIM_REQUIRE_KV_SCOPE=1 \
+  POLARIS_SHIM_ALLOW_ZERO_MEMSET=1 \
   POLARIS_SHIM_GPU_ID=0 \
   POLARIS_SHIM_BLOCK_SIZE=0x200000 \
   POLARIS_SHIM_MIN_MANAGED_ALLOC=<kv-floor-bytes> \
@@ -197,7 +209,14 @@ sudo env \
 
 The current regression validates llama.cpp's actual KV allocation and
 kernel-deref path for both runtime `cudaMalloc` and runtime
-`cudaMallocManaged` through daemon-owned RM backing. The next production
-milestone is moving from the fixed managed-window allocator to
-workload-appropriate VA management and broadening long-running spill/reload
-stress coverage.
+`cudaMallocManaged` through daemon-owned RM backing. Set
+`POLARIS_LLAMA_RUN_PRESSURE_PROBE=1` to add the small-budget pressure gate:
+the script restarts `polarisd` with
+`POLARIS_LLAMA_PRESSURE_BUDGET_BYTES` (default 4 MiB), mirrors that budget and
+the CPU pool into the shim-registered transient GPU, runs a real CUDA
+`llama-bench` workload, and requires daemon-backed `offloads`, `reloads`,
+`uvm_bridge_map_calls`, and `uvm_bridge_map_ok` to increase without
+`uvm_no_pte` or `uvm_errors`. Longer term, replace the bounded managed-window
+allocator with VA management that is aware of llama.cpp KV lifecycle events
+such as context growth, context shift, prompt cache reuse, and long-running
+server churn.

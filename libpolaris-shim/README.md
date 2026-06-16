@@ -1,10 +1,19 @@
 # libpolaris-shim
 
-LD_PRELOAD shared library that makes unmodified CUDA workers (llama.cpp, vLLM,
-SGLang, PyTorch) transparent participants in POLARIS's kernel-directed KV
-paging path. v4 architecture — see `../docs/roadmap-v4.md`.
+LD_PRELOAD shared library for routing selected llama.cpp KV-cache allocations
+into POLARIS's kernel-directed paging path while leaving model weights and
+ordinary CUDA buffers on their normal CUDA path. v4 architecture — see
+`../docs/roadmap-v4.md`.
 
-## What it does (eventually)
+## KV-Only Role
+
+`libpolaris-shim` is the no-source-change entry point for llama.cpp KV-cache
+paging. It is not a generic CUDA allocation pager: model weights, upload
+buffers, workspaces, and unrelated CUDA allocations stay on the normal CUDA
+path. PyTorch/vLLM/SGLang support remains future allocator-backend work, not a
+claim that arbitrary framework CUDA buffers are transparently paged today.
+
+## What it does
 
 1. Intercepts `cuInit` / first CUDA driver-API call in the worker process.
 2. Creates a fault-capable, externally-owned GPU VA-space via
@@ -15,10 +24,12 @@ paging path. v4 architecture — see `../docs/roadmap-v4.md`.
    (`rm_client_token`, `va_space_token` in the v4 ABI) to `polaris.ko` via
    the `POLARIS_REGISTER_VASPACE` ioctl. The pair matters because RM object
    handles are scoped to a client.
-4. Intercepts `cuMemAlloc` / `cudaMalloc` / `cudaMallocManaged` and the PyTorch / llama.cpp
-   allocator backends to reserve VA inside the POLARIS VA-space — without
-   mapping it — and registers the range with `polaris.ko` so the fault
-   hook can resolve `addr → block_id`.
+4. Intercepts `cuMemAlloc` / `cudaMalloc` / `cudaMallocManaged` and related
+   CUDA allocator entry points, then selects only llama.cpp KV-cache
+   allocations when the ggml KV scope marks the allocation context. Selected
+   allocations reserve VA inside the POLARIS VA-space without mapping it and
+   register the range with `polaris.ko` so the fault hook can resolve
+   `addr → block_id`.
 5. Intercepts `cuMemFree` / `cudaFree` to deregister the range.
 
 ## Current state
@@ -136,17 +147,18 @@ Pinned-host and kernel-query calls used by llama.cpp are also forwarded:
 `cudaFreeHost`, `cudaHostRegister`, `cudaHostUnregister`,
 `cudaFuncSetAttribute`, `cudaFuncGetAttributes`, and
 `cudaOccupancyMaxActiveBlocksPerMultiprocessor`.
-Each allocation reserves a deferred logical Polaris block, registers a
-`block_id -> worker VA` mapping, and returns the Polaris VA to the worker.
-Pages are still unmapped; the next GPU dereference must fault through UVM and
-be serviced by polaris.ko.
-For the production path, selected allocations are deferred logical blocks: the
-shim does not allocate RM memory and does not register static backing. The first
-GPU fault queues an `ALLOC` decision, `polarisd` publishes daemon-owned RM
-backing through `POLARIS_COMPLETE_OPERATION`, and polaris.ko bridge-maps that
-backing through UVM before returning `HANDLED`. Real CUDA kernels may fault
-through CUDA's own UVM-registered VA-space rather than the shim-created RM/UVM
-VA-space; for that case polaris.ko services the fault only when a single
+Each selected allocation returns one contiguous Polaris VA range to the worker.
+Internally, the shim splits that range into `POLARIS_SHIM_BLOCK_SIZE` chunks,
+reserves one deferred logical Polaris block per chunk, and registers one
+`block_id -> worker VA chunk` mapping per block. Pages are still unmapped; the
+next GPU dereference must fault through UVM and be serviced by polaris.ko.
+For the production path, selected chunks are deferred logical blocks: the shim
+does not allocate RM memory and does not register static backing. The first GPU
+fault for a chunk queues an `ALLOC` decision, `polarisd` publishes daemon-owned
+RM backing through `POLARIS_COMPLETE_OPERATION`, and polaris.ko bridge-maps
+that backing through UVM before returning `HANDLED`. Real CUDA kernels may
+fault through CUDA's own UVM-registered VA-space rather than the shim-created
+RM/UVM VA-space; for that case polaris.ko services the fault only when a single
 unambiguous logical block mapping covers the faulting GPU/address.
 `POLARISD_RM_BACKING=1` also wires daemon-backed `OFFLOAD` and `RELOAD`
 through `POLARIS_RM_COPY`, which copies between daemon-owned RM vidmem and the
@@ -162,9 +174,9 @@ are routed through Polaris. Allocations outside that inclusive policy range
 fall through to the real CUDA allocator even when
 `POLARIS_SHIM_STRICT_MANAGED_ALLOC=1`; strict mode only changes failures for
 allocations that the policy selected for Polaris management.
-Explicit frees release the logical block. If a worker exits with outstanding
-shim-managed allocations, the shim releases those blocks before destroying its
-Polaris session and unregistering the VA-space.
+Explicit frees release every logical chunk in the allocation. If a worker exits
+with outstanding shim-managed allocations, the shim releases those blocks
+before destroying its Polaris session and unregistering the VA-space.
 Freed token spans are coalesced and reused by later allocations, so a workload
 can repeatedly allocate/free within the configured managed window without
 monotonically exhausting it.
@@ -319,9 +331,11 @@ the shim's static RM diagnostic backend. Set
 `tests/llama_cpp/run_llama_shim_e2e.sh` to add a strict live llama probe that
 starts with `POLARIS_SHIM_MANAGED_INITIAL_BLOCKS=1`, grows the registered
 fault window under real KV allocation pressure, and verifies grow/shrink stats
-on cleanup. Remaining production work is focused on replacing this bounded
-capacity with broader workload-driven VA rebalancing, broader stress coverage,
-and permission-based write-fault COW.
+on cleanup. Set `POLARIS_LLAMA_RUN_PRESSURE_PROBE=1` to add the small-budget
+live llama pressure gate; it requires daemon-backed offload/reload counters and
+UVM bridge-map telemetry to move on real KV chunks. Remaining production work
+is focused on replacing this bounded capacity with broader workload-driven VA
+rebalancing, broader stress coverage, and permission-based write-fault COW.
 
 ## Why this is not a Cargo crate
 

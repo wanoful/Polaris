@@ -1,95 +1,127 @@
 # POLARIS
 
-Paged Operating Layer for Accelerated Routing and Inference Systems
+Paged Operating Layer for Accelerated Routing and Inference Systems.
 
-POLARIS is a Linux kernel module + CUDA VMM daemon that provides OS-level paged KV Cache management for LLM inference. It implements kernel-directed page faults via CUDA VMM, CPU offload/reload under memory pressure, and reference-counted copy-on-write for beam search, and is benchmarked against vLLM and SGLang on real GPU hardware.
+POLARIS v4 is a Linux kernel module, patched NVIDIA UVM path, LD_PRELOAD shim,
+and userspace daemon for OS-level KV-cache paging. The production target is
+not arbitrary CUDA-buffer virtualization. The target is narrower: keep model
+weights and ordinary CUDA buffers on their normal CUDA path, while routing
+LLM KV-cache storage through Polaris-managed, fault-capable GPU virtual
+addresses.
 
-## Architecture
+## Current v4 Path
 
-We can understand POLARIS as the middleware layer between the LLM inference workload and the GPU hardware, orchestrating CUDA VMM operations based on kernel-level decisions about which KV blocks to keep resident on the GPU, which to evict, and when to reload from CPU memory.
+For llama.cpp, the supported path is:
 
-```
-Inference layer (PyTorch / vLLM / synthetic workload)
-      |
-      |  ioctl  ("Require new KV block")
-      ▼
-┌──────────────┐
-│  polaris.ko  │  ← kernel module: authoritative block table, page-fault
-│  (kernel)    │    decisions, COW refcount, LRU state, victim selection
-└──────┬───────┘
-       |  ioctl  ("Execute: cuMemMap block 42 on GPU 0 at VA 0x7f...")
-       ▼
-┌──────────────┐
-│   polarisd   │  ← userspace daemon: executes CUDA VMM operations —
-│  (userspace) │    cuMemCreate, cuMemMap, cuMemUnmap, cuMemSetAccess,
-│              │    cudaMemcpy (GPU↔CPU), cuMemRelease
-└──────────────┘
-       |
-       ▼
-┌──────────────┐
-│  NVIDIA GPU  │  ← real hardware, managed through CUDA driver
-└──────────────┘
+```text
+llama.cpp model weights / init buffers
+  -> normal CUDA allocator and normal CUDA copies
+
+llama.cpp KV-cache allocation
+  -> libpolaris-shim selects ggml KV scope only
+  -> shim returns one stable contiguous Polaris VA
+  -> internally the range is split into Polaris-sized KV chunks
+  -> first GPU kernel access to each chunk triggers a UVM replayable fault
+  -> polaris.ko resolves the logical KV chunk
+  -> polarisd allocates daemon-owned RM backing
+  -> polaris.ko asks UVM to map the external allocation
+  -> later pressure can spill/reload the same KV VA through POLARIS_RM_COPY
 ```
 
-## Key Components
+The shim defaults used by the llama regression enforce this contract with
+`POLARIS_SHIM_REQUIRE_KV_SCOPE=1`. KV zero-fill initialization is allowed with
+`POLARIS_SHIM_ALLOW_ZERO_MEMSET=1`; general host copies/fills involving
+Polaris pointers remain guarded.
 
-- **polaris.ko**: Linux kernel module — maintains global block table, session state, eviction policies, and decision protocol.
-- **polarisd**: Userspace daemon in Rust — executes CUDA VMM calls driven by kernel decisions.
-- **polarisctl**: CLI tool for stats, session inspection, and debugging.
-- **workloads/**: Synthetic KV stress, beam search, concurrent, and trace replay workloads.
-- **benchmarks/**: vLLM/SGLang trace collection, replay, plotting, and automated suite.
-- **adapter/** (deferred): Drop-in vLLM BlockSpaceManager replacement using POLARIS ioctls.
-- **ebpf/** (deferred): XDP eBPF program for zero-copy request ingestion.
+## Components
 
-## Core Abstractions
+- **Patched NVIDIA UVM**: exports the Polaris fault hook, external-allocation
+  map/unmap bridge, and RM-backed copy helpers. The active development tree is
+  expected at `../open-gpu-kernel-modules` or under
+  `third_party/open-gpu-kernel-modules`.
+- **polaris.ko**: registers the UVM hook, owns logical KV block state,
+  block-to-worker mappings, bridge-map telemetry, spill/reload decisions, and
+  cleanup rules.
+- **polarisd**: executes daemon-owned RM allocation/free plus RM-backed
+  offload/reload/COW copies through `POLARIS_RM_COPY`.
+- **libpolaris-shim.so**: bootstraps the fault-capable RM/UVM VA-space and
+  selects llama.cpp KV-cache allocations without source changes.
+- **tests/m2/**: root/GPU bring-up and hardening gates for the UVM bridge,
+  daemon-backed RM spill/reload, COW, OOM pressure, and module unload stress.
+- **integrations/llama.cpp/**: current llama.cpp operating contract and
+  root/GPU regression instructions.
 
-- **KV Block**: Smallest scheduling and paging unit (~8 MB for LLaMA-2-7B, 16 tokens, FP16).
-- **Session**: One LLM inference request; owns a linked list of KV blocks.
-- **Page Table (Block Table)**: Kernel-authoritative mapping from `(session_id, token_range)` to `(gpu_phys_handle, gpu_vaddr, state)`.
+## Build Checks
 
-## Quick Start
-
-### Build
-
-```bash
-cd kernel && make && sudo insmod polaris.ko
-cd ../polarisd && cargo build --release
-sudo systemctl start polarisd
+```sh
+make kernel NVIDIA_KO_DIR=../open-gpu-kernel-modules
+cargo test --workspace --no-run
+make -C libpolaris-shim all tests NVIDIA_KO_DIR=../open-gpu-kernel-modules
+make -C tests/m2 NVIDIA_KO_DIR=../open-gpu-kernel-modules
 ```
 
-### CLI
+Kernel and GPU tests require the matching patched NVIDIA module and root access.
 
-```bash
-polarisctl stats          # Show /sys/kernel/polaris/stats
-polarisctl session list   # List active sessions
-polarisctl debug blocks   # Dump block table
+## Root/GPU Gates
+
+Run the strict llama.cpp KV fault-path regression:
+
+```sh
+sudo -E make llama-e2e \
+  NVIDIA_KO_DIR=../open-gpu-kernel-modules \
+  LLAMA_CPP_DIR=../llama.cpp
 ```
 
-### Run Synthetic Workload
+Add the real llama.cpp small-budget KV pressure gate:
 
-```bash
-cd workloads && cargo run --bin synthetic_kv -- --help
-cargo run --bin beam_search -- --help
+```sh
+sudo env \
+  POLARIS_LLAMA_STRICT_SHIM_FAULT_PASS=1 \
+  POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE=1 \
+  POLARIS_LLAMA_RUN_PRESSURE_PROBE=1 \
+  NVIDIA_KO_DIR=../open-gpu-kernel-modules \
+  LLAMA_CPP_DIR=../llama.cpp \
+  bash tests/llama_cpp/run_llama_shim_e2e.sh
 ```
 
-## Benchmarking
+Run the daemon-backed RM soak:
 
-- Collect traces: `benchmarks/scripts/collect_vllm_trace.py`, `collect_sglang_trace.py`
-- Replay traces: `workloads/src/trace_replay.rs`
-- Run full suite: `benchmarks/scripts/run_all.sh`
-- Generate plots: `benchmarks/scripts/plot.py`
-
-## Repository Structure
-
+```sh
+sudo -E make m6-daemon-rm-soak \
+  NVIDIA_KO_DIR=../open-gpu-kernel-modules
 ```
-polaris/
-  kernel/          # polaris.ko, Makefile, Kbuild
-  polarisd/        # Rust daemon
-  polarisctl/      # Rust CLI
-  workloads/       # Synthetic and trace workloads
-  benchmarks/      # Configs, scripts, results
-  adapter/         # Optional vLLM adapter
-  ebpf/            # Optional XDP eBPF
-  docs/            # Design, API, evaluation docs
-  report/          # Final report, figures
+
+Run module unload/reload stress:
+
+```sh
+sudo -E make m6-module-unload-stress \
+  NVIDIA_KO_DIR=../open-gpu-kernel-modules
 ```
+
+## Status
+
+The v4 codebase has the UVM hook, fault-capable VA-space registration,
+external-range bridge mapping, daemon-owned RM backing, RM-backed
+spill/reload, overwrite COW, llama.cpp KV-only shim selection, per-chunk KV
+residency inside a contiguous llama.cpp allocation, an opt-in real llama.cpp
+pressure gate, and focused M6 stress gates wired.
+
+Still open:
+
+- Longer llama.cpp server/long-context pressure coverage beyond the current
+  opt-in `llama-bench` offload/reload gate.
+- Workload-aware VA reclamation beyond the current bounded managed-window
+  grow/shrink allocator.
+- Permission-based write-fault COW for shared KV pages.
+- PyTorch/vLLM allocator backend integration.
+- Benchmark automation and vLLM/SGLang comparison results.
+
+## Documentation
+
+- [docs/roadmap-v4.md](docs/roadmap-v4.md): current v4 roadmap and milestone
+  state.
+- [integrations/llama.cpp/README.md](integrations/llama.cpp/README.md):
+  llama.cpp KV-only integration details.
+- [tests/m2/README.md](tests/m2/README.md): staged UVM/RM bridge diagnostics.
+- [docs/fault-driven-analysis.md](docs/fault-driven-analysis.md): historical
+  analysis showing why raw CUDA VMM holes were abandoned.

@@ -57,7 +57,22 @@ first_existing_file() {
 
 stat_value() {
     local key="$1"
-    awk -v key="${key}:" '$1 == key { print $2; found = 1 } END { if (!found) print "0" }' "$STATS_PATH"
+    awk -v key="${key}:" '
+        $1 == key {
+            print $2
+            found = 1
+            exit
+        }
+        index($0, key) == 1 {
+            value = substr($0, length(key) + 1)
+            sub(/^[ \t]*/, "", value)
+            sub(/[ \t].*/, "", value)
+            print value
+            found = 1
+            exit
+        }
+        END { if (!found) print "0" }
+    ' "$STATS_PATH"
 }
 
 extract_last_metric() {
@@ -135,22 +150,77 @@ polaris_log="$tmpdir/llama-polaris-backend.log"
 shim_log="$tmpdir/llama-shim-probe.log"
 managed_shim_log="$tmpdir/llama-shim-managed-probe.log"
 dynamic_shim_log="$tmpdir/llama-shim-dynamic-window.log"
+pressure_shim_log="$tmpdir/llama-shim-pressure.log"
 polarisd_log="$tmpdir/polarisd.log"
+pressure_polarisd_log="$tmpdir/polarisd-pressure.log"
 stats_before="$tmpdir/stats.before"
 stats_after="$tmpdir/stats.after"
 cp "$STATS_PATH" "$stats_before"
 
 polarisd_pid=""
+active_polarisd_log="$polarisd_log"
 baseline_gpu_count="$(stat_value gpus)"
 
-cleanup() {
+stop_polarisd() {
     if [[ -n "$polarisd_pid" ]]; then
         kill "$polarisd_pid" 2>/dev/null || true
         wait "$polarisd_pid" 2>/dev/null || true
         polarisd_pid=""
     fi
 }
+
+cleanup() {
+    stop_polarisd
+}
 trap cleanup EXIT
+
+wait_for_kernel_cleanup() {
+    local label="$1"
+
+    for _ in $(seq 1 100); do
+        if [[ "$(stat_value daemon)" == "0" &&
+              "$(stat_value sessions)" == "0" &&
+              "$(stat_value blocks)" == "0" &&
+              "$(stat_value pending_decs)" == "0" &&
+              "$(stat_value static_blocks)" == "0" &&
+              "$(stat_value block_mappings)" == "0" &&
+              "$(stat_value v4_va_spaces)" == "0" &&
+              "$(stat_value v4_worker_pids)" == "0" &&
+              "$(stat_value gpus)" == "$baseline_gpu_count" ]]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    sed -n '1,140p' "$STATS_PATH" >&2 || true
+    die "$label cleanup did not return to baseline gpus=$baseline_gpu_count"
+}
+
+start_polarisd() {
+    local label="$1"
+    local log="$2"
+    shift 2
+
+    require_executable "$POLARISD_BIN" "polarisd binary"
+    active_polarisd_log="$log"
+    note "starting polarisd with daemon-owned RM backing${label:+ ($label)}"
+    env POLARISD_RM_BACKING=1 "$@" "$POLARISD_BIN" >"$log" 2>&1 &
+    polarisd_pid=$!
+    for _ in $(seq 1 200); do
+        if ! kill -0 "$polarisd_pid" 2>/dev/null; then
+            tail -n 160 "$log" >&2 || true
+            die "polarisd exited during startup; see $log"
+        fi
+        if [[ "$(stat_value daemon)" -ge 1 && "$(stat_value gpus)" -ge 1 ]]; then
+            break
+        fi
+        sleep 0.05
+    done
+    if [[ "$(stat_value daemon)" -lt 1 || "$(stat_value gpus)" -lt 1 ]]; then
+        tail -n 160 "$log" >&2 || true
+        die "polarisd did not register with polaris.ko; see $log"
+    fi
+}
 
 base_args=(
     -m "$LLAMA_CPP_MODEL"
@@ -199,29 +269,13 @@ if [[ "${POLARIS_LLAMA_RUN_SHIM_PROBE:-1}" == "0" ]]; then
 fi
 
 if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
-    require_executable "$POLARISD_BIN" "polarisd binary"
-    note "starting polarisd with daemon-owned RM backing"
-    POLARISD_RM_BACKING=1 "$POLARISD_BIN" >"$polarisd_log" 2>&1 &
-    polarisd_pid=$!
-    for _ in $(seq 1 200); do
-        if ! kill -0 "$polarisd_pid" 2>/dev/null; then
-            tail -n 160 "$polarisd_log" >&2 || true
-            die "polarisd exited during startup; see $polarisd_log"
-        fi
-        if [[ "$(stat_value daemon)" -ge 1 && "$(stat_value gpus)" -ge 1 ]]; then
-            break
-        fi
-        sleep 0.05
-    done
-    if [[ "$(stat_value daemon)" -lt 1 || "$(stat_value gpus)" -lt 1 ]]; then
-        tail -n 160 "$polarisd_log" >&2 || true
-        die "polarisd did not register with polaris.ko; see $polarisd_log"
-    fi
+    start_polarisd "" "$polarisd_log"
 fi
 
 run_shim_probe() {
     local unified_memory="$1"
     local dynamic_window="${2:-0}"
+    local pressure="${3:-0}"
     local probe_env=(
         GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
         GGML_CUDA_PDL="${GGML_CUDA_PDL:-0}"
@@ -245,6 +299,13 @@ run_shim_probe() {
             POLARIS_SHIM_MANAGED_BLOCKS="${POLARIS_LLAMA_DYNAMIC_MANAGED_BLOCKS:-256}"
             POLARIS_SHIM_MANAGED_INITIAL_BLOCKS="${POLARIS_LLAMA_DYNAMIC_INITIAL_BLOCKS:-1}"
             POLARIS_SHIM_MANAGED_GROW_BLOCKS="${POLARIS_LLAMA_DYNAMIC_GROW_BLOCKS:-1}"
+        )
+    fi
+
+    if [[ "$pressure" == "1" ]]; then
+        probe_env+=(
+            POLARIS_SHIM_GPU_BUDGET_BYTES="${POLARIS_LLAMA_PRESSURE_BUDGET_BYTES:-4194304}"
+            POLARIS_SHIM_CPU_POOL_BYTES="${POLARIS_LLAMA_PRESSURE_CPU_POOL_BYTES:-4294967296}"
         )
     fi
 
@@ -288,8 +349,8 @@ verify_shim_probe() {
     fi
     grep -q '\[polaris-shim\] managed allocation' "$log" ||
         die "$label no llama.cpp allocation was routed through Polaris; see $log"
-    grep -q 'polarisd: RM ALLOC block' "$polarisd_log" ||
-        die "$label polarisd did not publish daemon-owned RM backing; see $polarisd_log"
+    grep -q 'polarisd: RM ALLOC block' "$active_polarisd_log" ||
+        die "$label polarisd did not publish daemon-owned RM backing; see $active_polarisd_log"
 
     after_hook="$(stat_value uvm_hook_calls)"
     after_handled="$(stat_value uvm_handled)"
@@ -425,40 +486,75 @@ if [[ "${POLARIS_LLAMA_RUN_DYNAMIC_WINDOW_PROBE:-0}" == "1" ]]; then
         "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 1
 fi
 
+if [[ "${POLARIS_LLAMA_RUN_PRESSURE_PROBE:-0}" == "1" ]]; then
+    if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" != "1" ]]; then
+        die "POLARIS_LLAMA_RUN_PRESSURE_PROBE=1 requires POLARIS_LLAMA_START_POLARISD=1"
+    fi
+
+    pressure_budget="${POLARIS_LLAMA_PRESSURE_BUDGET_BYTES:-4194304}"
+    pressure_cpu_pool="${POLARIS_LLAMA_PRESSURE_CPU_POOL_BYTES:-4294967296}"
+
+    stop_polarisd
+    wait_for_kernel_cleanup "pre-pressure"
+    start_polarisd "pressure budget" "$pressure_polarisd_log" \
+        POLARISD_GPU_BUDGET_BYTES="$pressure_budget" \
+        POLARISD_CPU_POOL_BYTES="$pressure_cpu_pool"
+
+    before_hook_calls="$(stat_value uvm_hook_calls)"
+    before_handled="$(stat_value uvm_handled)"
+    before_no_pte="$(stat_value uvm_no_pte)"
+    before_errors="$(stat_value uvm_errors)"
+    before_blocks="$(stat_value blocks)"
+    before_offloads="$(stat_value offloads)"
+    before_reloads="$(stat_value reloads)"
+    before_bridge_calls="$(stat_value uvm_bridge_map_calls)"
+    before_bridge_ok="$(stat_value uvm_bridge_map_ok)"
+
+    note "running LD_PRELOAD pressure shim probe on ${LLAMA_CPP_SHIM_DEVICE:-CUDA0}"
+    set +e
+    run_shim_probe "" "0" "1" >"$pressure_shim_log" 2>&1
+    rc=$?
+    set -e
+    verify_shim_probe "pressure" "$pressure_shim_log" "$before_hook_calls" "$before_handled" \
+        "$before_no_pte" "$before_errors" api_runtime_alloc_selected "$rc" "$before_blocks" 0
+
+    after_offloads="$(stat_value offloads)"
+    after_reloads="$(stat_value reloads)"
+    after_bridge_calls="$(stat_value uvm_bridge_map_calls)"
+    after_bridge_ok="$(stat_value uvm_bridge_map_ok)"
+    after_no_pte="$(stat_value uvm_no_pte)"
+    after_errors="$(stat_value uvm_errors)"
+
+    if [[ "$after_offloads" -le "$before_offloads" ]]; then
+        tail -n 200 "$pressure_polarisd_log" >&2 || true
+        die "pressure probe did not increase offloads ($before_offloads -> $after_offloads)"
+    fi
+    if [[ "$after_reloads" -le "$before_reloads" ]]; then
+        tail -n 200 "$pressure_polarisd_log" >&2 || true
+        die "pressure probe did not increase reloads ($before_reloads -> $after_reloads)"
+    fi
+    if [[ "$after_bridge_calls" -le "$before_bridge_calls" ||
+          "$after_bridge_ok" -le "$before_bridge_ok" ]]; then
+        die "pressure probe did not increase bridge map telemetry: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
+    fi
+    if [[ "$after_no_pte" -gt "$before_no_pte" ||
+          "$after_errors" -gt "$before_errors" ]]; then
+        die "pressure probe reported UVM faults/errors: no_pte $before_no_pte -> $after_no_pte errors $before_errors -> $after_errors"
+    fi
+    grep -q 'polarisd: RM OFFLOAD block' "$pressure_polarisd_log" ||
+        die "pressure probe did not log daemon RM OFFLOAD; see $pressure_polarisd_log"
+    grep -q 'polarisd: RM RELOAD block' "$pressure_polarisd_log" ||
+        die "pressure probe did not log daemon RM RELOAD; see $pressure_polarisd_log"
+
+    note "PASS: pressure llama.cpp shim probe exercised daemon KV offload/reload"
+    note "offloads: $before_offloads -> $after_offloads"
+    note "reloads:  $before_reloads -> $after_reloads"
+    note "bridge maps: calls $before_bridge_calls -> $after_bridge_calls ok $before_bridge_ok -> $after_bridge_ok"
+fi
+
 if [[ "${POLARIS_LLAMA_START_POLARISD:-1}" == "1" ]]; then
-    if [[ -n "$polarisd_pid" ]]; then
-        kill "$polarisd_pid" 2>/dev/null || true
-        wait "$polarisd_pid" 2>/dev/null || true
-        polarisd_pid=""
-    fi
-
-    for _ in $(seq 1 100); do
-        if [[ "$(stat_value daemon)" == "0" &&
-              "$(stat_value sessions)" == "0" &&
-              "$(stat_value blocks)" == "0" &&
-              "$(stat_value pending_decs)" == "0" &&
-              "$(stat_value static_blocks)" == "0" &&
-              "$(stat_value block_mappings)" == "0" &&
-              "$(stat_value v4_va_spaces)" == "0" &&
-              "$(stat_value v4_worker_pids)" == "0" &&
-              "$(stat_value gpus)" == "$baseline_gpu_count" ]]; then
-            break
-        fi
-        sleep 0.05
-    done
-
-    if [[ "$(stat_value daemon)" != "0" ||
-          "$(stat_value sessions)" != "0" ||
-          "$(stat_value blocks)" != "0" ||
-          "$(stat_value pending_decs)" != "0" ||
-          "$(stat_value static_blocks)" != "0" ||
-          "$(stat_value block_mappings)" != "0" ||
-          "$(stat_value v4_va_spaces)" != "0" ||
-          "$(stat_value v4_worker_pids)" != "0" ||
-          "$(stat_value gpus)" != "$baseline_gpu_count" ]]; then
-        sed -n '1,140p' "$STATS_PATH" >&2 || true
-        die "llama shim cleanup did not return to baseline gpus=$baseline_gpu_count"
-    fi
+    stop_polarisd
+    wait_for_kernel_cleanup "llama shim"
 fi
 
 cp "$STATS_PATH" "$stats_after"
