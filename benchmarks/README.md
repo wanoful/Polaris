@@ -66,6 +66,8 @@ For a real-model offline benchmark against unmodified vLLM/SGLang, use:
 FRAMEWORK_BENCH_TRACE=0 \
 FRAMEWORK_BENCH_MODEL=/home/wano/workspace/models/SmolLM2-135M-Instruct \
 FRAMEWORK_BENCH_NUM_PROMPTS=16 \
+FRAMEWORK_BENCH_REPETITIONS=1 \
+FRAMEWORK_BENCH_WARMUP_REPETITIONS=1 \
 FRAMEWORK_BENCH_INPUT_LEN=128 \
 FRAMEWORK_BENCH_OUTPUT_LEN=32 \
 FRAMEWORK_BENCH_MAX_MODEL_LEN=256 \
@@ -90,6 +92,8 @@ FRAMEWORK_BENCH_MODES=vllm,sglang
 FRAMEWORK_BENCH_TRACE=0
 FRAMEWORK_BENCH_MODEL=/path/to/hf/model
 FRAMEWORK_BENCH_NUM_PROMPTS=16
+FRAMEWORK_BENCH_REPETITIONS=1
+FRAMEWORK_BENCH_WARMUP_REPETITIONS=1
 FRAMEWORK_BENCH_INPUT_LEN=128
 FRAMEWORK_BENCH_OUTPUT_LEN=32
 FRAMEWORK_BENCH_MAX_MODEL_LEN=256
@@ -156,3 +160,4 @@ Recorded real-model results:
 
 - `benchmarks/reports/framework-kv-real-model-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-20260616.md`
+- `benchmarks/reports/llama-polaris-vs-original-frameworks-trend-20260616.md`

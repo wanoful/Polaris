@@ -25,6 +25,8 @@ SUMMARY_MD="$OUT_DIR/summary.md"
 INPUT_LEN="${FRAMEWORK_BENCH_INPUT_LEN:-128}"
 OUTPUT_LEN="${FRAMEWORK_BENCH_OUTPUT_LEN:-32}"
 NUM_PROMPTS="${FRAMEWORK_BENCH_NUM_PROMPTS:-16}"
+REPETITIONS="${FRAMEWORK_BENCH_REPETITIONS:-1}"
+WARMUP_REPETITIONS="${FRAMEWORK_BENCH_WARMUP_REPETITIONS:-1}"
 MAX_MODEL_LEN="${FRAMEWORK_BENCH_MAX_MODEL_LEN:-256}"
 DTYPE="${FRAMEWORK_BENCH_DTYPE:-float16}"
 GPU_MEMORY_UTILIZATION="${FRAMEWORK_BENCH_GPU_MEMORY_UTILIZATION:-0.45}"
@@ -186,6 +188,8 @@ run_vllm_bench() {
             --source vllm \
             --model "$MODEL_PATH" \
             --num-prompts "$NUM_PROMPTS" \
+            --repetitions "$REPETITIONS" \
+            --warmup-repetitions "$WARMUP_REPETITIONS" \
             --input-len "$INPUT_LEN" \
             --output-len "$OUTPUT_LEN" \
             --max-model-len "$MAX_MODEL_LEN" \
@@ -239,6 +243,8 @@ run_sglang_bench() {
             --source sglang \
             --model "$MODEL_PATH" \
             --num-prompts "$NUM_PROMPTS" \
+            --repetitions "$REPETITIONS" \
+            --warmup-repetitions "$WARMUP_REPETITIONS" \
             --input-len "$INPUT_LEN" \
             --output-len "$OUTPUT_LEN" \
             --max-model-len "$MAX_MODEL_LEN" \
@@ -251,7 +257,7 @@ run_sglang_bench() {
 }
 
 write_summary() {
-    python3 - "$OUT_DIR" "$RUNS_JSONL" "$SUMMARY_MD" "$INPUT_LEN" "$OUTPUT_LEN" "$NUM_PROMPTS" "$VLLM_RANDOM_RANGE_RATIO" "$SGLANG_RANDOM_RANGE_RATIO" "$TRACE_ENABLED" <<'PY'
+    python3 - "$OUT_DIR" "$RUNS_JSONL" "$SUMMARY_MD" "$INPUT_LEN" "$OUTPUT_LEN" "$NUM_PROMPTS" "$REPETITIONS" "$WARMUP_REPETITIONS" "$VLLM_RANDOM_RANGE_RATIO" "$SGLANG_RANDOM_RANGE_RATIO" "$TRACE_ENABLED" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -259,10 +265,10 @@ from pathlib import Path
 out_dir = Path(sys.argv[1])
 runs_jsonl = Path(sys.argv[2])
 summary = Path(sys.argv[3])
-input_len, output_len, num_prompts = map(int, sys.argv[4:7])
-vllm_range_ratio = sys.argv[7]
-sglang_range_ratio = sys.argv[8]
-trace_enabled = sys.argv[9]
+input_len, output_len, num_prompts, repetitions, warmup_repetitions = map(int, sys.argv[4:9])
+vllm_range_ratio = sys.argv[9]
+sglang_range_ratio = sys.argv[10]
+trace_enabled = sys.argv[11]
 
 trace_records = []
 if runs_jsonl.exists():
@@ -290,6 +296,8 @@ lines = [
     "# vLLM / SGLang KV Benchmark Summary",
     "",
     f"- workload: {num_prompts} prompts, input={input_len} tokens, output={output_len} tokens",
+    f"- repetitions: {repetitions}",
+    f"- warmup repetitions: {warmup_repetitions}",
     f"- trace enabled: {trace_enabled}",
     f"- vLLM random range ratio: {vllm_range_ratio}",
     f"- SGLang random range ratio: {sglang_range_ratio}",

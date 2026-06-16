@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,62 @@ def count_sglang_output_tokens(row: dict[str, Any]) -> int:
     return 0
 
 
-def run_vllm(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, Any]:
+def make_sample_result(
+    args: argparse.Namespace,
+    source: str,
+    repetition: int,
+    elapsed: float,
+    output_tokens: int,
+) -> dict[str, Any]:
+    input_tokens = args.num_prompts * args.input_len
+    return {
+        "source": source,
+        "comparison_scope": "original_framework_e2e",
+        "model": args.model,
+        "repetition": repetition,
+        "num_requests": args.num_prompts,
+        "total_input_tokens": input_tokens,
+        "total_output_tokens": output_tokens,
+        "elapsed_time": elapsed,
+        "requests_per_second": args.num_prompts / elapsed,
+        "input_tokens_per_second": input_tokens / elapsed,
+        "output_tokens_per_second": output_tokens / elapsed,
+        "total_tokens_per_second": (input_tokens + output_tokens) / elapsed,
+    }
+
+
+def aggregate_samples(
+    args: argparse.Namespace, source: str, samples: list[dict[str, Any]]
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "source": source,
+        "comparison_scope": "original_framework_e2e",
+        "model": args.model,
+        "num_requests": args.num_prompts,
+        "repetitions": args.repetitions,
+        "warmup_repetitions": args.warmup_repetitions,
+        "total_input_tokens": args.num_prompts * args.input_len,
+        "total_output_tokens": samples[-1]["total_output_tokens"] if samples else 0,
+        "samples": samples,
+    }
+
+    metric_names = [
+        "elapsed_time",
+        "requests_per_second",
+        "input_tokens_per_second",
+        "output_tokens_per_second",
+        "total_tokens_per_second",
+    ]
+    for name in metric_names:
+        values = [float(sample[name]) for sample in samples]
+        result[name] = statistics.fmean(values)
+        result[f"{name}_stddev"] = statistics.stdev(values) if len(values) > 1 else 0.0
+        result[f"{name}_min"] = min(values)
+        result[f"{name}_max"] = max(values)
+    return result
+
+
+def run_vllm(args: argparse.Namespace) -> dict[str, Any]:
     from vllm import LLM, SamplingParams
 
     sampling_params = SamplingParams(
@@ -54,34 +110,39 @@ def run_vllm(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, An
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
     )
-    prompt_payload = [{"prompt_token_ids": p} for p in prompts]
 
-    start = time.perf_counter()
-    outputs = llm.generate(prompt_payload, sampling_params=sampling_params, use_tqdm=False)
-    elapsed = time.perf_counter() - start
+    samples: list[dict[str, Any]] = []
+    total_runs = args.warmup_repetitions + args.repetitions
+    for run_idx in range(total_runs):
+        prompts = build_token_prompts(
+            args.num_prompts,
+            args.input_len,
+            args.vocab_size,
+            seed_offset=100 + run_idx * 4099,
+        )
+        prompt_payload = [{"prompt_token_ids": p} for p in prompts]
 
-    output_tokens = 0
-    for item in outputs:
-        if item.outputs:
-            output_tokens += len(item.outputs[0].token_ids)
+        start = time.perf_counter()
+        outputs = llm.generate(
+            prompt_payload, sampling_params=sampling_params, use_tqdm=False
+        )
+        elapsed = time.perf_counter() - start
 
-    return {
-        "source": "vllm",
-        "comparison_scope": "original_framework_e2e",
-        "model": args.model,
-        "num_requests": args.num_prompts,
-        "total_input_tokens": args.num_prompts * args.input_len,
-        "total_output_tokens": output_tokens,
-        "elapsed_time": elapsed,
-        "requests_per_second": args.num_prompts / elapsed,
-        "input_tokens_per_second": (args.num_prompts * args.input_len) / elapsed,
-        "output_tokens_per_second": output_tokens / elapsed,
-        "total_tokens_per_second": (args.num_prompts * args.input_len + output_tokens)
-        / elapsed,
-    }
+        output_tokens = 0
+        for item in outputs:
+            if item.outputs:
+                output_tokens += len(item.outputs[0].token_ids)
+        if run_idx < args.warmup_repetitions:
+            continue
+        repetition = run_idx - args.warmup_repetitions
+        samples.append(
+            make_sample_result(args, "vllm", repetition, elapsed, output_tokens)
+        )
+
+    return aggregate_samples(args, "vllm", samples)
 
 
-def run_sglang(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, Any]:
+def run_sglang(args: argparse.Namespace) -> dict[str, Any]:
     from sglang.srt.entrypoints.engine import Engine
 
     engine = Engine(
@@ -96,47 +157,50 @@ def run_sglang(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, 
         cuda_graph_backend_prefill=args.sglang_cuda_graph_backend,
         log_level="error",
     )
-    sampling_params = [
-        {
-            "temperature": 0,
-            "max_new_tokens": args.output_len,
-            "ignore_eos": True,
-        }
-        for _ in prompts
-    ]
 
     try:
-        start = time.perf_counter()
-        outputs = engine.generate(input_ids=prompts, sampling_params=sampling_params)
-        elapsed = time.perf_counter() - start
-        if isinstance(outputs, dict):
-            outputs = [outputs]
-        output_tokens = sum(count_sglang_output_tokens(row) for row in outputs)
+        samples: list[dict[str, Any]] = []
+        total_runs = args.warmup_repetitions + args.repetitions
+        for run_idx in range(total_runs):
+            prompts = build_token_prompts(
+                args.num_prompts,
+                args.input_len,
+                args.vocab_size,
+                seed_offset=100 + run_idx * 4099,
+            )
+            sampling_params = [
+                {
+                    "temperature": 0,
+                    "max_new_tokens": args.output_len,
+                    "ignore_eos": True,
+                }
+                for _ in prompts
+            ]
+
+            start = time.perf_counter()
+            outputs = engine.generate(input_ids=prompts, sampling_params=sampling_params)
+            elapsed = time.perf_counter() - start
+            if isinstance(outputs, dict):
+                outputs = [outputs]
+            output_tokens = sum(count_sglang_output_tokens(row) for row in outputs)
+            if run_idx < args.warmup_repetitions:
+                continue
+            repetition = run_idx - args.warmup_repetitions
+            samples.append(
+                make_sample_result(args, "sglang", repetition, elapsed, output_tokens)
+            )
         server_info = engine.get_server_info()
     finally:
         engine.shutdown()
 
-    last_gen = 0.0
+    result = aggregate_samples(args, "sglang", samples)
     try:
-        last_gen = float(server_info["internal_states"][0]["last_gen_throughput"])
+        result["last_gen_throughput"] = float(
+            server_info["internal_states"][0]["last_gen_throughput"]
+        )
     except Exception:
         pass
-
-    return {
-        "source": "sglang",
-        "comparison_scope": "original_framework_e2e",
-        "model": args.model,
-        "num_requests": args.num_prompts,
-        "total_input_tokens": args.num_prompts * args.input_len,
-        "total_output_tokens": output_tokens,
-        "elapsed_time": elapsed,
-        "requests_per_second": args.num_prompts / elapsed,
-        "input_tokens_per_second": (args.num_prompts * args.input_len) / elapsed,
-        "output_tokens_per_second": output_tokens / elapsed,
-        "total_tokens_per_second": (args.num_prompts * args.input_len + output_tokens)
-        / elapsed,
-        "last_gen_throughput": last_gen,
-    }
+    return result
 
 
 def main() -> int:
@@ -147,6 +211,8 @@ def main() -> int:
     parser.add_argument("--input-len", type=int, required=True)
     parser.add_argument("--output-len", type=int, required=True)
     parser.add_argument("--max-model-len", type=int, required=True)
+    parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--warmup-repetitions", type=int, default=1)
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.45)
     parser.add_argument("--vocab-size", type=int, default=49152)
@@ -157,11 +223,15 @@ def main() -> int:
     parser.add_argument("--output-json", type=Path, required=True)
     args = parser.parse_args()
 
-    prompts = build_token_prompts(args.num_prompts, args.input_len, args.vocab_size)
+    if args.repetitions <= 0:
+        raise SystemExit("--repetitions must be positive")
+    if args.warmup_repetitions < 0:
+        raise SystemExit("--warmup-repetitions must be non-negative")
+
     if args.source == "vllm":
-        result = run_vllm(args, prompts)
+        result = run_vllm(args)
     else:
-        result = run_sglang(args, prompts)
+        result = run_sglang(args)
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     args.output_json.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
