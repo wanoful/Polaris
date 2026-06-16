@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Run real-model vLLM and SGLang KV-cache benchmarks with POLARIS trace patches.
+# Run real-model vLLM and SGLang benchmarks.
 #
-# This runner compares framework KV allocator behavior and framework-level
-# offline throughput for the same synthetic token workload. It does not make
-# vLLM/SGLang allocate KV cache from POLARIS.
+# By default this runner uses unmodified framework paths for end-to-end
+# throughput. Set FRAMEWORK_BENCH_TRACE=1 to apply trace patches and collect
+# KV allocator lifecycle events. It does not make vLLM/SGLang allocate KV cache
+# from POLARIS.
 
 set -euo pipefail
 
@@ -30,6 +31,8 @@ GPU_MEMORY_UTILIZATION="${FRAMEWORK_BENCH_GPU_MEMORY_UTILIZATION:-0.45}"
 MODES="${FRAMEWORK_BENCH_MODES:-vllm,sglang}"
 VLLM_RANDOM_RANGE_RATIO="${FRAMEWORK_BENCH_VLLM_RANDOM_RANGE_RATIO:-0.0}"
 SGLANG_RANDOM_RANGE_RATIO="${FRAMEWORK_BENCH_SGLANG_RANDOM_RANGE_RATIO:-1.0}"
+TRACE_ENABLED="${FRAMEWORK_BENCH_TRACE:-0}"
+VOCAB_SIZE="${FRAMEWORK_BENCH_VOCAB_SIZE:-49152}"
 
 VLLM_VENV="${VLLM_VENV:-$WORKSPACE_DIR/.bench-venvs/vllm}"
 SGLANG_VENV="${SGLANG_VENV:-$WORKSPACE_DIR/.bench-venvs/sglang}"
@@ -150,7 +153,6 @@ append_trace_summary() {
 
 run_vllm_bench() {
     find_vllm
-    apply_vllm_trace_patch
 
     local dir="$OUT_DIR/vllm"
     local trace="$dir/bench_${INPUT_LEN}x${OUTPUT_LEN}.trace.csv"
@@ -158,65 +160,98 @@ run_vllm_bench() {
     local log="$LOG_DIR/vllm_${INPUT_LEN}x${OUTPUT_LEN}.log"
     mkdir -p "$dir"
 
-    note "running vLLM real-model benchmark"
+    note "running vLLM real-model benchmark trace=$TRACE_ENABLED"
     rm -f "$trace" "$result"
-    PATH="$(dirname "$VLLM_BIN"):$PATH" \
-    POLARIS_TRACE="$trace" \
-        "$VLLM_BIN" bench throughput \
-        --model "$MODEL_PATH" \
-        --dataset-name random \
-        --random-input-len "$INPUT_LEN" \
-        --random-output-len "$OUTPUT_LEN" \
-        --random-range-ratio "$VLLM_RANDOM_RANGE_RATIO" \
-        --num-prompts "$NUM_PROMPTS" \
-        --max-model-len "$MAX_MODEL_LEN" \
-        --dtype "$DTYPE" \
-        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-        --enforce-eager \
-        --output-json "$result" \
-        2>&1 | tee "$log"
-
-    append_trace_summary "vllm" "$trace"
+    if [[ "$TRACE_ENABLED" == "1" ]]; then
+        apply_vllm_trace_patch
+        PATH="$(dirname "$VLLM_BIN"):$PATH" \
+        POLARIS_TRACE="$trace" \
+            "$VLLM_BIN" bench throughput \
+            --model "$MODEL_PATH" \
+            --dataset-name random \
+            --random-input-len "$INPUT_LEN" \
+            --random-output-len "$OUTPUT_LEN" \
+            --random-range-ratio "$VLLM_RANDOM_RANGE_RATIO" \
+            --num-prompts "$NUM_PROMPTS" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --dtype "$DTYPE" \
+            --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --enforce-eager \
+            --output-json "$result" \
+            2>&1 | tee "$log"
+        append_trace_summary "vllm" "$trace"
+    else
+        PATH="$(dirname "$VLLM_PYTHON"):$PATH" \
+            "$VLLM_PYTHON" "$ROOT_DIR/benchmarks/scripts/original_framework_bench.py" \
+            --source vllm \
+            --model "$MODEL_PATH" \
+            --num-prompts "$NUM_PROMPTS" \
+            --input-len "$INPUT_LEN" \
+            --output-len "$OUTPUT_LEN" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --dtype "$DTYPE" \
+            --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --vocab-size "$VOCAB_SIZE" \
+            --enforce-eager \
+            --output-json "$result" \
+            2>&1 | tee "$log"
+    fi
 }
 
 run_sglang_bench() {
     find_sglang
-    apply_sglang_trace_patch
 
     local dir="$OUT_DIR/sglang"
     local trace="$dir/bench_${INPUT_LEN}x${OUTPUT_LEN}.trace.csv"
-    local result="$dir/bench_${INPUT_LEN}x${OUTPUT_LEN}.jsonl"
+    local result_json="$dir/bench_${INPUT_LEN}x${OUTPUT_LEN}.json"
+    local result_jsonl="$dir/bench_${INPUT_LEN}x${OUTPUT_LEN}.jsonl"
     local log="$LOG_DIR/sglang_${INPUT_LEN}x${OUTPUT_LEN}.log"
     mkdir -p "$dir"
 
-    note "running SGLang real-model benchmark"
-    rm -f "$trace" "$result"
-    PATH="$(dirname "$SGLANG_PYTHON"):$PATH" \
-    POLARIS_TRACE="$trace" \
-        "$SGLANG_PYTHON" -m sglang.bench_offline_throughput \
-        --model-path "$MODEL_PATH" \
-        --dataset-name random-ids \
-        --random-input-len "$INPUT_LEN" \
-        --random-output-len "$OUTPUT_LEN" \
-        --random-range-ratio "$SGLANG_RANDOM_RANGE_RATIO" \
-        --num-prompts "$NUM_PROMPTS" \
-        --context-length "$MAX_MODEL_LEN" \
-        --dtype "$DTYPE" \
-        --mem-fraction-static "$GPU_MEMORY_UTILIZATION" \
-        --attention-backend flashinfer \
-        --sampling-backend pytorch \
-        --cuda-graph-backend-decode disabled \
-        --cuda-graph-backend-prefill disabled \
-        --skip-warmup \
-        --tokenize-prompt \
-        --result-filename "$result" \
-        2>&1 | tee "$log"
-
-    append_trace_summary "sglang" "$trace"
+    note "running SGLang real-model benchmark trace=$TRACE_ENABLED"
+    rm -f "$trace" "$result_json" "$result_jsonl"
+    if [[ "$TRACE_ENABLED" == "1" ]]; then
+        apply_sglang_trace_patch
+        PATH="$(dirname "$SGLANG_PYTHON"):$PATH" \
+        POLARIS_TRACE="$trace" \
+            "$SGLANG_PYTHON" -m sglang.bench_offline_throughput \
+            --model-path "$MODEL_PATH" \
+            --dataset-name random-ids \
+            --random-input-len "$INPUT_LEN" \
+            --random-output-len "$OUTPUT_LEN" \
+            --random-range-ratio "$SGLANG_RANDOM_RANGE_RATIO" \
+            --num-prompts "$NUM_PROMPTS" \
+            --context-length "$MAX_MODEL_LEN" \
+            --dtype "$DTYPE" \
+            --mem-fraction-static "$GPU_MEMORY_UTILIZATION" \
+            --attention-backend flashinfer \
+            --sampling-backend pytorch \
+            --cuda-graph-backend-decode disabled \
+            --cuda-graph-backend-prefill disabled \
+            --skip-warmup \
+            --tokenize-prompt \
+            --result-filename "$result_jsonl" \
+            2>&1 | tee "$log"
+        append_trace_summary "sglang" "$trace"
+    else
+        PATH="$(dirname "$SGLANG_PYTHON"):$PATH" \
+            "$SGLANG_PYTHON" "$ROOT_DIR/benchmarks/scripts/original_framework_bench.py" \
+            --source sglang \
+            --model "$MODEL_PATH" \
+            --num-prompts "$NUM_PROMPTS" \
+            --input-len "$INPUT_LEN" \
+            --output-len "$OUTPUT_LEN" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --dtype "$DTYPE" \
+            --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+            --vocab-size "$VOCAB_SIZE" \
+            --output-json "$result_json" \
+            2>&1 | tee "$log"
+    fi
 }
 
 write_summary() {
-    python3 - "$OUT_DIR" "$RUNS_JSONL" "$SUMMARY_MD" "$INPUT_LEN" "$OUTPUT_LEN" "$NUM_PROMPTS" "$VLLM_RANDOM_RANGE_RATIO" "$SGLANG_RANDOM_RANGE_RATIO" <<'PY'
+    python3 - "$OUT_DIR" "$RUNS_JSONL" "$SUMMARY_MD" "$INPUT_LEN" "$OUTPUT_LEN" "$NUM_PROMPTS" "$VLLM_RANDOM_RANGE_RATIO" "$SGLANG_RANDOM_RANGE_RATIO" "$TRACE_ENABLED" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -227,6 +262,7 @@ summary = Path(sys.argv[3])
 input_len, output_len, num_prompts = map(int, sys.argv[4:7])
 vllm_range_ratio = sys.argv[7]
 sglang_range_ratio = sys.argv[8]
+trace_enabled = sys.argv[9]
 
 trace_records = []
 if runs_jsonl.exists():
@@ -242,17 +278,23 @@ def load_jsonl_last(path):
     return rows[-1] if rows else None
 
 vllm = load_json(out_dir / "vllm" / f"bench_{input_len}x{output_len}.json")
-sglang = load_jsonl_last(out_dir / "sglang" / f"bench_{input_len}x{output_len}.jsonl")
+sglang = (
+    load_json(out_dir / "sglang" / f"bench_{input_len}x{output_len}.json")
+    or load_jsonl_last(out_dir / "sglang" / f"bench_{input_len}x{output_len}.jsonl")
+)
 trace_by_source = {rec.get("source"): rec for rec in trace_records}
+
+scope = "framework throughput plus KV allocator trace" if trace_enabled == "1" else "original framework end-to-end throughput"
 
 lines = [
     "# vLLM / SGLang KV Benchmark Summary",
     "",
     f"- workload: {num_prompts} prompts, input={input_len} tokens, output={output_len} tokens",
+    f"- trace enabled: {trace_enabled}",
     f"- vLLM random range ratio: {vllm_range_ratio}",
     f"- SGLang random range ratio: {sglang_range_ratio}",
-    "- scope: real-model framework throughput plus KV allocator trace",
-    "- note: vLLM/SGLang traces do not route KV cache through POLARIS yet",
+    f"- scope: real-model {scope}",
+    "- note: vLLM/SGLang do not route KV cache through POLARIS",
     "",
     "| source | requests/s | output tok/s | total tok/s | total reserved blocks | peak live blocks | total reserved tokens |",
     "|---|---:|---:|---:|---:|---:|---:|",
@@ -260,13 +302,15 @@ lines = [
 
 if vllm:
     elapsed = float(vllm.get("elapsed_time", 0.0) or 0.0)
-    output_tok_s = (num_prompts * output_len / elapsed) if elapsed else 0.0
+    output_tok_s = float(vllm.get("output_tokens_per_second", 0.0))
+    if not output_tok_s:
+        output_tok_s = (num_prompts * output_len / elapsed) if elapsed else 0.0
     rec = trace_by_source.get("vllm", {})
     lines.append(
         "| vllm | {rps:.2f} | {out:.2f} | {total:.2f} | {reserved} | {peak} | {tokens} |".format(
             rps=float(vllm.get("requests_per_second", 0.0)),
             out=output_tok_s,
-            total=float(vllm.get("tokens_per_second", 0.0)),
+            total=float(vllm.get("tokens_per_second", vllm.get("total_tokens_per_second", 0.0))),
             reserved=rec.get("total_reserved_blocks", ""),
             peak=rec.get("peak_live_blocks", ""),
             tokens=rec.get("total_reserved_tokens", ""),
@@ -277,9 +321,9 @@ if sglang:
     rec = trace_by_source.get("sglang", {})
     lines.append(
         "| sglang | {rps:.2f} | {out:.2f} | {total:.2f} | {reserved} | {peak} | {tokens} |".format(
-            rps=float(sglang.get("request_throughput", 0.0)),
-            out=float(sglang.get("output_throughput", 0.0)),
-            total=float(sglang.get("total_throughput", 0.0)),
+            rps=float(sglang.get("request_throughput", sglang.get("requests_per_second", 0.0))),
+            out=float(sglang.get("output_throughput", sglang.get("output_tokens_per_second", 0.0))),
+            total=float(sglang.get("total_throughput", sglang.get("total_tokens_per_second", 0.0))),
             reserved=rec.get("total_reserved_blocks", ""),
             peak=rec.get("peak_live_blocks", ""),
             tokens=rec.get("total_reserved_tokens", ""),

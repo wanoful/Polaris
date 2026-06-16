@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""Run unmodified vLLM/SGLang offline throughput on fixed token-id prompts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+
+def build_token_prompts(
+    num_prompts: int, input_len: int, vocab_size: int, seed_offset: int = 100
+) -> list[list[int]]:
+    if input_len <= 0:
+        raise SystemExit("--input-len must be positive")
+    if vocab_size <= 1024:
+        raise SystemExit(f"vocab_size is too small for random token prompts: {vocab_size}")
+
+    usable = max(1, vocab_size - seed_offset - 1)
+    prompts: list[list[int]] = []
+    for i in range(num_prompts):
+        base = seed_offset + (i * 9973) % usable
+        prompts.append([seed_offset + ((base + i + j) % usable) for j in range(input_len)])
+    return prompts
+
+
+def count_sglang_output_tokens(row: dict[str, Any]) -> int:
+    meta = row.get("meta_info") or {}
+    if isinstance(meta.get("completion_tokens"), int):
+        return int(meta["completion_tokens"])
+    if isinstance(row.get("output_ids"), list):
+        return len(row["output_ids"])
+    if isinstance(row.get("token_ids"), list):
+        return len(row["token_ids"])
+    return 0
+
+
+def run_vllm(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, Any]:
+    from vllm import LLM, SamplingParams
+
+    sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=args.output_len,
+        ignore_eos=True,
+    )
+    llm = LLM(
+        model=args.model,
+        tokenizer=args.model,
+        dtype=args.dtype,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        enforce_eager=args.enforce_eager,
+    )
+    prompt_payload = [{"prompt_token_ids": p} for p in prompts]
+
+    start = time.perf_counter()
+    outputs = llm.generate(prompt_payload, sampling_params=sampling_params, use_tqdm=False)
+    elapsed = time.perf_counter() - start
+
+    output_tokens = 0
+    for item in outputs:
+        if item.outputs:
+            output_tokens += len(item.outputs[0].token_ids)
+
+    return {
+        "source": "vllm",
+        "comparison_scope": "original_framework_e2e",
+        "model": args.model,
+        "num_requests": args.num_prompts,
+        "total_input_tokens": args.num_prompts * args.input_len,
+        "total_output_tokens": output_tokens,
+        "elapsed_time": elapsed,
+        "requests_per_second": args.num_prompts / elapsed,
+        "input_tokens_per_second": (args.num_prompts * args.input_len) / elapsed,
+        "output_tokens_per_second": output_tokens / elapsed,
+        "total_tokens_per_second": (args.num_prompts * args.input_len + output_tokens)
+        / elapsed,
+    }
+
+
+def run_sglang(args: argparse.Namespace, prompts: list[list[int]]) -> dict[str, Any]:
+    from sglang.srt.entrypoints.engine import Engine
+
+    engine = Engine(
+        model_path=args.model,
+        tokenizer_path=args.model,
+        context_length=args.max_model_len,
+        dtype=args.dtype,
+        mem_fraction_static=args.gpu_memory_utilization,
+        attention_backend=args.sglang_attention_backend,
+        sampling_backend=args.sglang_sampling_backend,
+        cuda_graph_backend_decode=args.sglang_cuda_graph_backend,
+        cuda_graph_backend_prefill=args.sglang_cuda_graph_backend,
+        log_level="error",
+    )
+    sampling_params = [
+        {
+            "temperature": 0,
+            "max_new_tokens": args.output_len,
+            "ignore_eos": True,
+        }
+        for _ in prompts
+    ]
+
+    try:
+        start = time.perf_counter()
+        outputs = engine.generate(input_ids=prompts, sampling_params=sampling_params)
+        elapsed = time.perf_counter() - start
+        if isinstance(outputs, dict):
+            outputs = [outputs]
+        output_tokens = sum(count_sglang_output_tokens(row) for row in outputs)
+        server_info = engine.get_server_info()
+    finally:
+        engine.shutdown()
+
+    last_gen = 0.0
+    try:
+        last_gen = float(server_info["internal_states"][0]["last_gen_throughput"])
+    except Exception:
+        pass
+
+    return {
+        "source": "sglang",
+        "comparison_scope": "original_framework_e2e",
+        "model": args.model,
+        "num_requests": args.num_prompts,
+        "total_input_tokens": args.num_prompts * args.input_len,
+        "total_output_tokens": output_tokens,
+        "elapsed_time": elapsed,
+        "requests_per_second": args.num_prompts / elapsed,
+        "input_tokens_per_second": (args.num_prompts * args.input_len) / elapsed,
+        "output_tokens_per_second": output_tokens / elapsed,
+        "total_tokens_per_second": (args.num_prompts * args.input_len + output_tokens)
+        / elapsed,
+        "last_gen_throughput": last_gen,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", required=True, choices=["vllm", "sglang"])
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--num-prompts", type=int, required=True)
+    parser.add_argument("--input-len", type=int, required=True)
+    parser.add_argument("--output-len", type=int, required=True)
+    parser.add_argument("--max-model-len", type=int, required=True)
+    parser.add_argument("--dtype", default="float16")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.45)
+    parser.add_argument("--vocab-size", type=int, default=49152)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--sglang-attention-backend", default="flashinfer")
+    parser.add_argument("--sglang-sampling-backend", default="pytorch")
+    parser.add_argument("--sglang-cuda-graph-backend", default="disabled")
+    parser.add_argument("--output-json", type=Path, required=True)
+    args = parser.parse_args()
+
+    prompts = build_token_prompts(args.num_prompts, args.input_len, args.vocab_size)
+    if args.source == "vllm":
+        result = run_vllm(args, prompts)
+    else:
+        result = run_sglang(args, prompts)
+
+    args.output_json.parent.mkdir(parents=True, exist_ok=True)
+    args.output_json.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

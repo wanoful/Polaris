@@ -60,9 +60,10 @@ LLAMA_CPP_BIN=/path/to/llama-bench
 
 ## vLLM / SGLang KV Trace Comparison
 
-For a real-model offline benchmark against both frameworks, use:
+For a real-model offline benchmark against unmodified vLLM/SGLang, use:
 
 ```sh
+FRAMEWORK_BENCH_TRACE=0 \
 FRAMEWORK_BENCH_MODEL=/home/wano/workspace/models/SmolLM2-135M-Instruct \
 FRAMEWORK_BENCH_NUM_PROMPTS=16 \
 FRAMEWORK_BENCH_INPUT_LEN=128 \
@@ -73,15 +74,20 @@ benchmarks/scripts/run_framework_kv_bench.sh
 
 The runner:
 
-- applies the vLLM and SGLang trace patches if needed;
-- runs `vllm bench throughput` and `sglang.bench_offline_throughput`;
-- writes framework throughput artifacts, KV traces, `runs.jsonl`, and
-  `summary.md` under `benchmarks/results/frameworks/<timestamp>/`.
+- runs unmodified vLLM/SGLang by default through their public offline APIs;
+- uses fixed token-id prompts so the input/output token counts are controlled;
+- writes framework throughput artifacts and `summary.md` under
+  `benchmarks/results/frameworks/<timestamp>/`.
+
+Set `FRAMEWORK_BENCH_TRACE=1` to apply the trace patches and collect KV
+allocator lifecycle CSVs. Trace mode is for KV allocator inspection, not for
+strict "original framework" throughput reporting.
 
 Useful knobs:
 
 ```sh
 FRAMEWORK_BENCH_MODES=vllm,sglang
+FRAMEWORK_BENCH_TRACE=0
 FRAMEWORK_BENCH_MODEL=/path/to/hf/model
 FRAMEWORK_BENCH_NUM_PROMPTS=16
 FRAMEWORK_BENCH_INPUT_LEN=128
@@ -149,3 +155,4 @@ should be labeled separately from these KV allocator metrics.
 Recorded real-model results:
 
 - `benchmarks/reports/framework-kv-real-model-20260616.md`
+- `benchmarks/reports/llama-polaris-vs-original-frameworks-20260616.md`
