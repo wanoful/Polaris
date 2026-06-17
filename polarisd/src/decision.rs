@@ -4,7 +4,8 @@ use crate::offload::CpuPool;
 use crate::rm;
 use libc::c_int;
 use libpolaris::types::*;
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExecutionResult {
@@ -17,7 +18,7 @@ pub struct ExecutionResult {
     pub rm_backing_length: u64,
 }
 
-fn decision_name(op: u32) -> &'static str {
+pub(crate) fn decision_name(op: u32) -> &'static str {
     match op {
         x if x == PolarisDecisionOp::Alloc as u32 => "ALLOC",
         x if x == PolarisDecisionOp::Free as u32 => "FREE",
@@ -28,6 +29,69 @@ fn decision_name(op: u32) -> &'static str {
         x if x == PolarisDecisionOp::CowBreak as u32 => "COW_BREAK",
         _ => "UNKNOWN",
     }
+}
+
+static PROFILE_DECISIONS: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn profile_decisions_enabled() -> bool {
+    *PROFILE_DECISIONS.get_or_init(|| env_enabled("POLARISD_PROFILE_DECISIONS"))
+}
+
+pub(crate) fn profile_decision_stage(
+    dec: &PolarisDecision,
+    stage: &str,
+    elapsed: Duration,
+    result: Option<i32>,
+) {
+    if !profile_decisions_enabled() {
+        return;
+    }
+
+    if let Some(result) = result {
+        eprintln!(
+            "polarisd_profile decision={} op={} block_id={} session_id={} size={} stage={} elapsed_ns={} result={}",
+            dec.decision_id,
+            decision_name(dec.op),
+            dec.block_id,
+            dec.session_id,
+            dec.size_bytes,
+            stage,
+            elapsed.as_nanos(),
+            result
+        );
+    } else {
+        eprintln!(
+            "polarisd_profile decision={} op={} block_id={} session_id={} size={} stage={} elapsed_ns={}",
+            dec.decision_id,
+            decision_name(dec.op),
+            dec.block_id,
+            dec.session_id,
+            dec.size_bytes,
+            stage,
+            elapsed.as_nanos()
+        );
+    }
+}
+
+pub(crate) fn profile_elapsed(
+    dec: &PolarisDecision,
+    stage: &str,
+    started: Instant,
+    result: Option<i32>,
+) {
+    profile_decision_stage(dec, stage, started.elapsed(), result);
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty()
+                && v != "0"
+                && !v.eq_ignore_ascii_case("false")
+                && !v.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
 }
 
 /// Execute a single kernel decision against the real GPU.
@@ -71,17 +135,33 @@ pub fn execute(
         dec.dst_vaddr
     );
 
+    let total_started = Instant::now();
+    let push_started = Instant::now();
     if let Err(e) = cuda_vmm::push_context(gpu.context) {
+        profile_elapsed(
+            dec,
+            "push_context",
+            push_started,
+            Some(-(libc::ENODEV as i32)),
+        );
+        profile_elapsed(
+            dec,
+            "decision_total",
+            total_started,
+            Some(-(libc::ENODEV as i32)),
+        );
         eprintln!("polarisd: push_context failed: {e}");
         return ExecutionResult {
             result: -(libc::ENODEV as i32),
             ..Default::default()
         };
     }
+    profile_elapsed(dec, "push_context", push_started, Some(0));
 
     let started = Instant::now();
     let outcome = dispatch(fd, dec, gpu, cpu_pool, rm_backend);
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    profile_elapsed(dec, "dispatch", started, Some(outcome.result));
     if dec.timeout_ms != 0 && elapsed_ms > dec.timeout_ms as u64 {
         eprintln!(
             "polarisd: decision {} exceeded timeout budget ({} ms > {} ms)",
@@ -89,7 +169,16 @@ pub fn execute(
         );
     }
 
-    let _ = cuda_vmm::pop_context();
+    let pop_started = Instant::now();
+    let pop_result = cuda_vmm::pop_context();
+    let pop_status = if pop_result.is_ok() {
+        0
+    } else {
+        -(libc::EIO as i32)
+    };
+    profile_elapsed(dec, "pop_context", pop_started, Some(pop_status));
+    let _ = pop_result;
+    profile_elapsed(dec, "decision_total", total_started, Some(outcome.result));
 
     outcome
 }
@@ -125,9 +214,16 @@ fn dispatch(
             let vaddr = dst.vaddr;
 
             if let Some(backend) = rm_backend.as_mut() {
+                let alloc_started = Instant::now();
                 let allocation = match backend.alloc_for_block(dec.block_id, size) {
                     Ok(allocation) => allocation,
                     Err(e) => {
+                        profile_elapsed(
+                            dec,
+                            "rm_alloc_backing",
+                            alloc_started,
+                            Some(-(libc::ENOMEM as i32)),
+                        );
                         eprintln!("polarisd: RM ALLOC failed for block {}: {e}", dec.block_id);
                         if dst.release_to_pool {
                             gpu.vas.free(vaddr, size);
@@ -138,6 +234,7 @@ fn dispatch(
                         };
                     }
                 };
+                profile_elapsed(dec, "rm_alloc_backing", alloc_started, Some(0));
 
                 gpu.track_va(dec.block_id, vaddr, size, dst.release_to_pool);
                 gpu.used_bytes += size;
@@ -157,9 +254,16 @@ fn dispatch(
                 };
             }
 
+            let create_started = Instant::now();
             let phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
                 Ok(h) => h,
                 Err(e) => {
+                    profile_elapsed(
+                        dec,
+                        "alloc_create_physical",
+                        create_started,
+                        Some(-(libc::ENOMEM as i32)),
+                    );
                     eprintln!(
                         "polarisd: cuMemCreate failed for block {}: {e}",
                         dec.block_id
@@ -173,8 +277,16 @@ fn dispatch(
                     };
                 }
             };
+            profile_elapsed(dec, "alloc_create_physical", create_started, Some(0));
 
+            let map_started = Instant::now();
             if let Err(e) = cuda_vmm::map_memory(vaddr, phys, size) {
+                profile_elapsed(
+                    dec,
+                    "alloc_map_memory",
+                    map_started,
+                    Some(-(libc::EINVAL as i32)),
+                );
                 eprintln!("polarisd: cuMemMap failed for block {}: {e}", dec.block_id);
                 if let Err(re) = cuda_vmm::release_physical(phys) {
                     eprintln!(
@@ -190,8 +302,16 @@ fn dispatch(
                     ..Default::default()
                 };
             }
+            profile_elapsed(dec, "alloc_map_memory", map_started, Some(0));
 
+            let access_started = Instant::now();
             if let Err(e) = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal) {
+                profile_elapsed(
+                    dec,
+                    "alloc_set_access",
+                    access_started,
+                    Some(-(libc::EINVAL as i32)),
+                );
                 eprintln!(
                     "polarisd: cuMemSetAccess failed for block {}: {e}",
                     dec.block_id
@@ -211,6 +331,7 @@ fn dispatch(
                     ..Default::default()
                 };
             }
+            profile_elapsed(dec, "alloc_set_access", access_started, Some(0));
 
             gpu.track_handle(dec.block_id, phys);
             gpu.track_va(dec.block_id, vaddr, size, dst.release_to_pool);

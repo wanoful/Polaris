@@ -1,10 +1,12 @@
 use crate::cuda_vmm;
 use crate::decision::ExecutionResult;
+use crate::decision::profile_elapsed;
 use crate::gpu;
 use crate::rm;
 use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::collections::HashMap;
+use std::time::Instant;
 
 /// Sub-allocation from the pre-allocated CPU pinned memory pool.
 pub struct CpuPool {
@@ -171,8 +173,10 @@ pub fn execute_offload(
     let sz_usize = size as usize;
 
     // Allocate CPU buffer from the pinned pool.
+    let pool_started = Instant::now();
     let cpu_addr = match cpu_pool.allocate(size) {
         Some(addr) => {
+            profile_elapsed(dec, "offload_cpu_pool_alloc", pool_started, Some(0));
             eprintln!(
                 "polarisd: OFFLOAD block {} -> cpu_buf={addr:#x} size={size}",
                 dec.block_id
@@ -180,6 +184,12 @@ pub fn execute_offload(
             addr
         }
         None => {
+            profile_elapsed(
+                dec,
+                "offload_cpu_pool_alloc",
+                pool_started,
+                Some(-(libc::ENOMEM as i32)),
+            );
             eprintln!(
                 "polarisd: OFFLOAD block {} CPU pool exhausted (used={} total={})",
                 dec.block_id,
@@ -191,25 +201,50 @@ pub fn execute_offload(
     };
 
     // Copy GPU → CPU (the VA is still mapped and accessible).
+    let copy_started = Instant::now();
     if let Err(e) = cuda_vmm::copy_device_to_host(cpu_addr, src_vaddr, sz_usize) {
+        profile_elapsed(
+            dec,
+            "offload_copy_device_to_host",
+            copy_started,
+            Some(-(libc::EFAULT as i32)),
+        );
         eprintln!("polarisd: OFFLOAD cudaMemcpyDtoH failed for block {}: {e}", dec.block_id);
         cpu_pool.free(cpu_addr, size);
         return (-(libc::EFAULT as i32), 0, 0);
     }
+    profile_elapsed(dec, "offload_copy_device_to_host", copy_started, Some(0));
 
     // Unmap the GPU VA — data now lives only in the CPU buffer.
+    let unmap_started = Instant::now();
     if let Err(e) = cuda_vmm::unmap_memory(src_vaddr, size) {
+        profile_elapsed(
+            dec,
+            "offload_unmap_memory",
+            unmap_started,
+            Some(-(libc::EINVAL as i32)),
+        );
         eprintln!("polarisd: OFFLOAD unmap failed for block {}: {e}", dec.block_id);
         cpu_pool.free(cpu_addr, size);
         return (-(libc::EINVAL as i32), 0, 0);
     }
+    profile_elapsed(dec, "offload_unmap_memory", unmap_started, Some(0));
 
     // Release the physical GPU memory handle. This is what genuinely
     // frees GPU bytes — without it, cuMemCreate for new blocks would
     // fail with OUT_OF_MEMORY even though our accounting says we have room.
     if let Some(old_phys) = gpu.get_handle(dec.block_id) {
+        let release_started = Instant::now();
         if let Err(e) = cuda_vmm::release_physical(old_phys) {
+            profile_elapsed(
+                dec,
+                "offload_release_physical",
+                release_started,
+                Some(-(libc::EIO as i32)),
+            );
             eprintln!("polarisd: OFFLOAD cuMemRelease failed for block {}: {e}", dec.block_id);
+        } else {
+            profile_elapsed(dec, "offload_release_physical", release_started, Some(0));
         }
     }
 
@@ -266,25 +301,48 @@ pub fn execute_reload(
     }
 
     // Create new physical memory (old was released during offload).
+    let create_started = Instant::now();
     let new_phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
         Ok(h) => h,
         Err(e) => {
+            profile_elapsed(
+                dec,
+                "reload_create_physical",
+                create_started,
+                Some(-(libc::ENOMEM as i32)),
+            );
             eprintln!("polarisd: RELOAD cuMemCreate failed for block {}: {e}", dec.block_id);
             return (-(libc::ENOMEM as i32), 0, 0);
         }
     };
+    profile_elapsed(dec, "reload_create_physical", create_started, Some(0));
 
     // Map the new physical handle.
+    let map_started = Instant::now();
     if let Err(e) = cuda_vmm::map_memory(vaddr, new_phys, size) {
+        profile_elapsed(
+            dec,
+            "reload_map_memory",
+            map_started,
+            Some(-(libc::EINVAL as i32)),
+        );
         eprintln!("polarisd: RELOAD cuMemMap failed for block {}: {e}", dec.block_id);
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
             eprintln!("polarisd: RELOAD cuMemRelease cleanup failed for block {}: {re}", dec.block_id);
         }
         return (-(libc::EINVAL as i32), 0, 0);
     }
+    profile_elapsed(dec, "reload_map_memory", map_started, Some(0));
 
     // Set access for this GPU.
+    let access_started = Instant::now();
     if let Err(e) = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal) {
+        profile_elapsed(
+            dec,
+            "reload_set_access",
+            access_started,
+            Some(-(libc::EINVAL as i32)),
+        );
         eprintln!("polarisd: RELOAD cuMemSetAccess failed for block {}: {e}", dec.block_id);
         let _ = cuda_vmm::unmap_memory(vaddr, size);
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
@@ -292,9 +350,17 @@ pub fn execute_reload(
         }
         return (-(libc::EINVAL as i32), 0, 0);
     }
+    profile_elapsed(dec, "reload_set_access", access_started, Some(0));
 
     // Copy CPU → GPU (the new mapping is now accessible).
+    let copy_started = Instant::now();
     if let Err(e) = cuda_vmm::copy_host_to_device(vaddr, cpu_addr, size as usize) {
+        profile_elapsed(
+            dec,
+            "reload_copy_host_to_device",
+            copy_started,
+            Some(-(libc::EFAULT as i32)),
+        );
         eprintln!("polarisd: RELOAD cudaMemcpyHtoD failed for block {}: {e}", dec.block_id);
         let _ = cuda_vmm::unmap_memory(vaddr, size);
         if let Err(re) = cuda_vmm::release_physical(new_phys) {
@@ -302,10 +368,13 @@ pub fn execute_reload(
         }
         return (-(libc::EFAULT as i32), 0, 0);
     }
+    profile_elapsed(dec, "reload_copy_host_to_device", copy_started, Some(0));
 
     // Release the CPU buffer — data now back on GPU.
+    let pool_started = Instant::now();
     cpu_pool.untrack(dec.block_id);
     cpu_pool.free(cpu_addr, size);
+    profile_elapsed(dec, "reload_cpu_pool_free", pool_started, Some(0));
 
     // Update daemon tracking.
     gpu.track_handle(dec.block_id, new_phys);
@@ -349,9 +418,16 @@ pub fn execute_rm_offload(
         };
     }
 
+    let pool_started = Instant::now();
     let cpu_addr = match cpu_pool.allocate(size) {
         Some(addr) => addr,
         None => {
+            profile_elapsed(
+                dec,
+                "rm_offload_cpu_pool_alloc",
+                pool_started,
+                Some(-(libc::ENOMEM as i32)),
+            );
             eprintln!(
                 "polarisd: RM OFFLOAD block {} CPU pool exhausted (used={} total={})",
                 dec.block_id,
@@ -364,6 +440,7 @@ pub fn execute_rm_offload(
             };
         }
     };
+    profile_elapsed(dec, "rm_offload_cpu_pool_alloc", pool_started, Some(0));
 
     let mut copy = PolarisRmCopyArg {
         block_id: dec.block_id,
@@ -373,7 +450,9 @@ pub fn execute_rm_offload(
         direction: POLARIS_RM_COPY_TO_CPU,
         ..Default::default()
     };
+    let copy_started = Instant::now();
     if let Err(errno) = ioctl::rm_copy(fd, &mut copy) {
+        profile_elapsed(dec, "rm_offload_copy_to_cpu_ioctl", copy_started, Some(-errno));
         eprintln!(
             "polarisd: RM OFFLOAD copy block {} failed: errno={errno}",
             dec.block_id
@@ -384,6 +463,7 @@ pub fn execute_rm_offload(
             ..Default::default()
         };
     }
+    profile_elapsed(dec, "rm_offload_copy_to_cpu_ioctl", copy_started, Some(0));
     if copy.bytes_copied != size {
         eprintln!(
             "polarisd: RM OFFLOAD short copy block {} bytes=0x{:x} expected=0x{:x}",
@@ -398,7 +478,14 @@ pub fn execute_rm_offload(
         };
     }
 
+    let free_started = Instant::now();
     if let Err(e) = backend.free_block(dec.block_id) {
+        profile_elapsed(
+            dec,
+            "rm_offload_free_backing",
+            free_started,
+            Some(-(libc::EIO as i32)),
+        );
         eprintln!("polarisd: RM OFFLOAD free RM backing failed for block {}: {e}", dec.block_id);
         cpu_pool.free(cpu_addr, size);
         return ExecutionResult {
@@ -406,6 +493,7 @@ pub fn execute_rm_offload(
             ..Default::default()
         };
     }
+    profile_elapsed(dec, "rm_offload_free_backing", free_started, Some(0));
 
     cpu_pool.track(dec.block_id, cpu_addr);
     gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
@@ -456,9 +544,16 @@ pub fn execute_rm_reload(
         };
     }
 
+    let alloc_started = Instant::now();
     let allocation = match backend.alloc_for_block(dec.block_id, size) {
         Ok(allocation) => allocation,
         Err(e) => {
+            profile_elapsed(
+                dec,
+                "rm_reload_alloc_backing",
+                alloc_started,
+                Some(-(libc::ENOMEM as i32)),
+            );
             eprintln!("polarisd: RM RELOAD alloc failed for block {}: {e}", dec.block_id);
             return ExecutionResult {
                 result: -(libc::ENOMEM as i32),
@@ -466,6 +561,7 @@ pub fn execute_rm_reload(
             };
         }
     };
+    profile_elapsed(dec, "rm_reload_alloc_backing", alloc_started, Some(0));
 
     let mut copy = PolarisRmCopyArg {
         block_id: dec.block_id,
@@ -478,7 +574,9 @@ pub fn execute_rm_reload(
         rm_h_memory: allocation.h_memory,
         ..Default::default()
     };
+    let copy_started = Instant::now();
     if let Err(errno) = ioctl::rm_copy(fd, &mut copy) {
+        profile_elapsed(dec, "rm_reload_copy_from_cpu_ioctl", copy_started, Some(-errno));
         eprintln!(
             "polarisd: RM RELOAD copy block {} failed: errno={errno}",
             dec.block_id
@@ -489,6 +587,7 @@ pub fn execute_rm_reload(
             ..Default::default()
         };
     }
+    profile_elapsed(dec, "rm_reload_copy_from_cpu_ioctl", copy_started, Some(0));
     if copy.bytes_copied != size {
         eprintln!(
             "polarisd: RM RELOAD short copy block {} bytes=0x{:x} expected=0x{:x}",
@@ -503,8 +602,10 @@ pub fn execute_rm_reload(
         };
     }
 
+    let pool_started = Instant::now();
     cpu_pool.untrack(dec.block_id);
     cpu_pool.free(dec.cpu_addr, size);
+    profile_elapsed(dec, "rm_reload_cpu_pool_free", pool_started, Some(0));
 
     if let Some(va) = gpu.get_va_alloc(dec.block_id) {
         gpu.track_va(dec.block_id, va.vaddr, va.size, false);

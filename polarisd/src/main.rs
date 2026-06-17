@@ -12,6 +12,7 @@ use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
+use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("polarisd: starting POLARIS daemon");
@@ -237,12 +238,26 @@ fn decision_loop(
                         ..Default::default()
                     };
 
+                    let complete_started = Instant::now();
                     if let Err(e) =
                         ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
                     {
+                        decision::profile_elapsed(
+                            dec,
+                            "complete_operation_ioctl",
+                            complete_started,
+                            Some(-e),
+                        );
                         eprintln!(
                             "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
                             dec.decision_id
+                        );
+                    } else {
+                        decision::profile_elapsed(
+                            dec,
+                            "complete_operation_ioctl",
+                            complete_started,
+                            Some(0),
                         );
                     }
 

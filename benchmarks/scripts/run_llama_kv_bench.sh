@@ -337,6 +337,57 @@ def parse_polarisd_decisions(path):
             counts[key] += 1
     return counts
 
+def summarize_ns(values):
+    values = sorted(values)
+    if not values:
+        return {
+            "count": 0,
+            "total_ns": 0,
+            "avg_ns": 0,
+            "p50_ns": 0,
+            "p90_ns": 0,
+            "p99_ns": 0,
+            "max_ns": 0,
+        }
+
+    def percentile(pct):
+        idx = int((len(values) - 1) * pct / 100)
+        return values[idx]
+
+    total = sum(values)
+    return {
+        "count": len(values),
+        "total_ns": total,
+        "avg_ns": total / len(values),
+        "p50_ns": percentile(50),
+        "p90_ns": percentile(90),
+        "p99_ns": percentile(99),
+        "max_ns": values[-1],
+    }
+
+def parse_polarisd_profile(path):
+    p = Path(path)
+    if not path or not p.exists():
+        return {}
+
+    # Example:
+    # polarisd_profile decision=12 op=RELOAD ... stage=rm_reload_copy_from_cpu_ioctl elapsed_ns=1234 result=0
+    pattern = re.compile(
+        r"polarisd_profile\b.*?\bop=([A-Z_]+)\b.*?\bstage=([A-Za-z0-9_]+)\b.*?\belapsed_ns=(\d+)"
+    )
+    grouped = {}
+    for line in p.read_text(errors="replace").splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        op, stage, elapsed = match.groups()
+        grouped.setdefault(op, {}).setdefault(stage, []).append(int(elapsed))
+
+    return {
+        op: {stage: summarize_ns(values) for stage, values in sorted(stages.items())}
+        for op, stages in sorted(grouped.items())
+    }
+
 before_s = parse_stats(before)
 after_s = parse_stats(after)
 delta = {k: after_s.get(k, 0) - before_s.get(k, 0) for k in keys}
@@ -344,6 +395,7 @@ llama = load_llama(stdout_json)
 avg_ts_values = [x.get("avg_ts") for x in llama if isinstance(x, dict) and isinstance(x.get("avg_ts"), (int, float))]
 avg_ts = sum(avg_ts_values) / len(avg_ts_values) if avg_ts_values else None
 polarisd_decisions = parse_polarisd_decisions(polarisd_log)
+polarisd_profile = parse_polarisd_profile(polarisd_log)
 record = {
     "source": "polaris",
     "mode": mode,
@@ -368,6 +420,7 @@ record = {
     "stats_after": after_s,
     "stats_delta": delta,
     "polarisd_decisions": polarisd_decisions,
+    "polarisd_profile": polarisd_profile,
     "stdout_json": stdout_json,
     "stderr_log": stderr_log,
     "polarisd_log": polarisd_log,
@@ -422,7 +475,8 @@ run_one() {
             require_uvm_dispatch_key_probe
             start_polarisd "$polarisd_log" \
                 POLARISD_GPU_BUDGET_BYTES="$budget_bytes" \
-                POLARISD_CPU_POOL_BYTES="$cpu_pool_bytes"
+                POLARISD_CPU_POOL_BYTES="$cpu_pool_bytes" \
+                POLARISD_PROFILE_DECISIONS="${POLARISD_PROFILE_DECISIONS:-0}"
             set_eviction_policy
             set +e
             run_bench_command "$stdout_json" "$stderr_log" \
@@ -433,6 +487,9 @@ run_one() {
                 POLARIS_SHIM_STRICT_MANAGED_ALLOC=1 \
                 POLARIS_SHIM_REPORT_STATS=1 \
                 POLARIS_SHIM_REQUIRE_KV_SCOPE="${POLARIS_SHIM_REQUIRE_KV_SCOPE:-1}" \
+                POLARIS_SHIM_AUTO_KV_HINTS="${POLARIS_SHIM_AUTO_KV_HINTS:-0}" \
+                POLARIS_LLAMA_KV_HINTS="${POLARIS_LLAMA_KV_HINTS:-0}" \
+                POLARIS_LLAMA_KV_HINT_TRACE="${POLARIS_LLAMA_KV_HINT_TRACE:-0}" \
                 POLARIS_SHIM_ALLOW_ZERO_MEMSET="${POLARIS_SHIM_ALLOW_ZERO_MEMSET:-1}" \
                 POLARIS_SHIM_TRANSIENT_GPU="${POLARIS_SHIM_TRANSIENT_GPU:-1}" \
                 POLARIS_SHIM_GPU_ID="${POLARIS_SHIM_GPU_ID:-0}" \
