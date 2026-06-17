@@ -1864,6 +1864,22 @@ fn polaris_current_pid() -> i32 {
     }
 }
 
+fn polaris_block_accessible_to_session(
+    inner: &PolarisInner,
+    block: &PolarisBlock,
+    session_id: u64,
+) -> bool {
+    if block.session_id == session_id {
+        return true;
+    }
+    inner
+        .sessions
+        .iter()
+        .find(|s| s.session_id == session_id)
+        .map(|s| s.block_ids.iter().any(|&bid| bid == block.block_id))
+        .unwrap_or(false)
+}
+
 // ─── Global shared state ────────────────────────────────────────────────────
 
 pub(crate) struct PolarisInner {
@@ -2377,6 +2393,17 @@ unsafe extern "C" fn polaris_stats_show(
     let static_blocks = inner.static_blocks.len();
     let block_mappings = inner.block_mappings.len();
     let v4_worker_pids = inner.va_spaces.iter().filter(|v| v.pid != 0).count();
+    let kv_active_sessions = inner
+        .sessions
+        .iter()
+        .filter(|s| s.active_read_token_count != 0 || s.active_write_token_count != 0)
+        .count();
+    let kv_active_max_epoch = inner
+        .sessions
+        .iter()
+        .map(|s| s.active_epoch)
+        .max()
+        .unwrap_or(0);
     let fast_va_spaces = POLARIS_FAST_VASPACES
         .iter()
         .filter(|slot| slot.va_space_token.load(Acquire) != 0)
@@ -2473,6 +2500,8 @@ v4_va_spaces:   {v4_va_spaces}
 v4_worker_pids: {v4_worker_pids}
 static_blocks:  {static_blocks}
 block_mappings: {block_mappings}
+kv_active_sessions:{kv_active_sessions}
+kv_active_epoch:{kv_active_max_epoch}
 uvm_hook_calls: {uvm_hook_calls}
 uvm_fast_hits:  {uvm_fast_matches}
 uvm_fast_miss:  {uvm_fast_misses}
@@ -2530,6 +2559,8 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 v4_worker_pids = v4_worker_pids,
                 static_blocks = static_blocks,
                 block_mappings = block_mappings,
+                kv_active_sessions = kv_active_sessions,
+                kv_active_max_epoch = kv_active_max_epoch,
                 uvm_hook_calls = uvm_hook_calls,
                 uvm_fast_matches = uvm_fast_matches,
                 uvm_fast_misses = uvm_fast_misses,
@@ -2831,6 +2862,7 @@ impl MiscDevice for PolarisDevice {
             POLARIS_PROBE_RM_PHYS => me.handle_probe_rm_phys(user_ptr, size),
             POLARIS_PROBE_RM_COPY => me.handle_probe_rm_copy(user_ptr, size),
             POLARIS_RM_COPY => me.handle_rm_copy(user_ptr, size),
+            POLARIS_UPDATE_KV_ACTIVE_WINDOW => me.handle_update_kv_active_window(user_ptr, size),
             _ => {
                 dev_err!(me.dev, "POLARIS: unknown ioctl 0x{:x}\n", cmd);
                 Err(ENOTTY)
@@ -3115,6 +3147,12 @@ impl PolarisDevice {
                 bytes_per_token: bpt,
                 parent_session_id: 0,
                 priority,
+                active_phase: PolarisPhase::Prefill,
+                active_read_start_token: 0,
+                active_read_token_count: 0,
+                active_write_start_token: 0,
+                active_write_token_count: 0,
+                active_epoch: 0,
                 block_ids: KVec::new(),
             },
             GFP_KERNEL,
@@ -3361,6 +3399,12 @@ impl PolarisDevice {
         let parent_beam = parent.beam_width;
         let parent_bpt = parent.bytes_per_token;
         let parent_priority = parent.priority;
+        let parent_active_phase = parent.active_phase;
+        let parent_active_read_start = parent.active_read_start_token;
+        let parent_active_read_count = parent.active_read_token_count;
+        let parent_active_write_start = parent.active_write_start_token;
+        let parent_active_write_count = parent.active_write_token_count;
+        let parent_active_epoch = parent.active_epoch;
         let parent_block_ids: KVec<u64> = {
             let mut ids = KVec::new();
             for &bid in &parent.block_ids {
@@ -3419,6 +3463,12 @@ impl PolarisDevice {
                 bytes_per_token: parent_bpt,
                 parent_session_id: parent_id,
                 priority: parent_priority,
+                active_phase: parent_active_phase,
+                active_read_start_token: parent_active_read_start,
+                active_read_token_count: parent_active_read_count,
+                active_write_start_token: parent_active_write_start,
+                active_write_token_count: parent_active_write_count,
+                active_epoch: parent_active_epoch,
                 block_ids: parent_block_ids,
             },
             GFP_KERNEL,
@@ -3841,22 +3891,60 @@ impl PolarisDevice {
         Ok(0)
     }
 
+    fn handle_update_kv_active_window(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
+        let mut reader = UserSlice::new(user_ptr, size).reader();
+        let arg: PolarisKvActiveWindowArg = reader.read()?;
+        let mut guard = POLARIS_STATE.lock();
+        let inner = guard.as_mut().ok_or(ENODEV)?;
+        let session = inner
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == arg.session_id)
+            .ok_or(ENOENT)?;
+
+        if arg.flags & POLARIS_KV_HINT_FLAG_CLEAR != 0 {
+            session.active_phase = PolarisPhase::Prefill;
+            session.active_read_start_token = 0;
+            session.active_read_token_count = 0;
+            session.active_write_start_token = 0;
+            session.active_write_token_count = 0;
+            session.active_epoch = arg.epoch;
+            return Ok(0);
+        }
+
+        session.active_phase = if arg.phase == PolarisPhase::Decode as u32 {
+            PolarisPhase::Decode
+        } else {
+            PolarisPhase::Prefill
+        };
+        session.active_read_start_token = arg.read_start_token;
+        session.active_read_token_count = arg.read_token_count;
+        session.active_write_start_token = arg.write_start_token;
+        session.active_write_token_count = arg.write_token_count;
+        session.active_epoch = arg.epoch;
+        Ok(0)
+    }
+
     fn handle_block_get_state(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let mut arg: PolarisBlockGetStateArg = reader.read()?;
         let guard = POLARIS_STATE.lock();
         let inner = guard.as_ref().ok_or(ENODEV)?;
 
-        // Look up by session_id and token_start.  For COW child sessions the
-        // block's session_id is the parent's, so fall back to the session's
-        // block_ids list.
-        let maybe_block = {
-            let direct = inner
-                .blocks
-                .iter()
-                .find(|b| b.session_id == arg.session_id && b.token_start == arg.token_start);
-            if direct.is_some() {
-                direct
+        let maybe_block = if arg.block_id != 0 {
+            inner.blocks.iter().find(|b| {
+                b.block_id == arg.block_id
+                    && polaris_block_accessible_to_session(inner, b, arg.session_id)
+            })
+        } else {
+            // Legacy lookup by session_id and token_start. For COW child
+            // sessions the block's session_id is the parent's, so fall back
+            // to the session's block_ids list.
+            let direct = inner.blocks.iter().find(|b| {
+                b.session_id == arg.session_id && b.token_start == arg.token_start
+            });
+            if let Some(block) = direct {
+                Some(block)
             } else {
                 let session = inner.sessions.iter().find(|s| s.session_id == arg.session_id);
                 session.and_then(|sess| {

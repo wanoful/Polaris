@@ -98,6 +98,9 @@ pub const POLARIS_PROBE_RM_COPY: u32 =
 pub const POLARIS_RM_COPY: u32 =
     kernel::ioctl::_IOWR::<PolarisRmCopyArg>(POLARIS_IOCTL_MAGIC, 0x1A);
 
+pub const POLARIS_UPDATE_KV_ACTIVE_WINDOW: u32 =
+    kernel::ioctl::_IOW::<PolarisKvActiveWindowArg>(POLARIS_IOCTL_MAGIC, 0x1B);
+
 // ─── Block Flags (kernel-side type-safe wrappers) ───────────────────────────
 
 impl_flags!(
@@ -198,6 +201,12 @@ pub struct PolarisSession {
     pub bytes_per_token: u64,
     pub parent_session_id: u64,
     pub priority: u32,
+    pub active_phase: PolarisPhase,
+    pub active_read_start_token: u64,
+    pub active_read_token_count: u64,
+    pub active_write_start_token: u64,
+    pub active_write_token_count: u64,
+    pub active_epoch: u64,
     pub block_ids: KVec<u64>, // ordered list of block IDs in token order
 }
 
@@ -335,6 +344,9 @@ unsafe impl kernel::transmute::AsBytes for PolarisGetDecisionArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisSetPolicyArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisSetPolicyArg {}
+
+unsafe impl kernel::transmute::FromBytes for PolarisKvActiveWindowArg {}
+unsafe impl kernel::transmute::AsBytes for PolarisKvActiveWindowArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisListSessionsArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisListSessionsArg {}

@@ -123,6 +123,9 @@ pub const POLARIS_PROBE_RM_COPY: u32 =
 pub const POLARIS_RM_COPY: u32 =
     iowr!(MAGIC, 0x1A, PolarisRmCopyArg);
 
+pub const POLARIS_UPDATE_KV_ACTIVE_WINDOW: u32 =
+    iow!(MAGIC, 0x1B, PolarisKvActiveWindowArg);
+
 // ─── Low-level ioctl wrappers ────────────────────────────────────────────────
 
 /// Issue an ioctl to a file descriptor with a mutable argument.
@@ -221,4 +224,9 @@ pub fn probe_rm_copy(fd: i32, arg: &mut PolarisProbeRmCopyArg) -> Result<(), i32
 /// Copy between an RM-backed logical block and a userspace CPU buffer.
 pub fn rm_copy(fd: i32, arg: &mut PolarisRmCopyArg) -> Result<(), i32> {
     ioctl_read(fd, POLARIS_RM_COPY, arg)
+}
+
+/// Publish the current KV active read/write window for a session.
+pub fn update_kv_active_window(fd: i32, arg: &PolarisKvActiveWindowArg) -> Result<(), i32> {
+    ioctl_write(fd, POLARIS_UPDATE_KV_ACTIVE_WINDOW, arg)
 }

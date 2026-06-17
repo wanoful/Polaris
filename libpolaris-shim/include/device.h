@@ -54,6 +54,38 @@ int polaris_shim_block_release_with_flags(uint64_t session_id,
                                           uint32_t token_count,
                                           uint32_t flags);
 
+int polaris_shim_update_kv_active_window(uint64_t session_id,
+                                         uint32_t phase,
+                                         uint32_t flags,
+                                         uint64_t read_start_token,
+                                         uint64_t read_token_count,
+                                         uint64_t write_start_token,
+                                         uint64_t write_token_count,
+                                         uint64_t epoch);
+
+/*
+ * Publish/clear a KV active-window hint for the shim-owned Polaris session.
+ * These are exported by libpolaris-shim.so so framework adapters can report
+ * precise prefill/decode read/write ranges without knowing the session id.
+ */
+int polaris_shim_set_kv_active_window(uint32_t phase,
+                                      uint64_t read_start_token,
+                                      uint64_t read_token_count,
+                                      uint64_t write_start_token,
+                                      uint64_t write_token_count);
+
+int polaris_shim_set_kv_active_byte_ranges(uint32_t phase,
+                                           const void *read0,
+                                           uint64_t read0_bytes,
+                                           const void *read1,
+                                           uint64_t read1_bytes,
+                                           const void *write0,
+                                           uint64_t write0_bytes,
+                                           const void *write1,
+                                           uint64_t write1_bytes);
+
+int polaris_shim_clear_kv_active_window(void);
+
 /*
  * Submit POLARIS_REGISTER_VASPACE. Returns 0 on success, -errno on failure.
  * Safe to call when /dev/polaris is unavailable: returns -ENODEV and the

@@ -26,6 +26,8 @@
 #define POLARIS_RESERVE_FLAG_OVERWRITE (1U << 0)
 #define POLARIS_RESERVE_FLAG_DEFER_FAULT (1U << 4)
 #define POLARIS_PHASE_PREFILL 1U
+#define POLARIS_PHASE_DECODE 2U
+#define POLARIS_KV_HINT_FLAG_CLEAR (1U << 0)
 
 struct polaris_register_gpu_arg {
     uint32_t gpu_id;
@@ -161,6 +163,18 @@ struct polaris_block_release_arg {
     uint64_t _reserved2[4];
 };
 
+struct polaris_kv_active_window_arg {
+    uint64_t session_id;
+    uint32_t phase;
+    uint32_t flags;
+    uint64_t read_start_token;
+    uint64_t read_token_count;
+    uint64_t write_start_token;
+    uint64_t write_token_count;
+    uint64_t epoch;
+    uint64_t _reserved[4];
+};
+
 #define POLARIS_REGISTER_GPU _IOW(POLARIS_IOCTL_MAGIC, 0x01, struct polaris_register_gpu_arg)
 #define POLARIS_REGISTER_VA_RANGE _IOWR(POLARIS_IOCTL_MAGIC, 0x02, struct polaris_register_va_range_arg)
 #define POLARIS_SESSION_CREATE _IOWR(POLARIS_IOCTL_MAGIC, 0x03, struct polaris_session_create_arg)
@@ -175,6 +189,7 @@ struct polaris_block_release_arg {
 #define POLARIS_UNMAP_BLOCK_MAPPINGS _IOWR(POLARIS_IOCTL_MAGIC, 0x15, struct polaris_unmap_block_mappings_arg)
 #define POLARIS_SPILL_BLOCK _IOWR(POLARIS_IOCTL_MAGIC, 0x16, struct polaris_spill_block_arg)
 #define POLARIS_REGISTER_BLOCK_BACKING _IOW(POLARIS_IOCTL_MAGIC, 0x17, struct polaris_register_block_backing_arg)
+#define POLARIS_UPDATE_KV_ACTIVE_WINDOW _IOW(POLARIS_IOCTL_MAGIC, 0x1b, struct polaris_kv_active_window_arg)
 
 #define POLARIS_REGISTER_GPU_FLAG_TRANSIENT (1U << 0)
 #define POLARIS_RELEASE_FLAG_CALLER_OWNS_BACKING (1U << 1)

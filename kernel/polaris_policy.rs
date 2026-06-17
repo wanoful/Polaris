@@ -288,6 +288,10 @@ const MAX_AGE_SCORE_MS: u64 = 120_000;
 const ACTIVE_AHEAD_PROTECT_CHUNKS: u32 = 4;
 const ACTIVE_BEHIND_PROTECT_CHUNKS: u32 = 4;
 const ACTIVE_WINDOW_PROTECT_SCORE: i64 = 500_000;
+const HINTED_ACTIVE_READ_PROTECT_SCORE: i64 = 750_000;
+const HINTED_ACTIVE_WRITE_PROTECT_SCORE: i64 = 1_000_000;
+const HINTED_ACTIVE_NEAR_PROTECT_SCORE: i64 = 250_000;
+const HINTED_ACTIVE_NEAR_TOKENS: u64 = 4;
 
 #[derive(Clone, Copy)]
 struct ActiveChunkWindow {
@@ -296,24 +300,74 @@ struct ActiveChunkWindow {
     end: u32,
 }
 
-fn active_chunk_window(inner: &PolarisInner, protected_block_id: u64) -> Option<ActiveChunkWindow> {
+#[derive(Clone, Copy)]
+struct ActiveKvWindow {
+    session_id: u64,
+    read_start: u64,
+    read_end: u64,
+    write_start: u64,
+    write_end: u64,
+}
+
+fn active_chunk_window(
+    inner: &PolarisInner,
+    requesting_session_id: u64,
+    protected_block_id: u64,
+) -> Option<ActiveChunkWindow> {
     if protected_block_id == 0 {
         return None;
     }
     inner.blocks.iter()
         .find(|b| b.block_id == protected_block_id)
-        .map(|b| ActiveChunkWindow {
-            session_id: b.session_id,
-            start: b.token_start,
-            end: b.token_start.saturating_add(b.token_count),
+        .map(|b| {
+            let session_id = if block_owned_by_session(inner, b, requesting_session_id) {
+                requesting_session_id
+            } else {
+                b.session_id
+            };
+            ActiveChunkWindow {
+                session_id,
+                start: b.token_start,
+                end: b.token_start.saturating_add(b.token_count),
+            }
         })
 }
 
-fn active_window_score(block: &PolarisBlock, active: Option<ActiveChunkWindow>) -> i64 {
+fn active_kv_window(inner: &PolarisInner, session_id: u64) -> Option<ActiveKvWindow> {
+    let session = inner.sessions.iter().find(|s| s.session_id == session_id)?;
+    let read_end = session
+        .active_read_start_token
+        .saturating_add(session.active_read_token_count);
+    let write_end = session
+        .active_write_start_token
+        .saturating_add(session.active_write_token_count);
+
+    if session.active_read_token_count == 0 && session.active_write_token_count == 0 {
+        return None;
+    }
+
+    Some(ActiveKvWindow {
+        session_id,
+        read_start: session.active_read_start_token,
+        read_end,
+        write_start: session.active_write_start_token,
+        write_end,
+    })
+}
+
+fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+fn active_window_score(
+    inner: &PolarisInner,
+    block: &PolarisBlock,
+    active: Option<ActiveChunkWindow>,
+) -> i64 {
     let Some(active) = active else {
         return 0;
     };
-    if block.session_id != active.session_id {
+    if !block_owned_by_session(inner, block, active.session_id) {
         return 0;
     }
 
@@ -337,6 +391,44 @@ fn active_window_score(block: &PolarisBlock, active: Option<ActiveChunkWindow>) 
     0
 }
 
+fn hinted_active_window_score(
+    inner: &PolarisInner,
+    block: &PolarisBlock,
+    active: Option<ActiveKvWindow>,
+) -> i64 {
+    let Some(active) = active else {
+        return 0;
+    };
+    if !block_owned_by_session(inner, block, active.session_id) {
+        return 0;
+    }
+
+    let block_start = block.token_start as u64;
+    let block_end = block_start.saturating_add(block.token_count as u64);
+
+    if active.write_start < active.write_end
+        && ranges_overlap(block_start, block_end, active.write_start, active.write_end)
+    {
+        return -HINTED_ACTIVE_WRITE_PROTECT_SCORE;
+    }
+
+    if active.read_start < active.read_end
+        && ranges_overlap(block_start, block_end, active.read_start, active.read_end)
+    {
+        return -HINTED_ACTIVE_READ_PROTECT_SCORE;
+    }
+
+    if active.read_start < active.read_end {
+        let near_start = active.read_start.saturating_sub(HINTED_ACTIVE_NEAR_TOKENS);
+        let near_end = active.read_end.saturating_add(HINTED_ACTIVE_NEAR_TOKENS);
+        if ranges_overlap(block_start, block_end, near_start, near_end) {
+            return -HINTED_ACTIVE_NEAR_PROTECT_SCORE;
+        }
+    }
+
+    0
+}
+
 fn phase_aware_order_time(block: &PolarisBlock) -> u64 {
     if block.phase == PolarisPhase::Decode && block.last_touch_ns != 0 {
         block.last_touch_ns
@@ -347,11 +439,13 @@ fn phase_aware_order_time(block: &PolarisBlock) -> u64 {
 
 /// Score the block. Higher = more evictable.
 fn phase_aware_score(
+    inner: &PolarisInner,
     block: &PolarisBlock,
     now: u64,
     gpu_pressure: u64,
     session_priority: u32,
     active: Option<ActiveChunkWindow>,
+    hinted_active: Option<ActiveKvWindow>,
 ) -> i64 {
     let order_time = phase_aware_order_time(block);
     let age_ns = now.saturating_sub(order_time);
@@ -377,7 +471,8 @@ fn phase_aware_score(
         + PREFILL_WEIGHT * is_prefill
         + PRESSURE_WEIGHT * pressure_norm
         + PRIORITY_WEIGHT * inv_priority
-        + active_window_score(block, active)
+        + active_window_score(inner, block, active)
+        + hinted_active_window_score(inner, block, hinted_active)
         - SHARING_WEIGHT * refcount
         - DECODE_WEIGHT * recent_decode
 }
@@ -393,7 +488,9 @@ fn find_victim_phase_aware(
     // marks selected allocations as prefill. In that common single-session,
     // private-prefill shape, FIFO map order is the best available signal and
     // avoids treating chunk IDs as semantic LLM token positions.
-    if phase_aware_should_use_fifo_order(inner, target_gpu) {
+    let hinted_active = active_kv_window(inner, requesting_session_id);
+
+    if hinted_active.is_none() && phase_aware_should_use_fifo_order(inner, target_gpu) {
         return find_victim_fifo(
             inner,
             requesting_session_id,
@@ -404,7 +501,7 @@ fn find_victim_phase_aware(
     }
 
     let now = unsafe { bindings::ktime_get_mono_fast_ns() };
-    let active = active_chunk_window(inner, protected_block_id);
+    let active = active_chunk_window(inner, requesting_session_id, protected_block_id);
 
     // Look up GPU pressure once.
     let gpu_pressure = inner.gpus.iter()
@@ -431,7 +528,15 @@ fn find_victim_phase_aware(
             .find(|s| s.session_id == block.session_id)
             .map(|s| s.priority)
             .unwrap_or(5u32);
-        let score = phase_aware_score(block, now, gpu_pressure, session_priority, active);
+        let score = phase_aware_score(
+            inner,
+            block,
+            now,
+            gpu_pressure,
+            session_priority,
+            active,
+            hinted_active,
+        );
         let order_time = phase_aware_order_time(block);
         if score > best_score || (score == best_score && order_time < best_order_time) {
             best_score = score;
@@ -458,7 +563,15 @@ fn find_victim_phase_aware(
             .find(|s| s.session_id == block.session_id)
             .map(|s| s.priority)
             .unwrap_or(5u32);
-        let score = phase_aware_score(block, now, gpu_pressure, session_priority, active);
+        let score = phase_aware_score(
+            inner,
+            block,
+            now,
+            gpu_pressure,
+            session_priority,
+            active,
+            hinted_active,
+        );
         let order_time = phase_aware_order_time(block);
         if score > best_score || (score == best_score && order_time < best_order_time) {
             best_score = score;

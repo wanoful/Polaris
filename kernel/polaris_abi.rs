@@ -82,6 +82,7 @@ pub const POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID: u64 = 1 << 0;
 pub const POLARIS_RM_COPY_NO_MISMATCH: u64 = u64::MAX;
 pub const POLARIS_RM_COPY_TO_CPU: u32 = 0;
 pub const POLARIS_RM_COPY_FROM_CPU: u32 = 1;
+pub const POLARIS_KV_HINT_FLAG_CLEAR: u32 = 1 << 0;
 
 pub const POLARIS_DEFAULT_FAULT_TIMEOUT_MS: u32 = 5000;
 
@@ -455,6 +456,20 @@ pub struct PolarisSetPolicyArg {
     pub policy: u32,
     pub _reserved: u32,
     pub _reserved2: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct PolarisKvActiveWindowArg {
+    pub session_id: u64,
+    pub phase: u32,
+    pub flags: u32,
+    pub read_start_token: u64,
+    pub read_token_count: u64,
+    pub write_start_token: u64,
+    pub write_token_count: u64,
+    pub epoch: u64,
+    pub _reserved: [u64; 4],
 }
 
 #[repr(C)]

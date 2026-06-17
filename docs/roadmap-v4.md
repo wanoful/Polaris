@@ -1180,6 +1180,23 @@ Still to do on the Polaris side for M1/M2:
   compact `summary.md` table for quick inspection. A local smoke run with
   prompt=32/gen=4 verified native CUDA and POLARIS pressure records, including
   nonzero daemon-backed offload/reload and bridge-map deltas.
+- First KV-aware policy-hint slice wired: `POLARIS_UPDATE_KV_ACTIVE_WINDOW`
+  lets userspace publish per-session active read/write token windows plus an
+  epoch, and `phase_aware` consumes that hint by protecting write overlaps
+  strongest, read overlaps next, and near-read neighbors lightly. The scoring
+  path now applies the hint through the session `block_ids` membership helper,
+  so child-session hints also protect inherited COW-shared parent blocks.
+  The shim exports `polaris_shim_set_kv_active_window()` /
+  `polaris_shim_clear_kv_active_window()` for direct token-window publication,
+  and `polaris_shim_set_kv_active_byte_ranges()` for adapters that can report
+  active GPU byte ranges but do not know shim token ids. The local llama.cpp
+  tree now wires this byte-range API behind `POLARIS_LLAMA_KV_HINTS=1`,
+  publishing a conservative prefill/decode KV read/write window before each
+  ubatch graph compute. `POLARIS_SHIM_AUTO_KV_HINTS=1` remains an opt-in coarse
+  no-source-change proxy based on the current tail allocation and incoming
+  allocation span. The benchmark runner passes both hint flags through when set.
+  This is still chunk-window based, not a full model-token access trace; vLLM
+  and SGLang integration hooks remain future work.
 - vLLM/SGLang comparison support is currently KV allocator trace-level:
   `benchmarks/scripts/kv_trace_summary.py` consumes the existing trace patch
   CSV format and reports logical reservation, release, peak-live-block, token,

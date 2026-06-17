@@ -180,6 +180,23 @@ before destroying its Polaris session and unregistering the VA-space.
 Freed token spans are coalesced and reused by later allocations, so a workload
 can repeatedly allocate/free within the configured managed window without
 monotonically exhausting it.
+The shim also exposes a KV active-window hint surface for policy experiments.
+Framework-aware adapters can call `polaris_shim_set_kv_active_window()` and
+`polaris_shim_clear_kv_active_window()` to publish prefill/decode read/write
+token ranges for the shim-owned Polaris session. Framework adapters that know
+GPU addresses but not shim token ids can call
+`polaris_shim_set_kv_active_byte_ranges()`: the shim maps up to two read byte
+ranges and two write byte ranges back to the Polaris chunk window before
+issuing the kernel hint.
+The local llama.cpp tree has an opt-in integration for that byte-range API:
+set `POLARIS_LLAMA_KV_HINTS=1` while preloading the shim to publish active KV
+cache hints immediately before each ubatch graph compute. For no-source-change
+llama.cpp runs, `POLARIS_SHIM_AUTO_KV_HINTS=1` remains available as a
+conservative proxy: before a selected allocation is materialized, the shim
+publishes the current tail allocation as the read window and the incoming token
+span as the write window; after successful allocation/free it refreshes or
+clears that tail-span hint. Both hint paths are opt-in because the kernel ABI is
+chunk-window based rather than a full model-token access trace.
 The shim also answers `cuMemGetAddressRange` / `cuMemGetAddressRange_v2`,
 `cuPointerGetAttribute` / `cuPointerGetAttributes`, and runtime
 `cudaPointerGetAttributes` for managed Polaris pointers. Driver-API pointer
@@ -243,7 +260,10 @@ intended for tuning M5 workload runs: with `POLARIS_SHIM_MIN_MANAGED_ALLOC` /
 KV-sized allocations were routed through Polaris while smaller CUDA
 runtime/control allocations stayed on the real CUDA allocator, and whether a
 run used the default `cudaMalloc` path or the
-`GGML_CUDA_ENABLE_UNIFIED_MEMORY` / `cudaMallocManaged` path.
+`GGML_CUDA_ENABLE_UNIFIED_MEMORY` / `cudaMallocManaged` path. When KV hints
+are enabled or called explicitly, the summary also includes
+`kv_hint_update_calls`, `kv_hint_clear_calls`, `kv_hint_failure_calls`, and
+the auto-hint subset counters.
 The shim also interposes common runtime and driver memory operations
 (`cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemset`, `cudaMemsetAsync`,
 `cudaMemcpy2DAsync`, `cudaMemcpyPeerAsync`, `cudaMemcpy3DPeerAsync`,

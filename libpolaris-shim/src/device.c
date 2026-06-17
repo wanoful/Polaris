@@ -227,6 +227,48 @@ int polaris_shim_block_release_with_flags(uint64_t session_id,
     return 0;
 }
 
+int polaris_shim_update_kv_active_window(uint64_t session_id,
+                                         uint32_t phase,
+                                         uint32_t flags,
+                                         uint64_t read_start_token,
+                                         uint64_t read_token_count,
+                                         uint64_t write_start_token,
+                                         uint64_t write_token_count,
+                                         uint64_t epoch)
+{
+    int fd = polaris_shim_device_fd();
+    if (fd < 0)
+        return -ENODEV;
+
+    struct polaris_kv_active_window_arg arg = {
+        .session_id = session_id,
+        .phase = phase,
+        .flags = flags,
+        .read_start_token = read_start_token,
+        .read_token_count = read_token_count,
+        .write_start_token = write_start_token,
+        .write_token_count = write_token_count,
+        .epoch = epoch,
+    };
+
+    if (ioctl(fd, POLARIS_UPDATE_KV_ACTIVE_WINDOW, &arg) != 0) {
+        int e = errno;
+        fprintf(stderr,
+                "[polaris-shim] POLARIS_UPDATE_KV_ACTIVE_WINDOW session=%llu phase=%u read=%llu+%llu write=%llu+%llu epoch=%llu failed: %s\n",
+                (unsigned long long)session_id,
+                phase,
+                (unsigned long long)read_start_token,
+                (unsigned long long)read_token_count,
+                (unsigned long long)write_start_token,
+                (unsigned long long)write_token_count,
+                (unsigned long long)epoch,
+                strerror(e));
+        return -e;
+    }
+
+    return 0;
+}
+
 int polaris_shim_register_vaspace(uint32_t gpu_id,
                                   uint64_t rm_client_token,
                                   uint64_t va_space_token,

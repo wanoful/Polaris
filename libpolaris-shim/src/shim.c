@@ -89,6 +89,7 @@ static int g_create_external_ranges;
 static int g_bootstrap_rm_uvm;
 static int g_static_rm_backend;
 static int g_require_kv_scope;
+static int g_auto_kv_hints;
 static int g_allow_zero_memset;
 static int g_trace_scope;
 static int g_strict_managed_alloc;
@@ -140,6 +141,7 @@ static struct polaris_shim_allocation *g_allocations;
 static struct polaris_shim_free_span *g_free_spans;
 static size_t g_live_managed_allocations;
 static size_t g_active_graph_captures;
+static int g_kv_hint_active;
 
 enum polaris_shim_alloc_api {
     POLARIS_SHIM_ALLOC_API_DRIVER,
@@ -186,6 +188,12 @@ struct polaris_shim_alloc_stats {
     uint64_t managed_window_shrink_calls;
     uint64_t managed_window_shrink_failure_calls;
     uint64_t managed_window_shrink_bytes;
+    uint64_t kv_hint_update_calls;
+    uint64_t kv_hint_clear_calls;
+    uint64_t kv_hint_failure_calls;
+    uint64_t kv_hint_auto_update_calls;
+    uint64_t kv_hint_auto_clear_calls;
+    uint64_t kv_hint_epoch;
     uint64_t live_requested_bytes;
     uint64_t live_rounded_bytes;
     uint64_t peak_live_requested_bytes;
@@ -614,6 +622,143 @@ static void stats_note_fallback_free_result(int success)
     pthread_mutex_unlock(&g_alloc_lock);
 }
 
+static uint64_t next_kv_hint_epoch_locked(void)
+{
+    g_alloc_stats.kv_hint_epoch++;
+    if (g_alloc_stats.kv_hint_epoch == 0)
+        g_alloc_stats.kv_hint_epoch = 1;
+    return g_alloc_stats.kv_hint_epoch;
+}
+
+static void stats_note_kv_hint_result(uint32_t flags, int auto_hint, int success)
+{
+    pthread_mutex_lock(&g_alloc_lock);
+    if (flags & POLARIS_KV_HINT_FLAG_CLEAR) {
+        g_alloc_stats.kv_hint_clear_calls++;
+        if (auto_hint)
+            g_alloc_stats.kv_hint_auto_clear_calls++;
+        if (success)
+            g_kv_hint_active = 0;
+    } else {
+        g_alloc_stats.kv_hint_update_calls++;
+        if (auto_hint)
+            g_alloc_stats.kv_hint_auto_update_calls++;
+        if (success)
+            g_kv_hint_active = 1;
+    }
+    if (!success)
+        g_alloc_stats.kv_hint_failure_calls++;
+    pthread_mutex_unlock(&g_alloc_lock);
+}
+
+static int publish_kv_active_window(uint32_t phase,
+                                    uint32_t flags,
+                                    uint64_t read_start_token,
+                                    uint64_t read_token_count,
+                                    uint64_t write_start_token,
+                                    uint64_t write_token_count,
+                                    int auto_hint)
+{
+    uint64_t epoch;
+    int ret;
+
+    if (g_session_id == 0)
+        return -EINVAL;
+
+    pthread_mutex_lock(&g_alloc_lock);
+    epoch = next_kv_hint_epoch_locked();
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    ret = polaris_shim_update_kv_active_window(g_session_id,
+                                               phase,
+                                               flags,
+                                               read_start_token,
+                                               read_token_count,
+                                               write_start_token,
+                                               write_token_count,
+                                               epoch);
+    stats_note_kv_hint_result(flags, auto_hint, ret == 0);
+    if (ret != 0 && g_trace_scope) {
+        fprintf(stderr,
+                "[polaris-shim] KV active-window hint failed phase=%u flags=0x%x "
+                "read=%" PRIu64 "+%" PRIu64 " write=%" PRIu64 "+%" PRIu64
+                " epoch=%" PRIu64 " ret=%d\n",
+                phase,
+                flags,
+                read_start_token,
+                read_token_count,
+                write_start_token,
+                write_token_count,
+                epoch,
+                ret);
+    }
+    return ret;
+}
+
+static void clear_kv_active_window_if_ready(int auto_hint)
+{
+    int active;
+
+    if (g_session_id == 0)
+        return;
+
+    pthread_mutex_lock(&g_alloc_lock);
+    active = g_kv_hint_active;
+    pthread_mutex_unlock(&g_alloc_lock);
+    if (!active)
+        return;
+
+    (void)publish_kv_active_window(POLARIS_PHASE_DECODE,
+                                   POLARIS_KV_HINT_FLAG_CLEAR,
+                                   0,
+                                   0,
+                                   0,
+                                   0,
+                                   auto_hint);
+}
+
+static void publish_auto_kv_hint_from_tail_allocation(uint32_t write_start,
+                                                      uint32_t write_count)
+{
+    struct polaris_shim_allocation *alloc;
+    uint64_t read_start = 0;
+    uint64_t read_end = 0;
+
+    if (!g_auto_kv_hints)
+        return;
+
+    pthread_mutex_lock(&g_alloc_lock);
+    alloc = g_allocations;
+    while (alloc) {
+        uint64_t start = alloc->token_start;
+        uint64_t end = start + alloc->token_count;
+
+        if (end > read_end) {
+            read_start = start;
+            read_end = end;
+        }
+        alloc = alloc->next;
+    }
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    if (read_start >= read_end && write_count == 0) {
+        clear_kv_active_window_if_ready(1);
+        return;
+    }
+    if (read_start >= read_end) {
+        read_start = 0;
+        read_end = 0;
+    }
+
+    (void)publish_kv_active_window(POLARIS_PHASE_DECODE,
+                                   0,
+                                   read_start,
+                                   read_end - read_start,
+                                   write_start,
+                                   write_count,
+                                   1);
+}
+
 static void release_static_rm_backend(uint32_t h_memory, uint64_t size)
 {
     struct polaris_shim_rm_allocation allocation = {
@@ -860,7 +1005,13 @@ static void report_stats_at_exit(void)
             " managed_window_grow_bytes=%" PRIu64
             " managed_window_shrink_calls=%" PRIu64
             " managed_window_shrink_failure_calls=%" PRIu64
-            " managed_window_shrink_bytes=%" PRIu64 "\n",
+            " managed_window_shrink_bytes=%" PRIu64
+            " kv_hint_update_calls=%" PRIu64
+            " kv_hint_clear_calls=%" PRIu64
+            " kv_hint_failure_calls=%" PRIu64
+            " kv_hint_auto_update_calls=%" PRIu64
+            " kv_hint_auto_clear_calls=%" PRIu64
+            " kv_hint_epoch=%" PRIu64 "\n",
             stats.fallback_alloc_calls,
             stats.fallback_alloc_bytes,
             stats.fallback_alloc_success_calls,
@@ -875,7 +1026,13 @@ static void report_stats_at_exit(void)
             stats.managed_window_grow_bytes,
             stats.managed_window_shrink_calls,
             stats.managed_window_shrink_failure_calls,
-            stats.managed_window_shrink_bytes);
+            stats.managed_window_shrink_bytes,
+            stats.kv_hint_update_calls,
+            stats.kv_hint_clear_calls,
+            stats.kv_hint_failure_calls,
+            stats.kv_hint_auto_update_calls,
+            stats.kv_hint_auto_clear_calls,
+            stats.kv_hint_epoch);
     fprintf(stderr,
             "[polaris-shim] stats live_allocations=%zu"
             " live_requested_bytes=%" PRIu64
@@ -898,6 +1055,8 @@ static void unregister_vaspace_at_exit(void)
     g_allocations = NULL;
     g_live_managed_allocations = 0;
     pthread_mutex_unlock(&g_alloc_lock);
+
+    clear_kv_active_window_if_ready(1);
 
     while (list) {
         struct polaris_shim_allocation *next = list->next;
@@ -982,12 +1141,14 @@ static int bootstrap_allocator_control_plane(uint32_t gpu_id,
             " min_alloc=0x%" PRIx64
             " max_alloc=0x%" PRIx64
             " require_kv_scope=%d"
+            " auto_kv_hints=%d"
             " selected_skip=%" PRIu64 "\n",
             g_session_id,
             g_block_size,
             g_min_managed_alloc,
             g_max_managed_alloc,
             g_require_kv_scope,
+            g_auto_kv_hints,
             g_selected_alloc_skip);
     return 0;
 }
@@ -1082,6 +1243,7 @@ static void bootstrap_vaspace(void)
     g_report_stats = env_enabled("POLARIS_SHIM_REPORT_STATS");
     g_static_rm_backend = env_enabled("POLARIS_SHIM_STATIC_RM_BACKEND");
     g_require_kv_scope = env_enabled("POLARIS_SHIM_REQUIRE_KV_SCOPE");
+    g_auto_kv_hints = env_enabled("POLARIS_SHIM_AUTO_KV_HINTS");
     g_allow_zero_memset = env_enabled("POLARIS_SHIM_ALLOW_ZERO_MEMSET");
     g_trace_scope = env_enabled("POLARIS_SHIM_TRACE_SCOPE");
     if (g_static_rm_backend) {
@@ -1244,6 +1406,91 @@ static int find_allocation_range(CUdeviceptr ptr,
         alloc = alloc->next;
     }
     pthread_mutex_unlock(&g_alloc_lock);
+    return 0;
+}
+
+static int map_byte_range_to_token_window_locked(CUdeviceptr ptr,
+                                                 uint64_t bytes,
+                                                 uint64_t *start_out,
+                                                 uint64_t *end_out)
+{
+    struct polaris_shim_allocation *alloc;
+
+    if (!start_out || !end_out)
+        return -EINVAL;
+    if (ptr == 0 || bytes == 0) {
+        *start_out = 0;
+        *end_out = 0;
+        return 0;
+    }
+    if (g_block_size == 0)
+        return -EINVAL;
+
+    alloc = g_allocations;
+    while (alloc) {
+        uint64_t length = (uint64_t)alloc->token_count * g_block_size;
+        uint64_t offset;
+        uint64_t end_offset;
+        uint64_t rel_start;
+        uint64_t rel_end;
+
+        if (ptr < alloc->ptr) {
+            alloc = alloc->next;
+            continue;
+        }
+
+        offset = (uint64_t)(ptr - alloc->ptr);
+        if (offset >= length) {
+            alloc = alloc->next;
+            continue;
+        }
+        if (bytes > UINT64_MAX - offset)
+            return -EOVERFLOW;
+        end_offset = offset + bytes;
+        if (end_offset > length)
+            return -ERANGE;
+
+        rel_start = offset / g_block_size;
+        rel_end = end_offset / g_block_size;
+        if (end_offset % g_block_size != 0)
+            rel_end++;
+        *start_out = (uint64_t)alloc->token_start + rel_start;
+        *end_out = (uint64_t)alloc->token_start + rel_end;
+        return 0;
+    }
+
+    return -ENOENT;
+}
+
+static int widen_token_window_for_byte_range_locked(CUdeviceptr ptr,
+                                                    uint64_t bytes,
+                                                    uint64_t *start_out,
+                                                    uint64_t *end_out)
+{
+    uint64_t start = 0;
+    uint64_t end = 0;
+    int ret;
+
+    if (!start_out || !end_out)
+        return -EINVAL;
+    if (ptr == 0 || bytes == 0)
+        return 0;
+
+    ret = map_byte_range_to_token_window_locked(ptr, bytes, &start, &end);
+    if (ret != 0)
+        return ret;
+    if (start >= end)
+        return 0;
+
+    if (*start_out >= *end_out) {
+        *start_out = start;
+        *end_out = end;
+    } else {
+        if (start < *start_out)
+            *start_out = start;
+        if (end > *end_out)
+            *end_out = end;
+    }
     return 0;
 }
 
@@ -1657,15 +1904,21 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
     if (ret != 0)
         return ret;
 
+    // Before BLOCK_RESERVE can trigger policy eviction, protect the incoming
+    // span as write-active while keeping the most recent live allocation warm.
+    publish_auto_kv_hint_from_tail_allocation(token_start, token_count);
+
     alloc = calloc(1, sizeof(*alloc));
     if (!alloc) {
         return_token_span_and_reclaim(token_start, token_count);
+        publish_auto_kv_hint_from_tail_allocation(0, 0);
         return -ENOMEM;
     }
     alloc->chunks = calloc(token_count, sizeof(*alloc->chunks));
     if (!alloc->chunks) {
         free(alloc);
         return_token_span_and_reclaim(token_start, token_count);
+        publish_auto_kv_hint_from_tail_allocation(0, 0);
         return -ENOMEM;
     }
     alloc->requested_size = size;
@@ -1757,6 +2010,10 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
         g_alloc_stats.peak_live_rounded_bytes = g_alloc_stats.live_rounded_bytes;
     pthread_mutex_unlock(&g_alloc_lock);
 
+    // Once the allocation is registered, the incoming span becomes the tail
+    // read-locality proxy until a framework publishes a more precise hint.
+    publish_auto_kv_hint_from_tail_allocation(0, 0);
+
     *out = gpu_vaddr;
     fprintf(stderr,
             "[polaris-shim] managed allocation size=%zu rounded=0x%" PRIx64
@@ -1774,6 +2031,7 @@ fail_release_chunks:
     free_allocation_chunks_storage(alloc);
     free(alloc);
     return_token_span_and_reclaim(token_start, token_count);
+    publish_auto_kv_hint_from_tail_allocation(0, 0);
     return ret;
 }
 
@@ -1828,6 +2086,7 @@ static int polaris_free_managed(CUdeviceptr ptr)
             g_alloc_stats.live_rounded_bytes = 0;
         pthread_mutex_unlock(&g_alloc_lock);
         return_token_span_and_reclaim(token_start, token_count);
+        publish_auto_kv_hint_from_tail_allocation(0, 0);
         if (alloc) {
             free_allocation_chunks_storage(alloc);
             free(alloc);
@@ -2541,6 +2800,122 @@ void polaris_shim_set_allocation_scope(const char *scope)
                 scope ? scope : "none",
                 g_allocation_scope_is_kv);
     }
+}
+
+POLARIS_SHIM_INTERPOSER
+int polaris_shim_set_kv_active_window(uint32_t phase,
+                                      uint64_t read_start_token,
+                                      uint64_t read_token_count,
+                                      uint64_t write_start_token,
+                                      uint64_t write_token_count)
+{
+    pthread_once(&g_announce_once, announce);
+    pthread_once(&g_bootstrap_once, bootstrap_vaspace);
+
+    if (g_session_id == 0)
+        return -ENODEV;
+
+    return publish_kv_active_window(phase,
+                                    0,
+                                    read_start_token,
+                                    read_token_count,
+                                    write_start_token,
+                                    write_token_count,
+                                    0);
+}
+
+POLARIS_SHIM_INTERPOSER
+int polaris_shim_set_kv_active_byte_ranges(uint32_t phase,
+                                           const void *read0,
+                                           uint64_t read0_bytes,
+                                           const void *read1,
+                                           uint64_t read1_bytes,
+                                           const void *write0,
+                                           uint64_t write0_bytes,
+                                           const void *write1,
+                                           uint64_t write1_bytes)
+{
+    uint64_t read_start = 0;
+    uint64_t read_end = 0;
+    uint64_t write_start = 0;
+    uint64_t write_end = 0;
+    int ret;
+
+    pthread_once(&g_announce_once, announce);
+    pthread_once(&g_bootstrap_once, bootstrap_vaspace);
+
+    if (g_session_id == 0)
+        return -ENODEV;
+
+    pthread_mutex_lock(&g_alloc_lock);
+    ret = widen_token_window_for_byte_range_locked((CUdeviceptr)(uintptr_t)read0,
+                                                   read0_bytes,
+                                                   &read_start,
+                                                   &read_end);
+    if (ret == 0)
+        ret = widen_token_window_for_byte_range_locked((CUdeviceptr)(uintptr_t)read1,
+                                                       read1_bytes,
+                                                       &read_start,
+                                                       &read_end);
+    if (ret == 0)
+        ret = widen_token_window_for_byte_range_locked((CUdeviceptr)(uintptr_t)write0,
+                                                       write0_bytes,
+                                                       &write_start,
+                                                       &write_end);
+    if (ret == 0)
+        ret = widen_token_window_for_byte_range_locked((CUdeviceptr)(uintptr_t)write1,
+                                                       write1_bytes,
+                                                       &write_start,
+                                                       &write_end);
+    pthread_mutex_unlock(&g_alloc_lock);
+
+    if (ret != 0) {
+        stats_note_kv_hint_result(0, 0, 0);
+        if (g_trace_scope) {
+            fprintf(stderr,
+                    "[polaris-shim] KV byte-range hint mapping failed "
+                    "phase=%u ret=%d read0=%p+%" PRIu64
+                    " read1=%p+%" PRIu64 " write0=%p+%" PRIu64
+                    " write1=%p+%" PRIu64 "\n",
+                    phase,
+                    ret,
+                    read0,
+                    read0_bytes,
+                    read1,
+                    read1_bytes,
+                    write0,
+                    write0_bytes,
+                    write1,
+                    write1_bytes);
+        }
+        return ret;
+    }
+
+    return publish_kv_active_window(phase,
+                                    0,
+                                    read_start,
+                                    read_end - read_start,
+                                    write_start,
+                                    write_end - write_start,
+                                    0);
+}
+
+POLARIS_SHIM_INTERPOSER
+int polaris_shim_clear_kv_active_window(void)
+{
+    pthread_once(&g_announce_once, announce);
+    pthread_once(&g_bootstrap_once, bootstrap_vaspace);
+
+    if (g_session_id == 0)
+        return -ENODEV;
+
+    return publish_kv_active_window(POLARIS_PHASE_DECODE,
+                                    POLARIS_KV_HINT_FLAG_CLEAR,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0);
 }
 
 POLARIS_SHIM_INTERPOSER
