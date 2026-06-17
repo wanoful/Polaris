@@ -277,8 +277,8 @@ keys = [
     "sessions", "blocks", "gpus", "daemon", "offloads", "reloads", "evictions",
     "cow_breaks", "pending_decs", "v4_va_spaces", "static_blocks", "block_mappings",
     "uvm_hook_calls", "uvm_handled", "uvm_deferred", "uvm_rejected", "uvm_no_pte",
-    "uvm_errors", "uvm_bridge_map_calls", "uvm_bridge_map_ok", "uvm_bridge_map_err",
-    "uvm_bridge_map_retry", "uvm_bridge_map_avg_ns",
+    "uvm_errors", "uvm_cached_map_hits", "uvm_bridge_map_calls", "uvm_bridge_map_ok",
+    "uvm_bridge_map_err", "uvm_bridge_map_retry", "uvm_bridge_map_avg_ns",
 ]
 
 def parse_stats(path):

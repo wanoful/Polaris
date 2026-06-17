@@ -154,6 +154,7 @@ static POLARIS_UVM_FAULT_HANDLED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_DEFERRED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_REJECTED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_ERRORS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_CACHED_MAP_HITS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_VA_SPACE_TOKEN: Atomic<u64> = Atomic::new(0);
@@ -508,6 +509,18 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             if fault_address < block_base || fault_address >= block_end {
                 continue;
             }
+            if block.last_gpu_va_space_ptr.load(Acquire) == gpu_va_space_ptr {
+                POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
+                POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_HANDLED,
+                );
+            }
 
             let mapping = PolarisFaultMapping {
                 rm_client_token,
@@ -518,6 +531,7 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                 rm_control_fd: block.rm_control_fd.load(Relaxed),
                 h_client: block.h_client.load(Relaxed),
                 h_memory: block.h_memory.load(Relaxed),
+                mapped_gpu_va_space_ptr: block.last_gpu_va_space_ptr.load(Acquire),
             };
             match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
                 Ok(()) => {
@@ -559,6 +573,18 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             va_space_token,
             fault_address,
         ) {
+            if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+                POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
+                POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                return polaris_return_uvm_fault(
+                    gpu_id,
+                    rm_client_token,
+                    va_space_token,
+                    fault_address,
+                    access_type,
+                    UVM_POLARIS_FAULT_HANDLED,
+                );
+            }
             match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
                 Ok(()) => {
                     polaris_note_block_mapping_fault(
@@ -613,6 +639,18 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                         va_space_token,
                         fault_address,
                     ) {
+                        if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+                            POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
+                            POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                            return polaris_return_uvm_fault(
+                                gpu_id,
+                                rm_client_token,
+                                va_space_token,
+                                fault_address,
+                                access_type,
+                                UVM_POLARIS_FAULT_HANDLED,
+                            );
+                        }
                         match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
                             Ok(()) => {
                                 polaris_note_block_mapping_fault(
@@ -704,6 +742,18 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
         gpu_id,
         fault_address,
     ) {
+        if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+            POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
+            POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+            return polaris_return_uvm_fault(
+                gpu_id,
+                rm_client_token,
+                va_space_token,
+                fault_address,
+                access_type,
+                UVM_POLARIS_FAULT_HANDLED,
+            );
+        }
         match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
             Ok(()) => {
                 polaris_note_block_mapping_fault(
@@ -756,6 +806,18 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                     materialize.va_space_token,
                     fault_address,
                 ) {
+                    if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+                        POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
+                        POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
+                        return polaris_return_uvm_fault(
+                            gpu_id,
+                            rm_client_token,
+                            va_space_token,
+                            fault_address,
+                            access_type,
+                            UVM_POLARIS_FAULT_HANDLED,
+                        );
+                    }
                     match polaris_map_fault_mapping(gpu_va_space_ptr, &mapping) {
                         Ok(()) => {
                             polaris_note_block_mapping_fault(
@@ -1028,6 +1090,7 @@ struct PolarisFaultMapping {
     rm_control_fd: i32,
     h_client: u32,
     h_memory: u32,
+    mapped_gpu_va_space_ptr: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1089,6 +1152,7 @@ fn polaris_find_logical_fault_mapping(
             rm_control_fd: block.rm_control_fd,
             h_client: block.rm_h_client,
             h_memory: block.rm_h_memory,
+            mapped_gpu_va_space_ptr: mapping.last_gpu_va_space_ptr,
         });
     }
 
@@ -1174,6 +1238,7 @@ fn polaris_find_single_observed_fault_mapping(
             rm_control_fd: block.rm_control_fd,
             h_client: block.rm_h_client,
             h_memory: block.rm_h_memory,
+            mapped_gpu_va_space_ptr: mapping.last_gpu_va_space_ptr,
         };
 
         if found.is_some() {
@@ -2423,6 +2488,7 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_deferred = POLARIS_UVM_FAULT_DEFERRED.load(Relaxed);
     let uvm_rejected = POLARIS_UVM_FAULT_REJECTED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
+    let uvm_cached_map_hits = POLARIS_UVM_CACHED_MAP_HITS.load(Relaxed);
     let uvm_zero_faults = POLARIS_UVM_ZERO_FAULTS.load(Relaxed);
     let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
     let uvm_last_client = POLARIS_UVM_LAST_RM_CLIENT_TOKEN.load(Relaxed);
@@ -2510,6 +2576,7 @@ uvm_handled:    {uvm_handled}
 uvm_deferred:   {uvm_deferred}
 uvm_rejected:   {uvm_rejected}
 uvm_errors:     {uvm_errors}
+uvm_cached_map_hits:{uvm_cached_map_hits}
 uvm_zero_faults:{uvm_zero_faults}
 uvm_last_gpu:   {uvm_last_gpu}
 uvm_last_client:0x{uvm_last_client:x}
@@ -2569,6 +2636,7 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_deferred = uvm_deferred,
                 uvm_rejected = uvm_rejected,
                 uvm_errors = uvm_errors,
+                uvm_cached_map_hits = uvm_cached_map_hits,
                 uvm_zero_faults = uvm_zero_faults,
                 uvm_last_gpu = uvm_last_gpu,
                 uvm_last_client = uvm_last_client,
