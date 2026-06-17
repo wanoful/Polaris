@@ -258,19 +258,21 @@ write_record() {
     local cpu_pool_bytes="$7"
     local stdout_json="$8"
     local stderr_log="$9"
-    local stats_before="${10}"
-    local stats_after="${11}"
-    local rc="${12}"
+    local polarisd_log="${10}"
+    local stats_before="${11}"
+    local stats_after="${12}"
+    local rc="${13}"
 
     python3 - "$mode" "$comparison_scope" "$prompt_tokens" "$gen_tokens" "$repetitions" \
-        "$budget_bytes" "$cpu_pool_bytes" "$stdout_json" "$stderr_log" "$stats_before" "$stats_after" "$rc" \
+        "$budget_bytes" "$cpu_pool_bytes" "$stdout_json" "$stderr_log" "$polarisd_log" "$stats_before" "$stats_after" "$rc" \
         "$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || true)" \
         "$LLAMA_CPP_BIN" "$LLAMA_CPP_MODEL" "$RUN_ID" >>"$RUNS_JSONL" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
-mode, scope, prompt, gen, reps, budget, cpu_pool, stdout_json, stderr_log, before, after, rc, commit, llama_bin, model, run_id = sys.argv[1:]
+mode, scope, prompt, gen, reps, budget, cpu_pool, stdout_json, stderr_log, polarisd_log, before, after, rc, commit, llama_bin, model, run_id = sys.argv[1:]
 keys = [
     "sessions", "blocks", "gpus", "daemon", "offloads", "reloads", "evictions",
     "cow_breaks", "pending_decs", "v4_va_spaces", "static_blocks", "block_mappings",
@@ -302,12 +304,46 @@ def load_llama(path):
     except json.JSONDecodeError:
         return []
 
+def parse_polarisd_decisions(path):
+    p = Path(path)
+    counts = {
+        "allocs": 0,
+        "offloads": 0,
+        "reloads": 0,
+        "cows": 0,
+        "frees": 0,
+        "unmaps": 0,
+        "total": 0,
+    }
+    if not path or not p.exists():
+        return counts
+
+    op_to_key = {
+        "ALLOC": "allocs",
+        "OFFLOAD": "offloads",
+        "RELOAD": "reloads",
+        "COW": "cows",
+        "FREE": "frees",
+        "UNMAP": "unmaps",
+    }
+    pattern = re.compile(r"executing decision \d+ op=([A-Z_]+)\b")
+    for line in p.read_text(errors="replace").splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        counts["total"] += 1
+        key = op_to_key.get(match.group(1))
+        if key:
+            counts[key] += 1
+    return counts
+
 before_s = parse_stats(before)
 after_s = parse_stats(after)
 delta = {k: after_s.get(k, 0) - before_s.get(k, 0) for k in keys}
 llama = load_llama(stdout_json)
 avg_ts_values = [x.get("avg_ts") for x in llama if isinstance(x, dict) and isinstance(x.get("avg_ts"), (int, float))]
 avg_ts = sum(avg_ts_values) / len(avg_ts_values) if avg_ts_values else None
+polarisd_decisions = parse_polarisd_decisions(polarisd_log)
 record = {
     "source": "polaris",
     "mode": mode,
@@ -331,8 +367,10 @@ record = {
     "stats_before": before_s,
     "stats_after": after_s,
     "stats_delta": delta,
+    "polarisd_decisions": polarisd_decisions,
     "stdout_json": stdout_json,
     "stderr_log": stderr_log,
+    "polarisd_log": polarisd_log,
 }
 print(json.dumps(record, sort_keys=True))
 PY
@@ -419,7 +457,7 @@ run_one() {
 
     cp "$STATS_PATH" "$stats_after"
     write_record "$mode" "llama_cpp_end_to_end" "$prompt_tokens" "$gen_tokens" "$repetitions" \
-        "$budget_bytes" "$cpu_pool_bytes" "$stdout_json" "$stderr_log" "$stats_before" "$stats_after" "$rc"
+        "$budget_bytes" "$cpu_pool_bytes" "$stdout_json" "$stderr_log" "$polarisd_log" "$stats_before" "$stats_after" "$rc"
 
     if [[ "$rc" -ne 0 ]]; then
         tail -n 160 "$stderr_log" >&2 || true

@@ -30,6 +30,14 @@ def get(record: dict[str, Any], key: str, default: Any = 0) -> Any:
     return cur
 
 
+def first_present(record: dict[str, Any], keys: list[str], default: Any = 0) -> Any:
+    for key in keys:
+        value = get(record, key, None)
+        if value is not None:
+            return value
+    return default
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("jsonl", type=Path, help="Benchmark JSONL file")
@@ -61,8 +69,8 @@ def main() -> int:
                 prompt=prompt,
                 gen=gen,
                 avg_ts=avg_ts_s,
-                offloads=get(rec, "stats_delta.offloads", rec.get("offloads", 0)),
-                reloads=get(rec, "stats_delta.reloads", rec.get("reloads", 0)),
+                offloads=first_present(rec, ["polarisd_decisions.offloads", "stats_delta.offloads"], rec.get("offloads", 0)),
+                reloads=first_present(rec, ["polarisd_decisions.reloads", "stats_delta.reloads"], rec.get("reloads", 0)),
                 bridge=get(rec, "stats_delta.uvm_bridge_map_calls", rec.get("uvm_bridge_map_calls", 0)),
                 peak=rec.get("peak_live_blocks", ""),
                 reserved=rec.get("total_reserved_blocks", ""),

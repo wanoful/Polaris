@@ -6,7 +6,7 @@
 //!
 //!   FIFO        — Victim = block with the oldest map_time_ns
 //!   LRU         — Victim = block with the oldest last_touch_ns
-//!   PhaseAware  — Scoring function: prefill blocks preferred, shared/decode protected
+//!   PhaseAware  — Scoring function: active KV chunk protected, shared/decode protected
 //!
 //! All policies use a two-pass search:
 //!   Pass 1: only blocks from OTHER sessions (preferred)
@@ -139,6 +139,23 @@ fn is_eligible_phase_aware(block: &PolarisBlock, inner: &PolarisInner, target_gp
     }
 }
 
+fn phase_aware_should_use_fifo_order(inner: &PolarisInner, target_gpu: u32) -> bool {
+    let mut saw_candidate = false;
+
+    for block in inner.blocks.iter() {
+        if !is_eligible_phase_aware(block, inner, target_gpu) {
+            continue;
+        }
+        saw_candidate = true;
+
+        if block.phase != PolarisPhase::Prefill || block.refcount > 1 {
+            return false;
+        }
+    }
+
+    saw_candidate
+}
+
 // ─── FIFO: victim = oldest map_time_ns ──────────────────────────────────────
 
 fn find_victim_fifo(
@@ -267,6 +284,66 @@ const PRESSURE_WEIGHT: i64 = 1;
 const PRIORITY_WEIGHT: i64 = 50;
 const SHARING_WEIGHT: i64 = 1000;
 const DECODE_WEIGHT: i64 = 500;
+const MAX_AGE_SCORE_MS: u64 = 120_000;
+const ACTIVE_AHEAD_PROTECT_CHUNKS: u32 = 4;
+const ACTIVE_BEHIND_PROTECT_CHUNKS: u32 = 4;
+const ACTIVE_WINDOW_PROTECT_SCORE: i64 = 500_000;
+
+#[derive(Clone, Copy)]
+struct ActiveChunkWindow {
+    session_id: u64,
+    start: u32,
+    end: u32,
+}
+
+fn active_chunk_window(inner: &PolarisInner, protected_block_id: u64) -> Option<ActiveChunkWindow> {
+    if protected_block_id == 0 {
+        return None;
+    }
+    inner.blocks.iter()
+        .find(|b| b.block_id == protected_block_id)
+        .map(|b| ActiveChunkWindow {
+            session_id: b.session_id,
+            start: b.token_start,
+            end: b.token_start.saturating_add(b.token_count),
+        })
+}
+
+fn active_window_score(block: &PolarisBlock, active: Option<ActiveChunkWindow>) -> i64 {
+    let Some(active) = active else {
+        return 0;
+    };
+    if block.session_id != active.session_id {
+        return 0;
+    }
+
+    let candidate_start = block.token_start;
+    let candidate_end = block.token_start.saturating_add(block.token_count);
+
+    if candidate_start >= active.end {
+        let ahead = candidate_start.saturating_sub(active.end);
+        if ahead < ACTIVE_AHEAD_PROTECT_CHUNKS {
+            return -ACTIVE_WINDOW_PROTECT_SCORE;
+        }
+    } else if candidate_end <= active.start {
+        let behind = active.start.saturating_sub(candidate_end);
+        if behind < ACTIVE_BEHIND_PROTECT_CHUNKS {
+            return -ACTIVE_WINDOW_PROTECT_SCORE;
+        }
+    } else {
+        return -ACTIVE_WINDOW_PROTECT_SCORE;
+    }
+
+    0
+}
+
+fn phase_aware_order_time(block: &PolarisBlock) -> u64 {
+    if block.phase == PolarisPhase::Decode && block.last_touch_ns != 0 {
+        block.last_touch_ns
+    } else {
+        block.map_time_ns
+    }
+}
 
 /// Score the block. Higher = more evictable.
 fn phase_aware_score(
@@ -274,15 +351,11 @@ fn phase_aware_score(
     now: u64,
     gpu_pressure: u64,
     session_priority: u32,
+    active: Option<ActiveChunkWindow>,
 ) -> i64 {
-    // Age in seconds (saturating to avoid overflow on very old timestamps).
-    let touch_time = if block.last_touch_ns != 0 {
-        block.last_touch_ns
-    } else {
-        block.map_time_ns
-    };
-    let age_ns = now.saturating_sub(touch_time);
-    let age_sec = (age_ns / 1_000_000_000u64) as i64;
+    let order_time = phase_aware_order_time(block);
+    let age_ns = now.saturating_sub(order_time);
+    let age_ms = (age_ns / 1_000_000u64).min(MAX_AGE_SCORE_MS) as i64;
 
     let is_prefill = if block.phase == PolarisPhase::Prefill { 1i64 } else { 0i64 };
     let refcount = block.refcount as i64;
@@ -300,10 +373,11 @@ fn phase_aware_score(
     };
     let inv_priority = (11u32.saturating_sub(prio)) as i64;
 
-    AGE_WEIGHT * age_sec
+    AGE_WEIGHT * age_ms
         + PREFILL_WEIGHT * is_prefill
         + PRESSURE_WEIGHT * pressure_norm
         + PRIORITY_WEIGHT * inv_priority
+        + active_window_score(block, active)
         - SHARING_WEIGHT * refcount
         - DECODE_WEIGHT * recent_decode
 }
@@ -315,7 +389,22 @@ fn find_victim_phase_aware(
     protected_phys_handle: u64,
     protected_block_id: u64,
 ) -> Option<(usize, u64, u64, u32)> {
+    // llama.cpp's current shim exposes one Polaris "token" per KV chunk and
+    // marks selected allocations as prefill. In that common single-session,
+    // private-prefill shape, FIFO map order is the best available signal and
+    // avoids treating chunk IDs as semantic LLM token positions.
+    if phase_aware_should_use_fifo_order(inner, target_gpu) {
+        return find_victim_fifo(
+            inner,
+            requesting_session_id,
+            target_gpu,
+            protected_phys_handle,
+            protected_block_id,
+        );
+    }
+
     let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+    let active = active_chunk_window(inner, protected_block_id);
 
     // Look up GPU pressure once.
     let gpu_pressure = inner.gpus.iter()
@@ -326,6 +415,7 @@ fn find_victim_phase_aware(
     // Pass 1: other sessions only.
     let mut best: Option<(usize, u64, u64, u32, i64)> = None;
     let mut best_score: i64 = i64::MIN;
+    let mut best_order_time: u64 = u64::MAX;
 
     for (idx, block) in inner.blocks.iter().enumerate() {
         if block_owned_by_session(inner, block, requesting_session_id) {
@@ -341,9 +431,11 @@ fn find_victim_phase_aware(
             .find(|s| s.session_id == block.session_id)
             .map(|s| s.priority)
             .unwrap_or(5u32);
-        let score = phase_aware_score(block, now, gpu_pressure, session_priority);
-        if score > best_score {
+        let score = phase_aware_score(block, now, gpu_pressure, session_priority, active);
+        let order_time = phase_aware_order_time(block);
+        if score > best_score || (score == best_score && order_time < best_order_time) {
             best_score = score;
+            best_order_time = order_time;
             best = Some((idx, block.block_id, block.size_bytes, block.home_gpu, score));
         }
     }
@@ -354,6 +446,7 @@ fn find_victim_phase_aware(
 
     // Pass 2: any session (including the requesting one).
     best_score = i64::MIN;
+    best_order_time = u64::MAX;
     for (idx, block) in inner.blocks.iter().enumerate() {
         if is_protected_source(block, protected_phys_handle, protected_block_id) {
             continue;
@@ -365,9 +458,11 @@ fn find_victim_phase_aware(
             .find(|s| s.session_id == block.session_id)
             .map(|s| s.priority)
             .unwrap_or(5u32);
-        let score = phase_aware_score(block, now, gpu_pressure, session_priority);
-        if score > best_score {
+        let score = phase_aware_score(block, now, gpu_pressure, session_priority, active);
+        let order_time = phase_aware_order_time(block);
+        if score > best_score || (score == best_score && order_time < best_order_time) {
             best_score = score;
+            best_order_time = order_time;
             best = Some((idx, block.block_id, block.size_bytes, block.home_gpu, score));
         }
     }
