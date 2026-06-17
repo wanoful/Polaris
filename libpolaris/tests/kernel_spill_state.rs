@@ -1010,6 +1010,120 @@ fn phase_aware_active_window_protects_hinted_block() {
 }
 
 #[test]
+#[ignore = "requires root and a loaded polaris.ko; exercises phase-aware KV hints under undersized budgets"]
+fn phase_aware_active_window_skips_budget_reclaim_when_all_candidates_are_active() {
+    let dev = open_polaris();
+    let fd = dev.as_raw_fd();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(SeenOps::default()));
+    let executor = start_fake_executor(Arc::clone(&stop), Arc::clone(&seen));
+
+    register_transient_gpu_and_range_with_budget(
+        fd,
+        0x1b00_0000_0000,
+        64 * BLOCK_SIZE,
+        BLOCK_SIZE,
+    );
+    let policy = PolarisSetPolicyArg {
+        policy: 2,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SET_POLICY, &policy)
+        .expect("POLARIS_SET_POLICY phase-aware");
+
+    let mut session = PolarisSessionCreateArg {
+        home_gpu: 0,
+        gpu_vas_bytes: 64 * BLOCK_SIZE,
+        bytes_per_token: BLOCK_SIZE,
+        priority: 5,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_SESSION_CREATE, &mut session)
+        .expect("POLARIS_SESSION_CREATE");
+
+    let hint = PolarisKvActiveWindowArg {
+        session_id: session.session_id,
+        phase: PolarisPhase::Decode as u32,
+        read_start_token: 0,
+        read_token_count: 2,
+        epoch: 1,
+        ..Default::default()
+    };
+    ioctl::update_kv_active_window(fd, &hint).expect("POLARIS_UPDATE_KV_ACTIVE_WINDOW");
+
+    let mut first = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 0,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut first)
+        .expect("POLARIS_BLOCK_RESERVE first");
+    wait_for_state(
+        fd,
+        session.session_id,
+        first.block_id,
+        PolarisBlockState::Resident,
+    );
+
+    let mut second = PolarisBlockReserveArg {
+        session_id: session.session_id,
+        token_start: 1,
+        token_count: 1,
+        phase: PolarisPhase::Prefill as u32,
+        ..Default::default()
+    };
+    ioctl::ioctl_read(fd, ioctl::POLARIS_BLOCK_RESERVE, &mut second)
+        .expect("POLARIS_BLOCK_RESERVE second");
+    wait_for_state(
+        fd,
+        session.session_id,
+        second.block_id,
+        PolarisBlockState::Resident,
+    );
+
+    thread::sleep(Duration::from_millis(100));
+
+    let first_state = get_block_state(fd, session.session_id, first.block_id);
+    let second_state = get_block_state(fd, session.session_id, second.block_id);
+    assert_eq!(
+        first_state.state,
+        PolarisBlockState::Resident as u32,
+        "active-window hint should protect the first block even when the budget is undersized"
+    );
+    assert_eq!(
+        second_state.state,
+        PolarisBlockState::Resident as u32,
+        "active-window hint should protect the second block even when the budget is undersized"
+    );
+
+    let seen_ops = seen.lock().expect("seen mutex poisoned");
+    assert_eq!(seen_ops.alloc, 2);
+    assert_eq!(
+        seen_ops.offload, 0,
+        "undersized active working set should not be reclaimed by offloading active KV blocks"
+    );
+    drop(seen_ops);
+
+    let destroy = PolarisSessionDestroyArg {
+        session_id: session.session_id,
+        ..Default::default()
+    };
+    ioctl::ioctl_write(fd, ioctl::POLARIS_SESSION_DESTROY, &destroy)
+        .expect("POLARIS_SESSION_DESTROY");
+    wait_for_seen(
+        &seen,
+        |ops| ops.free >= 1,
+        "FREE decision after undersized active-window policy test destroy",
+    );
+
+    stop.store(true, Ordering::Release);
+    executor.join().expect("fake executor join");
+}
+
+#[test]
 #[ignore = "requires root and a loaded polaris.ko; exercises phase-aware KV hints for COW-shared blocks"]
 fn phase_aware_active_window_protects_child_inherited_block() {
     let dev = open_polaris();

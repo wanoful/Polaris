@@ -429,6 +429,27 @@ fn hinted_active_window_score(
     0
 }
 
+fn hinted_active_window_overlaps(
+    inner: &PolarisInner,
+    block: &PolarisBlock,
+    active: Option<ActiveKvWindow>,
+) -> bool {
+    let Some(active) = active else {
+        return false;
+    };
+    if !block_owned_by_session(inner, block, active.session_id) {
+        return false;
+    }
+
+    let block_start = block.token_start as u64;
+    let block_end = block_start.saturating_add(block.token_count as u64);
+
+    (active.write_start < active.write_end
+        && ranges_overlap(block_start, block_end, active.write_start, active.write_end))
+        || (active.read_start < active.read_end
+            && ranges_overlap(block_start, block_end, active.read_start, active.read_end))
+}
+
 fn phase_aware_order_time(block: &PolarisBlock) -> u64 {
     if block.phase == PolarisPhase::Decode && block.last_touch_ns != 0 {
         block.last_touch_ns
@@ -524,6 +545,9 @@ fn find_victim_phase_aware(
         if !is_eligible_phase_aware(block, inner, target_gpu) {
             continue;
         }
+        if hinted_active_window_overlaps(inner, block, hinted_active) {
+            continue;
+        }
         let session_priority = inner.sessions.iter()
             .find(|s| s.session_id == block.session_id)
             .map(|s| s.priority)
@@ -557,6 +581,9 @@ fn find_victim_phase_aware(
             continue;
         }
         if !is_eligible_phase_aware(block, inner, target_gpu) {
+            continue;
+        }
+        if hinted_active_window_overlaps(inner, block, hinted_active) {
             continue;
         }
         let session_priority = inner.sessions.iter()
