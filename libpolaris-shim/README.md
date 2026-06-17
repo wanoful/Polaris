@@ -197,6 +197,13 @@ publishes the current tail allocation as the read window and the incoming token
 span as the write window; after successful allocation/free it refreshes or
 clears that tail-span hint. Both hint paths are opt-in because the kernel ABI is
 chunk-window based rather than a full model-token access trace.
+`POLARIS_SHIM_EAGER_RESERVE=1` is an opt-in benchmarking mode that reserves
+selected chunks synchronously instead of using `POLARIS_RESERVE_FLAG_DEFER_FAULT`.
+This moves daemon `ALLOC` work out of the first GPU fault and can reduce UVM
+deferred-fault retry noise. It should be paired with precise
+`POLARIS_LLAMA_KV_HINTS=1` or coarse `POLARIS_SHIM_AUTO_KV_HINTS=1` under small
+GPU budgets so allocation-time budget enforcement does not evict the incoming
+active KV span.
 The shim also answers `cuMemGetAddressRange` / `cuMemGetAddressRange_v2`,
 `cuPointerGetAttribute` / `cuPointerGetAttributes`, and runtime
 `cudaPointerGetAttributes` for managed Polaris pointers. Driver-API pointer

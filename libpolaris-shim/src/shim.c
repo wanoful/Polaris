@@ -90,6 +90,7 @@ static int g_bootstrap_rm_uvm;
 static int g_static_rm_backend;
 static int g_require_kv_scope;
 static int g_auto_kv_hints;
+static int g_eager_reserve;
 static int g_allow_zero_memset;
 static int g_trace_scope;
 static int g_strict_managed_alloc;
@@ -1142,6 +1143,7 @@ static int bootstrap_allocator_control_plane(uint32_t gpu_id,
             " max_alloc=0x%" PRIx64
             " require_kv_scope=%d"
             " auto_kv_hints=%d"
+            " eager_reserve=%d"
             " selected_skip=%" PRIu64 "\n",
             g_session_id,
             g_block_size,
@@ -1149,6 +1151,7 @@ static int bootstrap_allocator_control_plane(uint32_t gpu_id,
             g_max_managed_alloc,
             g_require_kv_scope,
             g_auto_kv_hints,
+            g_eager_reserve,
             g_selected_alloc_skip);
     return 0;
 }
@@ -1244,6 +1247,7 @@ static void bootstrap_vaspace(void)
     g_static_rm_backend = env_enabled("POLARIS_SHIM_STATIC_RM_BACKEND");
     g_require_kv_scope = env_enabled("POLARIS_SHIM_REQUIRE_KV_SCOPE");
     g_auto_kv_hints = env_enabled("POLARIS_SHIM_AUTO_KV_HINTS");
+    g_eager_reserve = env_enabled("POLARIS_SHIM_EAGER_RESERVE");
     g_allow_zero_memset = env_enabled("POLARIS_SHIM_ALLOW_ZERO_MEMSET");
     g_trace_scope = env_enabled("POLARIS_SHIM_TRACE_SCOPE");
     if (g_static_rm_backend) {
@@ -1930,11 +1934,12 @@ static int polaris_alloc_managed(size_t size, CUdeviceptr *out)
         uint64_t block_id = 0;
         uint64_t chunk_vaddr = 0;
         uint64_t expected_vaddr;
+        uint32_t reserve_flags = g_eager_reserve ? 0 : POLARIS_RESERVE_FLAG_DEFER_FAULT;
 
         ret = polaris_shim_block_reserve(g_session_id,
                                          token_start + i,
                                          1,
-                                         POLARIS_RESERVE_FLAG_DEFER_FAULT,
+                                         reserve_flags,
                                          &block_id,
                                          &chunk_vaddr);
         if (ret != 0)

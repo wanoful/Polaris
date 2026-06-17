@@ -1195,6 +1195,10 @@ Still to do on the Polaris side for M1/M2:
   ubatch graph compute. `POLARIS_SHIM_AUTO_KV_HINTS=1` remains an opt-in coarse
   no-source-change proxy based on the current tail allocation and incoming
   allocation span. The benchmark runner passes both hint flags through when set.
+  `POLARIS_SHIM_EAGER_RESERVE=1` is available as an opt-in benchmark mode to
+  materialize selected chunks during shim allocation instead of deferring daemon
+  `ALLOC` until the first GPU fault; use it with KV hints under small budgets so
+  allocation-time budget enforcement does not reclaim the incoming active span.
   This is still chunk-window based, not a full model-token access trace; vLLM
   and SGLang integration hooks remain future work.
 - vLLM/SGLang comparison support is currently KV allocator trace-level:
