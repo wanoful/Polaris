@@ -3998,7 +3998,9 @@ impl PolarisDevice {
                         block.state = PolarisBlockState::Resident;
                         block.gpu_phys_handle = arg.output_handle;
                         polaris_apply_completed_rm_backing(block, completed_rm_backing);
-                        block.map_time_ns = unsafe { bindings::ktime_get_mono_fast_ns() };
+                        let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+                        block.map_time_ns = now;
+                        block.last_touch_ns = now;
                     }
                     PolarisBlockState::OffloadPending => {
                         block.state = PolarisBlockState::CpuOffloaded;

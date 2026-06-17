@@ -16,6 +16,8 @@ NVIDIA_KO_DIR="${NVIDIA_KO_DIR:-/home/wano/workspace/open-gpu-kernel-modules}"
 SHIM_SO="${SHIM_SO:-$ROOT_DIR/libpolaris-shim/libpolaris-shim.so}"
 STATS_PATH="${STATS_PATH:-/sys/kernel/polaris/stats}"
 POLARISD_BIN="${POLARISD_BIN:-$ROOT_DIR/target/debug/polarisd}"
+POLARISCTL_BIN="${POLARISCTL_BIN:-$ROOT_DIR/target/debug/polarisctl}"
+NVIDIA_UVM_TESTS_PARAM="${NVIDIA_UVM_TESTS_PARAM:-/sys/module/nvidia_uvm/parameters/uvm_enable_builtin_tests}"
 RESULTS_ROOT="${POLARIS_BENCH_RESULTS_DIR:-$ROOT_DIR/benchmarks/results/llama_cpp}"
 RUN_ID="${POLARIS_BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_DIR="${POLARIS_BENCH_OUT_DIR:-$RESULTS_ROOT/$RUN_ID}"
@@ -117,6 +119,7 @@ require_executable "$LLAMA_CPP_BIN" "llama.cpp benchmark binary"
 require_file "$LLAMA_CPP_MODEL" "GGUF model"
 require_file "$SHIM_SO" "libpolaris-shim.so"
 require_executable "$POLARISD_BIN" "polarisd binary"
+require_executable "$POLARISCTL_BIN" "polarisctl binary"
 [[ -r "$STATS_PATH" ]] || die "$STATS_PATH is not readable"
 
 mkdir -p "$LOG_DIR"
@@ -176,6 +179,44 @@ start_polarisd() {
     done
     tail -n 160 "$log" >&2 || true
     die "polarisd did not register with polaris.ko within ${timeout_sec}s; see $log"
+}
+
+require_uvm_dispatch_key_probe() {
+    local enabled=""
+    if [[ -r "$NVIDIA_UVM_TESTS_PARAM" ]]; then
+        enabled="$(tr -d '[:space:]' <"$NVIDIA_UVM_TESTS_PARAM")"
+    fi
+
+    case "$enabled" in
+        1|Y|y)
+            return 0
+            ;;
+    esac
+
+    die "nvidia_uvm must be loaded with uvm_enable_builtin_tests=1 for POLARIS RM/UVM bootstrap; current $NVIDIA_UVM_TESTS_PARAM=${enabled:-unavailable}"
+}
+
+set_eviction_policy() {
+    local policy="${POLARIS_BENCH_EVICTION_POLICY:-fifo}"
+
+    local policy_id
+    case "$policy" in
+        0|fifo|FIFO)
+            policy_id=0
+            ;;
+        1|lru|LRU)
+            policy_id=1
+            ;;
+        2|phase_aware|phase-aware|PhaseAware|PHASE_AWARE)
+            policy_id=2
+            ;;
+        *)
+            die "unknown POLARIS_BENCH_EVICTION_POLICY=$policy"
+            ;;
+    esac
+
+    note "setting eviction policy=$policy_id"
+    "$POLARISCTL_BIN" set-policy "$policy_id" >/dev/null
 }
 
 stop_polarisd() {
@@ -340,9 +381,11 @@ run_one() {
             set -e
             ;;
         polaris_no_pressure|polaris_pressure|polaris_sustained_pressure)
+            require_uvm_dispatch_key_probe
             start_polarisd "$polarisd_log" \
                 POLARISD_GPU_BUDGET_BYTES="$budget_bytes" \
                 POLARISD_CPU_POOL_BYTES="$cpu_pool_bytes"
+            set_eviction_policy
             set +e
             run_bench_command "$stdout_json" "$stderr_log" \
                 env \

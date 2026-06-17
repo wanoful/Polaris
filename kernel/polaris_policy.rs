@@ -212,8 +212,13 @@ fn find_victim_lru(
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
             continue;
         }
-        if block.last_touch_ns < best_time {
-            best_time = block.last_touch_ns;
+        let touch_time = if block.last_touch_ns != 0 {
+            block.last_touch_ns
+        } else {
+            block.map_time_ns
+        };
+        if touch_time < best_time {
+            best_time = touch_time;
             best = Some((idx, block.block_id, block.size_bytes, block.home_gpu));
         }
     }
@@ -231,8 +236,13 @@ fn find_victim_lru(
         if !is_eligible_fifo_lru(block, inner, target_gpu) {
             continue;
         }
-        if block.last_touch_ns < best_time {
-            best_time = block.last_touch_ns;
+        let touch_time = if block.last_touch_ns != 0 {
+            block.last_touch_ns
+        } else {
+            block.map_time_ns
+        };
+        if touch_time < best_time {
+            best_time = touch_time;
             best = Some((idx, block.block_id, block.size_bytes, block.home_gpu));
         }
     }
@@ -266,7 +276,12 @@ fn phase_aware_score(
     session_priority: u32,
 ) -> i64 {
     // Age in seconds (saturating to avoid overflow on very old timestamps).
-    let age_ns = now.saturating_sub(block.last_touch_ns);
+    let touch_time = if block.last_touch_ns != 0 {
+        block.last_touch_ns
+    } else {
+        block.map_time_ns
+    };
+    let age_ns = now.saturating_sub(touch_time);
     let age_sec = (age_ns / 1_000_000_000u64) as i64;
 
     let is_prefill = if block.phase == PolarisPhase::Prefill { 1i64 } else { 0i64 };
