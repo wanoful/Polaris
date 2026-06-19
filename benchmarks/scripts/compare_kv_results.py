@@ -74,8 +74,8 @@ def main() -> int:
 
     records = load_records(args.jsonl)
     rows = [
-        "| source | mode | scope | prompt | gen | avg_ts | offloads | reloads | bridge_maps | cached_maps | peak_live_blocks | total_reserved_blocks | uvm_errors | top_profile |",
-        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| source | mode | scope | prompt | gen | avg_ts | offloads | reloads | bridge_maps | cached_maps | driver_cache | hook_calls | peak_live_blocks | total_reserved_blocks | uvm_errors | top_profile |",
+        "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
 
     for rec in records:
@@ -90,7 +90,7 @@ def main() -> int:
         else:
             avg_ts_s = str(avg_ts)
         rows.append(
-            "| {source} | {mode} | {scope} | {prompt} | {gen} | {avg_ts} | {offloads} | {reloads} | {bridge} | {cached} | {peak} | {reserved} | {errors} | {top_profile} |".format(
+            "| {source} | {mode} | {scope} | {prompt} | {gen} | {avg_ts} | {offloads} | {reloads} | {bridge} | {cached} | {driver_cache} | {hook_calls} | {peak} | {reserved} | {errors} | {top_profile} |".format(
                 source=source,
                 mode=mode,
                 scope=scope,
@@ -101,6 +101,8 @@ def main() -> int:
                 reloads=first_present(rec, ["polarisd_decisions.reloads", "stats_delta.reloads"], rec.get("reloads", 0)),
                 bridge=get(rec, "stats_delta.uvm_bridge_map_calls", rec.get("uvm_bridge_map_calls", 0)),
                 cached=get(rec, "stats_delta.uvm_cached_map_hits", rec.get("uvm_cached_map_hits", 0)),
+                driver_cache=get(rec, "stats_delta.uvm_driver_cache_hits", rec.get("uvm_driver_cache_hits", 0)),
+                hook_calls=get(rec, "stats_delta.uvm_hook_calls", rec.get("uvm_hook_calls", 0)),
                 peak=rec.get("peak_live_blocks", ""),
                 reserved=rec.get("total_reserved_blocks", ""),
                 errors=get(rec, "stats_delta.uvm_errors", rec.get("uvm_errors", 0)),

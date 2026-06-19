@@ -279,6 +279,8 @@ keys = [
     "uvm_hook_calls", "uvm_handled", "uvm_deferred", "uvm_rejected", "uvm_no_pte",
     "uvm_errors", "uvm_cached_map_hits", "uvm_bridge_map_calls", "uvm_bridge_map_ok",
     "uvm_bridge_map_err", "uvm_bridge_map_retry", "uvm_bridge_map_avg_ns",
+    "uvm_driver_cache_hits", "uvm_driver_cache_miss", "uvm_driver_cache_inserts",
+    "uvm_driver_cache_evict", "uvm_driver_cache_inval",
 ]
 
 def parse_stats(path):

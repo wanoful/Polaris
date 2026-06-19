@@ -395,6 +395,13 @@ unsafe extern "C" {
         base: u64,
         length: u64,
     ) -> c_int;
+    fn uvm_polaris_mapped_cache_stats(
+        hits_out: *mut u64,
+        misses_out: *mut u64,
+        inserts_out: *mut u64,
+        evictions_out: *mut u64,
+        invalidations_out: *mut u64,
+    ) -> c_int;
     fn uvm_polaris_probe_external_allocation(
         gpu_va_space_ptr: u64,
         offset: u64,
@@ -2510,6 +2517,20 @@ unsafe extern "C" fn polaris_stats_show(
     } else {
         uvm_bridge_map_total_ns / uvm_bridge_map_calls
     };
+    let mut uvm_driver_cache_hits = 0u64;
+    let mut uvm_driver_cache_misses = 0u64;
+    let mut uvm_driver_cache_inserts = 0u64;
+    let mut uvm_driver_cache_evictions = 0u64;
+    let mut uvm_driver_cache_invalidations = 0u64;
+    let uvm_driver_cache_stats_ret = unsafe {
+        uvm_polaris_mapped_cache_stats(
+            &mut uvm_driver_cache_hits,
+            &mut uvm_driver_cache_misses,
+            &mut uvm_driver_cache_inserts,
+            &mut uvm_driver_cache_evictions,
+            &mut uvm_driver_cache_invalidations,
+        )
+    };
     let recent_cursor = POLARIS_UVM_RECENT_CURSOR.load(Relaxed);
     let recent0_idx = recent_cursor.wrapping_sub(1) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
     let recent1_idx = recent_cursor.wrapping_sub(2) as usize & (POLARIS_UVM_RECENT_FAULTS - 1);
@@ -2593,6 +2614,12 @@ uvm_bridge_map_err:{uvm_bridge_map_errors}
 uvm_bridge_map_retry:{uvm_bridge_map_retries}
 uvm_bridge_map_last_ns:{uvm_bridge_map_last_ns}
 uvm_bridge_map_avg_ns:{uvm_bridge_map_avg_ns}
+uvm_driver_cache_hits:{uvm_driver_cache_hits}
+uvm_driver_cache_miss:{uvm_driver_cache_misses}
+uvm_driver_cache_inserts:{uvm_driver_cache_inserts}
+uvm_driver_cache_evict:{uvm_driver_cache_evictions}
+uvm_driver_cache_inval:{uvm_driver_cache_invalidations}
+uvm_driver_cache_ret:{uvm_driver_cache_stats_ret}
 uvm_recent0:    fault=0x{recent0_fault:x} result={recent0_result} access={recent0_access}
 uvm_recent1:    fault=0x{recent1_fault:x} result={recent1_result} access={recent1_access}
 uvm_recent2:    fault=0x{recent2_fault:x} result={recent2_result} access={recent2_access}
@@ -2653,6 +2680,12 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_bridge_map_retries = uvm_bridge_map_retries,
                 uvm_bridge_map_last_ns = uvm_bridge_map_last_ns,
                 uvm_bridge_map_avg_ns = uvm_bridge_map_avg_ns,
+                uvm_driver_cache_hits = uvm_driver_cache_hits,
+                uvm_driver_cache_misses = uvm_driver_cache_misses,
+                uvm_driver_cache_inserts = uvm_driver_cache_inserts,
+                uvm_driver_cache_evictions = uvm_driver_cache_evictions,
+                uvm_driver_cache_invalidations = uvm_driver_cache_invalidations,
+                uvm_driver_cache_stats_ret = uvm_driver_cache_stats_ret,
                 recent0_fault = recent0_fault,
                 recent1_fault = recent1_fault,
                 recent2_fault = recent2_fault,
