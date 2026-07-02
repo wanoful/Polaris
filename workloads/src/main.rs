@@ -352,29 +352,6 @@ fn block_reserve(
     Ok((rc, arg.block_id, lat_us))
 }
 
-fn block_touch(
-    fd: c_int,
-    csv: &mut Option<CsvWriter>,
-    sid: u64,
-    token_start: u64,
-    token_count: u64,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let start = Instant::now();
-    let arg = PolarisBlockTouchArg {
-        session_id: sid,
-        token_start,
-        token_count,
-        ..Default::default()
-    };
-    ioctl::ioctl_write(fd, ioctl::POLARIS_BLOCK_TOUCH, &arg)
-        .map_err(|e| format!("BLOCK_TOUCH: errno {e}"))?;
-    let lat_us = start.elapsed().as_micros() as u64;
-    if let Some(ref mut c) = csv {
-        c.record("BLOCK_TOUCH", sid, token_start as u32, token_count as u32, 0, 0, lat_us);
-    }
-    Ok(lat_us)
-}
-
 fn branch_session(
     fd: c_int,
     csv: &mut Option<CsvWriter>,
@@ -477,14 +454,9 @@ fn run_decode_loop(
             .into());
         }
 
-        // Touch the active range to model the access pattern seen by the
-        // interrupt-driven fault path.
-        let touch_lat = block_touch(fd, csv, sid, 0, total_tokens)?;
-        total_lat_us += touch_lat;
-
         if i % 16 == 15 || i == output_blocks - 1 {
             eprintln!(
-                "    decode step {}/{} (total tokens={total_tokens}, reserve={lat_us} µs, touch={touch_lat} µs)",
+                "    decode step {}/{} (total tokens={total_tokens}, reserve={lat_us} µs)",
                 i + 1,
                 output_blocks,
             );
@@ -568,12 +540,6 @@ fn run_synthetic_kv(
         }
         let elapsed = start.elapsed();
         eprintln!("Reserved {num_blocks} blocks in {elapsed:?} ({total_lat} µs ioctl)");
-
-        // Touch the full reserved range once.
-        let _ = block_touch(
-            fd, csv, sid, 0,
-            (num_blocks * tokens_per_block) as u64,
-        )?;
     }
 
     destroy_session(fd, csv, sid);
@@ -660,10 +626,6 @@ fn run_beam_search(
                 if rc != 0 {
                     eprintln!("  Child {ci} decode step {step} failed (rc={rc}) — stopping");
                 }
-
-                // Touch all existing blocks in this child
-                let total_tokens = (prompt_tokens + step * tokens_per_block + count) as u64;
-                let _ = block_touch(fd, csv, child_id, 0, total_tokens)?;
             }
             if step % 8 == 0 || step == decode_blocks - 1 {
                 eprintln!(
@@ -775,9 +737,6 @@ fn run_concurrent(
                     // Skip this session if reserve fails.
                     continue;
                 }
-
-                let total_tokens = (prompt_tokens + step * tokens_per_block + count) as u64;
-                let _ = block_touch(fd, csv, sid, 0, total_tokens)?;
             }
             if step % 8 == 0 || step == decode_blocks - 1 {
                 eprintln!(

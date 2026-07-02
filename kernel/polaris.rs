@@ -52,6 +52,7 @@ enum PolarisFaultResolveMode {
 struct UvmPolarisOps {
     owner: *mut bindings::module,
     handle_gpu_fault: unsafe extern "C" fn(u32, u64, u64, u64, u64, u32) -> c_int,
+    handle_access_counter: Option<unsafe extern "C" fn(u32, u64, u64, u64, u64, u32)>,
 }
 
 const UVM_POLARIS_FAULT_NOT_MINE: c_int = 0;
@@ -65,6 +66,7 @@ const POLARIS_UVM_RECENT_FAULTS: usize = 4;
 static UVM_POLARIS_OPS: UvmPolarisOps = UvmPolarisOps {
     owner: core::ptr::addr_of_mut!(bindings::__this_module),
     handle_gpu_fault: polaris_uvm_handle_gpu_fault,
+    handle_access_counter: Some(polaris_uvm_handle_access_counter),
 };
 
 unsafe impl Sync for UvmPolarisOps {}
@@ -155,6 +157,21 @@ static POLARIS_UVM_FAULT_DEFERRED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_REJECTED: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_FAULT_ERRORS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_CACHED_MAP_HITS: Atomic<u64> = Atomic::new(0);
+// Access-counter touch path: notifications the driver forwarded from the GPU
+// access-counter bottom half, and the subset that landed on a resident Polaris
+// block and refreshed its LRU last_touch_ns. A large gap between the two means
+// notifications are arriving for VAs Polaris no longer owns (races with unmap).
+static POLARIS_UVM_ACCESS_COUNTER_CALLS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_ACCESS_COUNTER_TOUCHES: Atomic<u64> = Atomic::new(0);
+// Ablation toggle for the in-kernel "already mapped to this gpu_va_space" short
+// circuit. 1 = enabled (default), 0 = bypass and always go through
+// polaris_map_fault_mapping(). Writable via /sys/kernel/polaris/driver_cache.
+static POLARIS_DRIVER_CACHE_ENABLED: Atomic<u32> = Atomic::new(1);
+
+#[inline]
+fn polaris_driver_cache_enabled() -> bool {
+    POLARIS_DRIVER_CACHE_ENABLED.load(Relaxed) != 0
+}
 static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_VA_SPACE_TOKEN: Atomic<u64> = Atomic::new(0);
@@ -516,7 +533,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             if fault_address < block_base || fault_address >= block_end {
                 continue;
             }
-            if block.last_gpu_va_space_ptr.load(Acquire) == gpu_va_space_ptr {
+            if polaris_driver_cache_enabled()
+                && block.last_gpu_va_space_ptr.load(Acquire) == gpu_va_space_ptr
+            {
                 POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
                 POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
                 return polaris_return_uvm_fault(
@@ -580,7 +599,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             va_space_token,
             fault_address,
         ) {
-            if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+            if polaris_driver_cache_enabled()
+                && mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr
+            {
                 POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
                 POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
                 return polaris_return_uvm_fault(
@@ -646,7 +667,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                         va_space_token,
                         fault_address,
                     ) {
-                        if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+                        if polaris_driver_cache_enabled()
+                            && mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr
+                        {
                             POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
                             POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
                             return polaris_return_uvm_fault(
@@ -749,7 +772,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
         gpu_id,
         fault_address,
     ) {
-        if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+        if polaris_driver_cache_enabled()
+            && mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr
+        {
             POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
             POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
             return polaris_return_uvm_fault(
@@ -813,7 +838,9 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
                     materialize.va_space_token,
                     fault_address,
                 ) {
-                    if mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr {
+                    if polaris_driver_cache_enabled()
+                        && mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr
+                    {
                         POLARIS_UVM_CACHED_MAP_HITS.fetch_add(1, Relaxed);
                         POLARIS_UVM_FAULT_HANDLED.fetch_add(1, Relaxed);
                         return polaris_return_uvm_fault(
@@ -910,6 +937,67 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
         access_type,
         UVM_POLARIS_FAULT_NOT_MINE,
     )
+}
+
+/// Access-counter touch hook, invoked from the driver's GPU access-counter
+/// bottom half (`uvm_polaris_dispatch_access_counters`) for notifications whose
+/// address lands in a Polaris-managed VA range. Unlike the replayable-fault
+/// path, this fires for blocks that are *already resident and mapped*: the GPU
+/// accesses them without faulting, so the fault hook never observes the access
+/// and the block's `last_touch_ns` would otherwise go stale under LRU. Here we
+/// refresh it directly from the HW access signal — this is the sole automatic
+/// last-use source for resident blocks (there is no userspace touch ioctl).
+///
+/// Runs in the same non-sleeping context as the fault hook. `counter_value` is
+/// the saturating HW access count since the counter was last cleared; it is
+/// currently unused but is plumbed through for future frequency-aware policies.
+unsafe extern "C" fn polaris_uvm_handle_access_counter(
+    gpu_id: u32,
+    rm_client_token: u64,
+    va_space_token: u64,
+    _gpu_va_space_ptr: u64,
+    address: u64,
+    _counter_value: u32,
+) {
+    POLARIS_UVM_ACCESS_COUNTER_CALLS.fetch_add(1, Relaxed);
+    if address == 0 {
+        return;
+    }
+
+    let mut guard = POLARIS_STATE.lock();
+    let inner = match guard.as_mut() {
+        Some(inner) => inner,
+        None => return,
+    };
+
+    // Re-validate ownership under our own lock: the driver's mapped-cache filter
+    // can race with unmap, so confirm the address is still inside a registered
+    // Polaris VA range for this worker before touching anything.
+    if va_space_token != 0 {
+        let owned = inner.va_spaces.iter().any(|v| {
+            v.gpu_id == gpu_id
+                && v.va_space_token == va_space_token
+                && (v.rm_client_token == 0 || v.rm_client_token == rm_client_token)
+                && address >= v.managed_base
+                && address < v.managed_base.saturating_add(v.managed_length)
+        });
+        if !owned {
+            return;
+        }
+    }
+
+    // Touch the resident block covering the notified address. Search from the
+    // end to prefer the newest block at a shared VA, mirroring the fault path.
+    let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+    if let Some(block) = inner.blocks.iter_mut().rev().find(|b| {
+        b.home_gpu == gpu_id
+            && b.state == PolarisBlockState::Resident
+            && address >= b.gpu_vaddr
+            && address < b.gpu_vaddr.saturating_add(b.size_bytes)
+    }) {
+        block.last_touch_ns = now;
+        POLARIS_UVM_ACCESS_COUNTER_TOUCHES.fetch_add(1, Relaxed);
+    }
 }
 
 fn polaris_timed_uvm_map_external_allocation(
@@ -2391,6 +2479,7 @@ impl core::fmt::Write for BufWriter<'_> {
 // in a static. Using c_str!("stats").as_char_ptr() directly in a static
 // may not work if as_char_ptr is not const fn.
 const STATS_NAME_BYTES: &[u8] = b"stats\0";
+const DRIVER_CACHE_NAME_BYTES: &[u8] = b"driver_cache\0";
 
 // Newtype wrapper so we can safely mark the kobj_attribute as Sync.
 // The attribute is write-once (at module init) then read-only forever;
@@ -2408,6 +2497,54 @@ static POLARIS_STATS_ATTR: PolarisStatsAttr = PolarisStatsAttr(bindings::kobj_at
     show: Some(polaris_stats_show),
     store: None,
 });
+
+static POLARIS_DRIVER_CACHE_ATTR: PolarisStatsAttr = PolarisStatsAttr(bindings::kobj_attribute {
+    attr: bindings::attribute {
+        name: DRIVER_CACHE_NAME_BYTES.as_ptr() as *const kernel::ffi::c_char,
+        mode: 0o644,
+    },
+    show: Some(polaris_driver_cache_show),
+    store: Some(polaris_driver_cache_store),
+});
+
+unsafe extern "C" fn polaris_driver_cache_show(
+    _kobj: *mut bindings::kobject,
+    _attr: *mut bindings::kobj_attribute,
+    buf: *mut kernel::ffi::c_char,
+) -> isize {
+    let v = POLARIS_DRIVER_CACHE_ENABLED.load(Relaxed);
+    // SAFETY: sysfs guarantees buf is at least PAGE_SIZE bytes.
+    let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 16) };
+    let s = if v != 0 { b"1\n\0" } else { b"0\n\0" };
+    buf_slice[..s.len()].copy_from_slice(s);
+    (s.len() - 1) as isize
+}
+
+unsafe extern "C" fn polaris_driver_cache_store(
+    _kobj: *mut bindings::kobject,
+    _attr: *mut bindings::kobj_attribute,
+    buf: *const kernel::ffi::c_char,
+    count: usize,
+) -> isize {
+    // -EINVAL = -22 on Linux. Returning a raw errno is the kernel C convention
+    // for sysfs store callbacks; we do not have a Result type to convert here.
+    const NEG_EINVAL: isize = -22;
+    if buf.is_null() || count == 0 {
+        return NEG_EINVAL;
+    }
+    // SAFETY: sysfs gives us a kernel buffer of `count` bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+    // Accept "0" / "1" possibly followed by whitespace/newline.
+    let first = bytes.iter().find(|&&b| b != b' ' && b != b'\t').copied();
+    let val: u32 = match first {
+        Some(b'0') => 0,
+        Some(b'1') => 1,
+        _ => return NEG_EINVAL,
+    };
+    POLARIS_DRIVER_CACHE_ENABLED.store(val, Relaxed);
+    pr_info!("POLARIS: driver_cache = {}\n", val);
+    count as isize
+}
 
 unsafe extern "C" fn polaris_stats_show(
     _kobj: *mut bindings::kobject,
@@ -2496,6 +2633,8 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_rejected = POLARIS_UVM_FAULT_REJECTED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
     let uvm_cached_map_hits = POLARIS_UVM_CACHED_MAP_HITS.load(Relaxed);
+    let uvm_acct_calls = POLARIS_UVM_ACCESS_COUNTER_CALLS.load(Relaxed);
+    let uvm_acct_touches = POLARIS_UVM_ACCESS_COUNTER_TOUCHES.load(Relaxed);
     let uvm_zero_faults = POLARIS_UVM_ZERO_FAULTS.load(Relaxed);
     let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
     let uvm_last_client = POLARIS_UVM_LAST_RM_CLIENT_TOKEN.load(Relaxed);
@@ -2568,7 +2707,7 @@ blocks:         {blocks}
 gpus:           {gpus}
   unhealthy:    {unhealthy}
 daemon:         {daemon}
-policy:         {policy} (0=fifo,1=lru,2=phase_aware)
+policy:         {policy} (0=fifo,1=lru,2=phase_aware,3=attention_stream)
 offloads:       {offload_cnt}
 reloads:        {reload_cnt}
 evictions:      {evictions}
@@ -2598,6 +2737,8 @@ uvm_deferred:   {uvm_deferred}
 uvm_rejected:   {uvm_rejected}
 uvm_errors:     {uvm_errors}
 uvm_cached_map_hits:{uvm_cached_map_hits}
+uvm_acct_calls: {uvm_acct_calls}
+uvm_acct_touches:{uvm_acct_touches}
 uvm_zero_faults:{uvm_zero_faults}
 uvm_last_gpu:   {uvm_last_gpu}
 uvm_last_client:0x{uvm_last_client:x}
@@ -2664,6 +2805,8 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_rejected = uvm_rejected,
                 uvm_errors = uvm_errors,
                 uvm_cached_map_hits = uvm_cached_map_hits,
+                uvm_acct_calls = uvm_acct_calls,
+                uvm_acct_touches = uvm_acct_touches,
                 uvm_zero_faults = uvm_zero_faults,
                 uvm_last_gpu = uvm_last_gpu,
                 uvm_last_client = uvm_last_client,
@@ -2746,7 +2889,29 @@ fn init_polaris_sysfs() -> Result<*mut bindings::kobject> {
         return Err(ENOMEM);
     }
 
-    pr_info!("POLARIS: /sys/kernel/polaris/stats created\n");
+    // SAFETY: polaris_kobj is valid; POLARIS_DRIVER_CACHE_ATTR is 'static.
+    let ret = unsafe {
+        bindings::sysfs_create_file_ns(
+            polaris_kobj,
+            &raw const POLARIS_DRIVER_CACHE_ATTR.0.attr as *const bindings::attribute,
+            core::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        pr_err!("POLARIS: failed to create sysfs driver_cache attribute (err {ret})\n");
+        // SAFETY: stats attr created just above; tear it down before we drop kobj.
+        unsafe {
+            bindings::sysfs_remove_file_ns(
+                polaris_kobj,
+                &raw const POLARIS_STATS_ATTR.0.attr as *const bindings::attribute,
+                core::ptr::null(),
+            );
+            bindings::kobject_put(polaris_kobj);
+        }
+        return Err(ENOMEM);
+    }
+
+    pr_info!("POLARIS: /sys/kernel/polaris/{{stats,driver_cache}} created\n");
     Ok(polaris_kobj)
 }
 
@@ -2858,6 +3023,11 @@ impl PinnedDrop for PolarisModule {
             unsafe {
                 bindings::sysfs_remove_file_ns(
                     self.polaris_kobj,
+                    &raw const POLARIS_DRIVER_CACHE_ATTR.0.attr as *const bindings::attribute,
+                    core::ptr::null(),
+                );
+                bindings::sysfs_remove_file_ns(
+                    self.polaris_kobj,
                     &raw const POLARIS_STATS_ATTR.0.attr as *const bindings::attribute,
                     core::ptr::null(),
                 );
@@ -2945,7 +3115,6 @@ impl MiscDevice for PolarisDevice {
             POLARIS_SESSION_BRANCH => me.handle_session_branch(user_ptr, size),
             POLARIS_BLOCK_RESERVE => me.handle_block_reserve(user_ptr, size),
             POLARIS_BLOCK_RELEASE => me.handle_block_release(user_ptr, size),
-            POLARIS_BLOCK_TOUCH => me.handle_block_touch(user_ptr, size),
             POLARIS_BLOCK_GET_STATE => me.handle_block_get_state(user_ptr, size),
             POLARIS_GET_DECISION => me.handle_get_decision(user_ptr, size),
             POLARIS_COMPLETE_OPERATION => me.handle_complete_operation(user_ptr, size),
@@ -3952,46 +4121,6 @@ impl PolarisDevice {
         }
     }
 
-    fn handle_block_touch(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
-        let mut reader = UserSlice::new(user_ptr, size).reader();
-        let arg: PolarisBlockTouchArg = reader.read()?;
-        let mut guard = POLARIS_STATE.lock();
-        let inner = guard.as_mut().ok_or(ENODEV)?;
-        let now = unsafe { bindings::ktime_get_mono_fast_ns() };
-        let touch_end = arg.token_start + arg.token_count;
-
-        // Collect block IDs to touch (covers both directly-owned and COW-shared blocks).
-        let mut bids_to_touch: KVec<u64> = KVec::new();
-        if let Some(sess) = inner.sessions.iter().find(|s| s.session_id == arg.session_id) {
-            for &bid in &sess.block_ids {
-                bids_to_touch.push(bid, GFP_KERNEL)?;
-            }
-        }
-        // Also scan by session_id for directly-owned blocks not yet in block_ids list.
-        for block in inner.blocks.iter() {
-            if block.session_id == arg.session_id {
-                let start = block.token_start as u64;
-                let end = start + block.token_count as u64;
-                if start < touch_end && end > arg.token_start {
-                    if !bids_to_touch.iter().any(|&bid| bid == block.block_id) {
-                        bids_to_touch.push(block.block_id, GFP_KERNEL)?;
-                    }
-                }
-            }
-        }
-
-        for bid in &bids_to_touch {
-            if let Some(block) = inner.blocks.iter_mut().find(|b| b.block_id == *bid) {
-                let start = block.token_start as u64;
-                let end = start + block.token_count as u64;
-                if start < touch_end && end > arg.token_start {
-                    block.last_touch_ns = now;
-                }
-            }
-        }
-        Ok(0)
-    }
-
     fn handle_update_kv_active_window(&self, user_ptr: UserPtr, size: usize) -> Result<isize> {
         let mut reader = UserSlice::new(user_ptr, size).reader();
         let arg: PolarisKvActiveWindowArg = reader.read()?;
@@ -4603,10 +4732,11 @@ impl PolarisDevice {
             0 => inner.eviction_policy = PolarisEvictionPolicy::Fifo,
             1 => inner.eviction_policy = PolarisEvictionPolicy::Lru,
             2 => inner.eviction_policy = PolarisEvictionPolicy::PhaseAware,
+            3 => inner.eviction_policy = PolarisEvictionPolicy::AttentionStream,
             _ => {
                 dev_err!(
                     self.dev,
-                    "POLARIS: unknown eviction policy {} (valid: 0=fifo, 1=lru, 2=phase_aware)\n",
+                    "POLARIS: unknown eviction policy {} (valid: 0=fifo, 1=lru, 2=phase_aware, 3=attention_stream)\n",
                     arg.policy
                 );
                 return Err(EINVAL);

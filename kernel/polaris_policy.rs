@@ -7,6 +7,7 @@
 //!   FIFO        — Victim = block with the oldest map_time_ns
 //!   LRU         — Victim = block with the oldest last_touch_ns
 //!   PhaseAware  — Scoring function: active KV chunk protected, shared/decode protected
+//!   AttentionStream — llama.cpp KV active-window reuse-distance policy
 //!
 //! All policies use a two-pass search:
 //!   Pass 1: only blocks from OTHER sessions (preferred)
@@ -71,6 +72,13 @@ pub fn select_victim(
             )
         }
         PolarisEvictionPolicy::PhaseAware => find_victim_phase_aware(
+            inner,
+            requesting_session_id,
+            target_gpu,
+            protected_phys_handle,
+            protected_block_id,
+        ),
+        PolarisEvictionPolicy::AttentionStream => find_victim_attention_stream(
             inner,
             requesting_session_id,
             target_gpu,
@@ -292,6 +300,15 @@ const HINTED_ACTIVE_READ_PROTECT_SCORE: i64 = 750_000;
 const HINTED_ACTIVE_WRITE_PROTECT_SCORE: i64 = 1_000_000;
 const HINTED_ACTIVE_NEAR_PROTECT_SCORE: i64 = 250_000;
 const HINTED_ACTIVE_NEAR_TOKENS: u64 = 4;
+const ATTENTION_STREAM_LOOKAHEAD_TOKENS: u64 = 8;
+const ATTENTION_STREAM_SUFFIX_TOKENS: u64 = 16;
+const ATTENTION_STREAM_OUTSIDE_WINDOW_SCORE: i64 = 2_000_000;
+const ATTENTION_STREAM_PAST_SCORE: i64 = 1_000_000;
+const ATTENTION_STREAM_OTHER_IDLE_SCORE: i64 = 250_000;
+const ATTENTION_STREAM_FUTURE_SCALE: u64 = 4;
+const ATTENTION_STREAM_SHARED_PENALTY: i64 = 750_000;
+const ATTENTION_STREAM_DECODE_SUFFIX_PENALTY: i64 = 600_000;
+const ATTENTION_STREAM_LOOKAHEAD_PENALTY: i64 = 1_000_000;
 
 #[derive(Clone, Copy)]
 struct ActiveChunkWindow {
@@ -448,6 +465,26 @@ fn hinted_active_window_overlaps(
         && ranges_overlap(block_start, block_end, active.write_start, active.write_end))
         || (active.read_start < active.read_end
             && ranges_overlap(block_start, block_end, active.read_start, active.read_end))
+}
+
+fn hinted_active_write_overlaps(block: &PolarisBlock, active: ActiveKvWindow) -> bool {
+    if active.write_start >= active.write_end {
+        return false;
+    }
+
+    let block_start = block.token_start as u64;
+    let block_end = block_start.saturating_add(block.token_count as u64);
+    ranges_overlap(block_start, block_end, active.write_start, active.write_end)
+}
+
+fn hinted_active_read_overlaps(block: &PolarisBlock, active: ActiveKvWindow) -> bool {
+    if active.read_start >= active.read_end {
+        return false;
+    }
+
+    let block_start = block.token_start as u64;
+    let block_end = block_start.saturating_add(block.token_count as u64);
+    ranges_overlap(block_start, block_end, active.read_start, active.read_end)
 }
 
 fn phase_aware_order_time(block: &PolarisBlock) -> u64 {
@@ -608,4 +645,159 @@ fn find_victim_phase_aware(
     }
 
     best.map(|(a, b, c, d, _)| (a, b, c, d))
+}
+
+// ─── Attention-Stream: llama.cpp KV reuse-distance policy ───────────────────
+//
+// This policy consumes the existing llama.cpp KV active-window hints as a
+// sequential attention schedule. It hard-protects the current write/read span
+// and the near read lookahead, then prefers victims that are outside the active
+// attention window or already behind the current read cursor. With today's ABI,
+// read_start is the best available cursor; if no hint is present, fall back to
+// PhaseAware so policy 3 remains safe on non-hinting workloads.
+
+fn attention_stream_session_has_active_hint(inner: &PolarisInner, session_id: u64) -> bool {
+    active_kv_window(inner, session_id).is_some()
+}
+
+fn attention_stream_order_time(block: &PolarisBlock) -> u64 {
+    if block.last_touch_ns != 0 {
+        block.last_touch_ns
+    } else {
+        block.map_time_ns
+    }
+}
+
+fn attention_stream_score(
+    inner: &PolarisInner,
+    block: &PolarisBlock,
+    active: ActiveKvWindow,
+    session_priority: u32,
+) -> i64 {
+    let block_start = block.token_start as u64;
+    let block_end = block_start.saturating_add(block.token_count as u64);
+    let cursor = active.read_start;
+    let read_end = active.read_end;
+    let lookahead_end = cursor.saturating_add(ATTENTION_STREAM_LOOKAHEAD_TOKENS);
+    let suffix_start = if active.write_start < active.write_end {
+        active.write_start.saturating_sub(ATTENTION_STREAM_SUFFIX_TOKENS)
+    } else {
+        read_end.saturating_sub(ATTENTION_STREAM_SUFFIX_TOKENS)
+    };
+
+    let mut score = 0i64;
+
+    if block_owned_by_session(inner, block, active.session_id) {
+        if active.read_start < active.read_end
+            && !ranges_overlap(block_start, block_end, active.read_start, active.read_end)
+        {
+            score += ATTENTION_STREAM_OUTSIDE_WINDOW_SCORE;
+        } else if block_end <= cursor {
+            let behind = cursor.saturating_sub(block_end).min(i64::MAX as u64) as i64;
+            score += ATTENTION_STREAM_PAST_SCORE.saturating_add(behind);
+        } else if block_start >= lookahead_end {
+            let ahead = block_start.saturating_sub(lookahead_end) / ATTENTION_STREAM_FUTURE_SCALE;
+            score += ahead.min(i64::MAX as u64) as i64;
+        }
+
+        if active.read_start < active.read_end
+            && ranges_overlap(block_start, block_end, cursor, lookahead_end.min(active.read_end))
+        {
+            score -= ATTENTION_STREAM_LOOKAHEAD_PENALTY;
+        }
+
+        if ranges_overlap(block_start, block_end, suffix_start, active.write_end.max(read_end)) {
+            score -= ATTENTION_STREAM_DECODE_SUFFIX_PENALTY;
+        }
+    } else {
+        score += ATTENTION_STREAM_OTHER_IDLE_SCORE;
+        if !attention_stream_session_has_active_hint(inner, block.session_id) {
+            score += ATTENTION_STREAM_OTHER_IDLE_SCORE;
+        }
+    }
+
+    if block.refcount > 1 {
+        let refcount = block.refcount.min(8) as i64;
+        score -= ATTENTION_STREAM_SHARED_PENALTY.saturating_mul(refcount);
+    }
+
+    let prio = if session_priority > 0 && session_priority <= 10 {
+        session_priority
+    } else {
+        5u32
+    };
+    score += (11u32.saturating_sub(prio) as i64) * PRIORITY_WEIGHT;
+
+    score
+}
+
+fn find_victim_attention_stream(
+    inner: &PolarisInner,
+    requesting_session_id: u64,
+    target_gpu: u32,
+    protected_phys_handle: u64,
+    protected_block_id: u64,
+) -> Option<(usize, u64, u64, u32)> {
+    let Some(active) = active_kv_window(inner, requesting_session_id) else {
+        return find_victim_phase_aware(
+            inner,
+            requesting_session_id,
+            target_gpu,
+            protected_phys_handle,
+            protected_block_id,
+        );
+    };
+
+    for pass in 0..2 {
+        let mut best: Option<(usize, u64, u64, u32, i64)> = None;
+        let mut best_score: i64 = i64::MIN;
+        let mut best_order_time: u64 = u64::MAX;
+
+        for (idx, block) in inner.blocks.iter().enumerate() {
+            if pass == 0 && block_owned_by_session(inner, block, requesting_session_id) {
+                continue;
+            }
+            if is_protected_source(block, protected_phys_handle, protected_block_id) {
+                continue;
+            }
+            if !is_eligible_phase_aware(block, inner, target_gpu) {
+                continue;
+            }
+            if block_owned_by_session(inner, block, active.session_id)
+                && (hinted_active_write_overlaps(block, active)
+                    || hinted_active_read_overlaps(block, active))
+            {
+                continue;
+            }
+
+            let session_priority = inner.sessions.iter()
+                .find(|s| s.session_id == block.session_id)
+                .map(|s| s.priority)
+                .unwrap_or(5u32);
+            let score = attention_stream_score(
+                inner,
+                block,
+                active,
+                session_priority,
+            );
+            let order_time = attention_stream_order_time(block);
+            if score > best_score || (score == best_score && order_time < best_order_time) {
+                best_score = score;
+                best_order_time = order_time;
+                best = Some((idx, block.block_id, block.size_bytes, block.home_gpu, score));
+            }
+        }
+
+        if best.is_some() {
+            return best.map(|(a, b, c, d, _)| (a, b, c, d));
+        }
+    }
+
+    find_victim_phase_aware(
+        inner,
+        requesting_session_id,
+        target_gpu,
+        protected_phys_handle,
+        protected_block_id,
+    )
 }

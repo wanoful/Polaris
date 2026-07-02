@@ -210,6 +210,9 @@ set_eviction_policy() {
         2|phase_aware|phase-aware|PhaseAware|PHASE_AWARE)
             policy_id=2
             ;;
+        3|attention_stream|attention-stream|AttentionStream|ATTENTION_STREAM)
+            policy_id=3
+            ;;
         *)
             die "unknown POLARIS_BENCH_EVICTION_POLICY=$policy"
             ;;
@@ -281,6 +284,7 @@ keys = [
     "uvm_bridge_map_err", "uvm_bridge_map_retry", "uvm_bridge_map_avg_ns",
     "uvm_driver_cache_hits", "uvm_driver_cache_miss", "uvm_driver_cache_inserts",
     "uvm_driver_cache_evict", "uvm_driver_cache_inval",
+    "uvm_acct_calls", "uvm_acct_touches",
 ]
 
 def parse_stats(path):

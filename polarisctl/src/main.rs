@@ -47,9 +47,9 @@ enum Commands {
     },
     /// List all sessions
     ListSessions,
-    /// Set eviction policy (0=FIFO, 1=LRU, 2=PhaseAware)
+    /// Set eviction policy (0=FIFO, 1=LRU, 2=PhaseAware, 3=AttentionStream)
     SetPolicy {
-        /// Policy: 0=FIFO, 1=LRU, 2=phase_aware
+        /// Policy: 0=FIFO, 1=LRU, 2=phase_aware, 3=attention_stream
         policy: u32,
     },
 }
@@ -87,6 +87,7 @@ fn cmd_stats(fd: c_int) -> Result<(), Box<dyn std::error::Error>> {
         0 => "FIFO",
         1 => "LRU",
         2 => "Phase-Aware",
+        3 => "Attention-Stream",
         _ => "Unknown",
     };
 
@@ -185,7 +186,8 @@ fn cmd_set_policy(fd: c_int, policy: u32) -> Result<(), Box<dyn std::error::Erro
         0 => "FIFO",
         1 => "LRU",
         2 => "Phase-Aware",
-        _ => return Err(format!("invalid policy {policy} — valid: 0=FIFO, 1=LRU, 2=phase_aware").into()),
+        3 => "Attention-Stream",
+        _ => return Err(format!("invalid policy {policy} - valid: 0=FIFO, 1=LRU, 2=phase_aware, 3=attention_stream").into()),
     };
     let arg = PolarisSetPolicyArg {
         policy,

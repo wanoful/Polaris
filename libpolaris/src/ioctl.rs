@@ -69,9 +69,6 @@ pub const POLARIS_BLOCK_RESERVE: u32 =
 pub const POLARIS_BLOCK_RELEASE: u32 =
     iow!(MAGIC, 0x08, PolarisBlockReleaseArg);
 
-pub const POLARIS_BLOCK_TOUCH: u32 =
-    iow!(MAGIC, 0x09, PolarisBlockTouchArg);
-
 pub const POLARIS_BLOCK_GET_STATE: u32 =
     iowr!(MAGIC, 0x0A, PolarisBlockGetStateArg);
 

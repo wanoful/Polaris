@@ -43,9 +43,6 @@ pub const POLARIS_BLOCK_RESERVE: u32 =
 pub const POLARIS_BLOCK_RELEASE: u32 =
     kernel::ioctl::_IOW::<PolarisBlockReleaseArg>(POLARIS_IOCTL_MAGIC, 0x08);
 
-pub const POLARIS_BLOCK_TOUCH: u32 =
-    kernel::ioctl::_IOW::<PolarisBlockTouchArg>(POLARIS_IOCTL_MAGIC, 0x09);
-
 pub const POLARIS_BLOCK_GET_STATE: u32 =
     kernel::ioctl::_IOWR::<PolarisBlockGetStateArg>(POLARIS_IOCTL_MAGIC, 0x0A);
 
@@ -321,9 +318,6 @@ unsafe impl kernel::transmute::AsBytes for PolarisBlockReserveArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisBlockReleaseArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisBlockReleaseArg {}
-
-unsafe impl kernel::transmute::FromBytes for PolarisBlockTouchArg {}
-unsafe impl kernel::transmute::AsBytes for PolarisBlockTouchArg {}
 
 unsafe impl kernel::transmute::FromBytes for PolarisBlockGetStateArg {}
 unsafe impl kernel::transmute::AsBytes for PolarisBlockGetStateArg {}

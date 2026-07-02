@@ -46,6 +46,8 @@ pub enum PolarisEvictionPolicy {
     Lru = 1,
     /// Victim = highest scoring function value (prefill preferred, decode/recent protected).
     PhaseAware = 2,
+    /// Victim = farthest predicted KV attention reuse from active-window hints.
+    AttentionStream = 3,
 }
 
 // ─── Decision Opcodes ───────────────────────────────────────────────
@@ -351,15 +353,6 @@ pub struct PolarisBlockReleaseArg {
     pub flags: u32,
     pub _reserved: u32,
     pub _reserved2: [u64; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct PolarisBlockTouchArg {
-    pub session_id: u64,
-    pub token_start: u64,
-    pub token_count: u64,
-    pub _reserved: [u64; 4],
 }
 
 #[repr(C)]
