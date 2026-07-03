@@ -152,6 +152,10 @@ pub struct PolarisBlock {
     pub phase: PolarisPhase,
     pub last_touch_ns: u64,
     pub map_time_ns: u64,
+    /// Physical framebuffer offset of the RM backing (from NVOS32 alloc), used
+    /// to map GPU Vidmem-Access-Bit-Buffer regions to this block for the
+    /// access-driven LRU touch. Zero when unknown / not vidmem-backed.
+    pub phys_fb_addr: u64,
     /// Opaque CUDA VMM phys handle of the source block for legacy COW_BREAK.
     pub cow_src_handle: u64,
     /// Source block id for in-flight COW_BREAK. RM-backed COW uses this because

@@ -628,6 +628,7 @@ pub fn execute_rm_reload(
         rm_h_client: backend.h_client,
         rm_h_memory: allocation.h_memory,
         rm_backing_length: allocation.size,
+        phys_fb_addr: allocation.phys_fb_addr,
         ..Default::default()
     }
 }
@@ -793,6 +794,7 @@ pub fn execute_rm_cow_break(
         rm_h_client: backend.h_client,
         rm_h_memory: allocation.h_memory,
         rm_backing_length: allocation.size,
+        phys_fb_addr: allocation.phys_fb_addr,
         ..Default::default()
     }
 }

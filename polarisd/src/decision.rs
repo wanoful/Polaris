@@ -16,6 +16,7 @@ pub struct ExecutionResult {
     pub rm_h_client: u32,
     pub rm_h_memory: u32,
     pub rm_backing_length: u64,
+    pub phys_fb_addr: u64,
 }
 
 pub(crate) fn decision_name(op: u32) -> &'static str {
@@ -250,6 +251,7 @@ fn dispatch(
                     rm_h_client: backend.h_client,
                     rm_h_memory: allocation.h_memory,
                     rm_backing_length: allocation.size,
+                    phys_fb_addr: allocation.phys_fb_addr,
                     ..Default::default()
                 };
             }

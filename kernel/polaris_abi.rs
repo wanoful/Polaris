@@ -416,6 +416,10 @@ pub struct PolarisCompleteOperationArg {
     pub rm_h_client: u32,
     pub rm_h_memory: u32,
     pub rm_backing_length: u64,
+    /// Physical framebuffer offset of the RM backing (NVOS32 `offset`), used to
+    /// map GPU Vidmem-Access-Bit-Buffer regions back to this block for the
+    /// access-driven LRU last-use signal. Zero when unknown / not vidmem-backed.
+    pub phys_fb_addr: u64,
 }
 
 #[repr(C)]

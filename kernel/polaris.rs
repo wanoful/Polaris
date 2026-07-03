@@ -53,6 +53,7 @@ struct UvmPolarisOps {
     owner: *mut bindings::module,
     handle_gpu_fault: unsafe extern "C" fn(u32, u64, u64, u64, u64, u32) -> c_int,
     handle_access_counter: Option<unsafe extern "C" fn(u32, u64, u64, u64, u64, u32)>,
+    handle_access_bits: Option<unsafe extern "C" fn(u32, *const u64, u32, u64)>,
 }
 
 const UVM_POLARIS_FAULT_NOT_MINE: c_int = 0;
@@ -67,6 +68,7 @@ static UVM_POLARIS_OPS: UvmPolarisOps = UvmPolarisOps {
     owner: core::ptr::addr_of_mut!(bindings::__this_module),
     handle_gpu_fault: polaris_uvm_handle_gpu_fault,
     handle_access_counter: Some(polaris_uvm_handle_access_counter),
+    handle_access_bits: Some(polaris_uvm_handle_access_bits),
 };
 
 unsafe impl Sync for UvmPolarisOps {}
@@ -163,6 +165,10 @@ static POLARIS_UVM_CACHED_MAP_HITS: Atomic<u64> = Atomic::new(0);
 // notifications are arriving for VAs Polaris no longer owns (races with unmap).
 static POLARIS_UVM_ACCESS_COUNTER_CALLS: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_ACCESS_COUNTER_TOUCHES: Atomic<u64> = Atomic::new(0);
+// VAB (Vidmem Access Bit Buffer) LRU path: dumps forwarded from the driver, and
+// the number of resident-block last_touch refreshes those dumps produced.
+static POLARIS_UVM_VAB_DUMPS: Atomic<u64> = Atomic::new(0);
+static POLARIS_UVM_VAB_TOUCHES: Atomic<u64> = Atomic::new(0);
 // Ablation toggle for the in-kernel "already mapped to this gpu_va_space" short
 // circuit. 1 = enabled (default), 0 = bypass and always go through
 // polaris_map_fault_mapping(). Writable via /sys/kernel/polaris/driver_cache.
@@ -997,6 +1003,59 @@ unsafe extern "C" fn polaris_uvm_handle_access_counter(
     }) {
         block.last_touch_ns = now;
         POLARIS_UVM_ACCESS_COUNTER_TOUCHES.fetch_add(1, Relaxed);
+    }
+}
+
+/// Vidmem Access Bit Buffer poll hook. Invoked from the driver's VAB dump
+/// workqueue with a snapshot bitmap: bit N set means physical framebuffer region
+/// `[N*region_bytes, (N+1)*region_bytes)` was accessed since the last dump. For
+/// each resident block we look up the bit covering its physical FB address and,
+/// if set, refresh `last_touch_ns` — giving LRU a real local-vidmem access
+/// signal without page faults or an explicit touch ioctl. Blocks whose region
+/// is not set retain their older timestamp and age toward eviction.
+///
+/// Runs in workqueue (sleepable) context; `bits` is valid only for this call.
+unsafe extern "C" fn polaris_uvm_handle_access_bits(
+    gpu_id: u32,
+    bits: *const u64,
+    num_words: u32,
+    region_bytes: u64,
+) {
+    POLARIS_UVM_VAB_DUMPS.fetch_add(1, Relaxed);
+    if bits.is_null() || num_words == 0 || region_bytes == 0 {
+        return;
+    }
+    let words = unsafe { core::slice::from_raw_parts(bits, num_words as usize) };
+    let total_bits = (num_words as u64).saturating_mul(64);
+
+    let mut guard = POLARIS_STATE.lock();
+    let inner = match guard.as_mut() {
+        Some(inner) => inner,
+        None => return,
+    };
+
+    let now = unsafe { bindings::ktime_get_mono_fast_ns() };
+    let mut touched: u64 = 0;
+    for block in inner.blocks.iter_mut() {
+        if block.state != PolarisBlockState::Resident
+            || block.phys_fb_addr == 0
+            || block.home_gpu != gpu_id
+        {
+            continue;
+        }
+        let region = block.phys_fb_addr / region_bytes;
+        if region >= total_bits {
+            continue;
+        }
+        let word = (region / 64) as usize;
+        let bit = region % 64;
+        if words[word] & (1u64 << bit) != 0 {
+            block.last_touch_ns = now;
+            touched += 1;
+        }
+    }
+    if touched != 0 {
+        POLARIS_UVM_VAB_TOUCHES.fetch_add(touched, Relaxed);
     }
 }
 
@@ -2208,6 +2267,7 @@ fn polaris_resolve_gpu_fault(
                             phase,
                             last_touch_ns: 0,
                             map_time_ns: 0,
+                            phys_fb_addr: 0,
                             cow_src_handle: 0,
                             cow_src_block_id: 0,
                             retry_count: 0,
@@ -2635,6 +2695,8 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_cached_map_hits = POLARIS_UVM_CACHED_MAP_HITS.load(Relaxed);
     let uvm_acct_calls = POLARIS_UVM_ACCESS_COUNTER_CALLS.load(Relaxed);
     let uvm_acct_touches = POLARIS_UVM_ACCESS_COUNTER_TOUCHES.load(Relaxed);
+    let uvm_vab_dumps = POLARIS_UVM_VAB_DUMPS.load(Relaxed);
+    let uvm_vab_touches = POLARIS_UVM_VAB_TOUCHES.load(Relaxed);
     let uvm_zero_faults = POLARIS_UVM_ZERO_FAULTS.load(Relaxed);
     let uvm_last_gpu = POLARIS_UVM_LAST_GPU_ID.load(Relaxed);
     let uvm_last_client = POLARIS_UVM_LAST_RM_CLIENT_TOKEN.load(Relaxed);
@@ -2739,6 +2801,8 @@ uvm_errors:     {uvm_errors}
 uvm_cached_map_hits:{uvm_cached_map_hits}
 uvm_acct_calls: {uvm_acct_calls}
 uvm_acct_touches:{uvm_acct_touches}
+uvm_vab_dumps:  {uvm_vab_dumps}
+uvm_vab_touches:{uvm_vab_touches}
 uvm_zero_faults:{uvm_zero_faults}
 uvm_last_gpu:   {uvm_last_gpu}
 uvm_last_client:0x{uvm_last_client:x}
@@ -2807,6 +2871,8 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_cached_map_hits = uvm_cached_map_hits,
                 uvm_acct_calls = uvm_acct_calls,
                 uvm_acct_touches = uvm_acct_touches,
+                uvm_vab_dumps = uvm_vab_dumps,
+                uvm_vab_touches = uvm_vab_touches,
                 uvm_zero_faults = uvm_zero_faults,
                 uvm_last_gpu = uvm_last_gpu,
                 uvm_last_client = uvm_last_client,
@@ -3864,6 +3930,7 @@ impl PolarisDevice {
                         },
                         last_touch_ns: 0,
                         map_time_ns: 0,
+                        phys_fb_addr: 0,
                         cow_src_handle: cow_src,
                         cow_src_block_id,
                         retry_count: 0,
@@ -3968,6 +4035,7 @@ impl PolarisDevice {
                 },
                 last_touch_ns: 0,
                 map_time_ns: 0,
+                phys_fb_addr: 0,
                 cow_src_handle: 0,
                 cow_src_block_id: 0,
                 retry_count: 0,
@@ -4319,6 +4387,9 @@ impl PolarisDevice {
                         let now = unsafe { bindings::ktime_get_mono_fast_ns() };
                         block.map_time_ns = now;
                         block.last_touch_ns = now;
+                        if arg.phys_fb_addr != 0 {
+                            block.phys_fb_addr = arg.phys_fb_addr;
+                        }
                     }
                     PolarisBlockState::OffloadPending => {
                         block.state = PolarisBlockState::CpuOffloaded;
@@ -4335,6 +4406,9 @@ impl PolarisDevice {
                         block.map_time_ns = now;
                         block.last_touch_ns = now;
                         block.cpu_buf_addr = 0;
+                        if arg.phys_fb_addr != 0 {
+                            block.phys_fb_addr = arg.phys_fb_addr;
+                        }
                     }
                     PolarisBlockState::FreePending => {
                         block.state = PolarisBlockState::Evicted;

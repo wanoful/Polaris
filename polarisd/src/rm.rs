@@ -157,6 +157,8 @@ struct NvMemoryAllocationParameters {
 pub struct RmAllocation {
     pub h_memory: u32,
     pub size: u64,
+    /// Physical framebuffer offset returned by NVOS32 alloc (params.offset).
+    pub phys_fb_addr: u64,
 }
 
 pub struct RmBackend {
@@ -308,11 +310,12 @@ impl RmBackend {
         let allocation = RmAllocation {
             h_memory,
             size: params.size,
+            phys_fb_addr: params.offset,
         };
         self.allocations.insert(block_id, allocation);
         eprintln!(
-            "polarisd: RM ALLOC block {} hClient=0x{:x} hMemory=0x{:x} size=0x{:x}",
-            block_id, self.h_client, allocation.h_memory, allocation.size
+            "polarisd: RM ALLOC block {} hClient=0x{:x} hMemory=0x{:x} size=0x{:x} phys_fb=0x{:x}",
+            block_id, self.h_client, allocation.h_memory, allocation.size, allocation.phys_fb_addr
         );
         Ok(allocation)
     }

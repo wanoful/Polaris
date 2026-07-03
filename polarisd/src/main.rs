@@ -235,6 +235,7 @@ fn decision_loop(
                         rm_h_client: exec.rm_h_client,
                         rm_h_memory: exec.rm_h_memory,
                         rm_backing_length: exec.rm_backing_length,
+                        phys_fb_addr: exec.phys_fb_addr,
                         ..Default::default()
                     };
 
