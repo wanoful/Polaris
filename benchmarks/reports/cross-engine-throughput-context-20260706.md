@@ -61,9 +61,17 @@ For vLLM/SGLang rows:
 - `output tok/s` is framework generated-token throughput.
 - `total tok/s` is input plus output token throughput.
 
-`llama_avg_ts` and framework `total tok/s` are not the same metric. For
-cross-engine discussion, `gen tok/s` vs `output tok/s` is the closest available
-decode-oriented comparison, while still not being a same-engine A/B.
+`llama_avg_ts` and framework `total tok/s` are not the same metric. Framework
+`output tok/s` is also a 16-request batch aggregate in these artifacts, while
+llama.cpp `gen tok/s` is a single llama-bench workload row. Directly comparing
+those two columns answers an aggregate-throughput question, not a per-request
+latency or per-stream decode-rate question.
+
+For readability, the cross-engine table therefore includes an approximate
+`per-request decode/output tok/s` column. For llama.cpp this is the same as
+`gen tok/s`. For vLLM/SGLang it is `output tok/s / 16`, because the recorded
+framework baselines use 16 fixed-shape prompts. This normalization is only a
+context aid; it is not a substitute for a same-engine or same-scheduler A/B.
 
 ## Controlled llama.cpp A/B
 
@@ -93,23 +101,23 @@ Interpretation:
 
 This table should be read as system-level context, not as an allocator A/B.
 
-| workload | system | benchmark path | POLARIS KV? | request shape | prompt/input tok/s | decode/output tok/s | aggregate metric | aggregate metric name |
-|---:|---|---|---|---:|---:|---:|---:|---|
-| 128/32 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 1041.51 | 815.75 | 928.63 | llama_avg_ts |
-| 128/32 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 599.83 | 724.73 | 662.28 | llama_avg_ts |
-| 128/32 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 941.25 | 177.71 | 559.48 | llama_avg_ts |
-| 128/32 | vLLM original/clean | offline batch | no | 16 | 3949.64 | 987.41 | 4937.05 | total tok/s |
-| 128/32 | SGLang original | offline batch | no | 16 | 1591.40 | 397.85 | 1989.25 | total tok/s |
-| 512/128 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 36281.44 | 930.33 | 18605.88 | llama_avg_ts |
-| 512/128 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 48155.98 | 757.68 | 24456.83 | llama_avg_ts |
-| 512/128 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 7416.72 | 184.08 | 3800.40 | llama_avg_ts |
-| 512/128 | vLLM original | offline batch | no | 16 | 8286.50 | 2071.63 | 10358.13 | total tok/s |
-| 512/128 | SGLang original | offline batch | no | 16 | 8333.23 | 2083.31 | 10416.54 | total tok/s |
-| 1024/128 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 42377.27 | 930.74 | 21654.00 | llama_avg_ts |
-| 1024/128 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 41424.41 | 756.35 | 21090.38 | llama_avg_ts |
-| 1024/128 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 2408.31 | 182.69 | 1295.50 | llama_avg_ts |
-| 1024/128 | vLLM original | offline batch | no | 16 | 15988.28 | 1998.53 | 17986.81 | total tok/s |
-| 1024/128 | SGLang original | offline batch | no | 16 | 16039.16 | 2004.89 | 18044.05 | total tok/s |
+| workload | system | benchmark path | POLARIS KV? | request shape | prompt/input tok/s | aggregate decode/output tok/s | approx per-request decode/output tok/s | aggregate metric | aggregate metric name |
+|---:|---|---|---|---:|---:|---:|---:|---:|---|
+| 128/32 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 1041.51 | 815.75 | 815.75 | 928.63 | llama_avg_ts |
+| 128/32 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 599.83 | 724.73 | 724.73 | 662.28 | llama_avg_ts |
+| 128/32 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 941.25 | 177.71 | 177.71 | 559.48 | llama_avg_ts |
+| 128/32 | vLLM original/clean | offline batch | no | 16 | 3949.64 | 987.41 | 61.71 | 4937.05 | total tok/s |
+| 128/32 | SGLang original | offline batch | no | 16 | 1591.40 | 397.85 | 24.87 | 1989.25 | total tok/s |
+| 512/128 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 36281.44 | 930.33 | 930.33 | 18605.88 | llama_avg_ts |
+| 512/128 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 48155.98 | 757.68 | 757.68 | 24456.83 | llama_avg_ts |
+| 512/128 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 7416.72 | 184.08 | 184.08 | 3800.40 | llama_avg_ts |
+| 512/128 | vLLM original | offline batch | no | 16 | 8286.50 | 2071.63 | 129.48 | 10358.13 | total tok/s |
+| 512/128 | SGLang original | offline batch | no | 16 | 8333.23 | 2083.31 | 130.21 | 10416.54 | total tok/s |
+| 1024/128 | llama.cpp native_cuda | llama-bench | no | 1 bench workload | 42377.27 | 930.74 | 930.74 | 21654.00 | llama_avg_ts |
+| 1024/128 | llama.cpp polaris_no_pressure | llama-bench | yes | 1 bench workload | 41424.41 | 756.35 | 756.35 | 21090.38 | llama_avg_ts |
+| 1024/128 | llama.cpp polaris_pressure | llama-bench | yes | 1 bench workload | 2408.31 | 182.69 | 182.69 | 1295.50 | llama_avg_ts |
+| 1024/128 | vLLM original | offline batch | no | 16 | 15988.28 | 1998.53 | 124.91 | 17986.81 | total tok/s |
+| 1024/128 | SGLang original | offline batch | no | 16 | 16039.16 | 2004.89 | 125.31 | 18044.05 | total tok/s |
 
 Interpretation:
 
@@ -119,8 +127,10 @@ Interpretation:
   not be used to isolate POLARIS KV overhead.
 - The llama.cpp POLARIS rows show that the injected KV-only path is functional
   and can be evaluated against native llama.cpp under the same engine.
-- Decode/output throughput is the most useful cross-engine column, but still
-  remains affected by different batching and runtime behavior.
+- Aggregate decode/output throughput is useful for system-throughput context,
+  but it strongly reflects batching. The normalized per-request column helps
+  avoid the false conclusion that a single llama.cpp stream is less than half
+  as fast as each vLLM/SGLang request.
 
 ## Recommended Wording
 
