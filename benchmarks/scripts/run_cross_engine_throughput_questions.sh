@@ -48,6 +48,13 @@ LLAMA_CPP_DEVICE="${LLAMA_CPP_DEVICE:-CUDA0}"
 LLAMA_BATCH_SIZE="${LLAMA_BATCH_SIZE:-2048}"
 LLAMA_UBATCH_SIZE="${LLAMA_UBATCH_SIZE:-512}"
 
+if [[ -z "${VLLM_BIN:-}" && -x "$ROOT_DIR/.venv-vllm/bin/vllm" ]]; then
+    export VLLM_BIN="$ROOT_DIR/.venv-vllm/bin/vllm"
+fi
+if [[ -z "${VLLM_PYTHON:-}" && -x "$ROOT_DIR/.venv-vllm/bin/python" ]]; then
+    export VLLM_PYTHON="$ROOT_DIR/.venv-vllm/bin/python"
+fi
+
 die() {
     echo "error: $*" >&2
     exit 1
