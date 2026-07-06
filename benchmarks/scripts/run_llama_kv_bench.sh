@@ -34,6 +34,18 @@ note() {
     echo "==> $*" >&2
 }
 
+env_enabled() {
+    local value="${1:-}"
+    case "$value" in
+        ""|0|false|FALSE|no|NO)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 first_existing_executable() {
     local path
     for path in "$@"; do
@@ -66,6 +78,46 @@ require_executable() {
     local path="$1"
     local what="$2"
     [[ -f "$path" && -x "$path" ]] || die "$what is not an executable file: $path"
+}
+
+llama_binary_has_polaris_hints() {
+    local bin="$1"
+    local dir
+    dir="$(dirname "$bin")"
+
+    if strings "$bin" 2>/dev/null | grep -q "POLARIS_LLAMA_KV_HINTS"; then
+        return 0
+    fi
+
+    local lib
+    while IFS= read -r lib; do
+        [[ -n "$lib" && -f "$lib" ]] || continue
+        if strings "$lib" 2>/dev/null | grep -q "POLARIS_LLAMA_KV_HINTS"; then
+            return 0
+        fi
+    done < <(
+        {
+            find "$dir" -maxdepth 1 -type f \( -name 'libllama*.so*' -o -name 'libggml*.so*' \) 2>/dev/null
+            ldd "$bin" 2>/dev/null | awk '
+                /=>/ && $3 ~ /^\// { print $3 }
+                $1 ~ /^\// { print $1 }
+            '
+        } | sort -u
+    )
+
+    return 1
+}
+
+validate_llama_hint_support() {
+    if ! env_enabled "${POLARIS_LLAMA_KV_HINTS:-0}"; then
+        return 0
+    fi
+
+    if llama_binary_has_polaris_hints "$LLAMA_CPP_BIN"; then
+        return 0
+    fi
+
+    die "POLARIS_LLAMA_KV_HINTS=1 but selected llama-bench lacks POLARIS hint code: $LLAMA_CPP_BIN. Rebuild llama.cpp or set LLAMA_CPP_BIN to a hint-capable binary."
 }
 
 stat_value_from_file() {
@@ -121,6 +173,7 @@ require_file "$SHIM_SO" "libpolaris-shim.so"
 require_executable "$POLARISD_BIN" "polarisd binary"
 require_executable "$POLARISCTL_BIN" "polarisctl binary"
 [[ -r "$STATS_PATH" ]] || die "$STATS_PATH is not readable"
+validate_llama_hint_support
 
 mkdir -p "$LOG_DIR"
 : >"$RUNS_JSONL"
@@ -224,6 +277,56 @@ set_eviction_policy() {
 
 stop_polarisd() {
     cleanup
+}
+
+shim_stat_from_log() {
+    local log="$1"
+    local key="$2"
+    python3 - "$log" "$key" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+log = Path(sys.argv[1])
+key = sys.argv[2]
+value = 0
+if log.exists():
+    pattern = re.compile(rf"\b{re.escape(key)}=(\d+)\b")
+    for line in log.read_text(errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            value = int(match.group(1))
+print(value)
+PY
+}
+
+verify_llama_kv_hints_if_required() {
+    local mode="$1"
+    local stderr_log="$2"
+
+    case "$mode" in
+        polaris_no_pressure|polaris_pressure|polaris_sustained_pressure)
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    if ! env_enabled "${POLARIS_LLAMA_KV_HINTS:-0}"; then
+        return 0
+    fi
+    if ! env_enabled "${POLARIS_BENCH_REQUIRE_KV_HINTS:-1}"; then
+        return 0
+    fi
+
+    local updates
+    local auto_updates
+    updates="$(shim_stat_from_log "$stderr_log" "kv_hint_update_calls")"
+    auto_updates="$(shim_stat_from_log "$stderr_log" "kv_hint_auto_update_calls")"
+    if [[ "$updates" -le "$auto_updates" ]]; then
+        tail -n 80 "$stderr_log" >&2 || true
+        die "POLARIS_LLAMA_KV_HINTS=1 but llama.cpp published no non-auto KV hint updates in $mode (kv_hint_update_calls=$updates, kv_hint_auto_update_calls=$auto_updates). Set POLARIS_BENCH_REQUIRE_KV_HINTS=0 only for diagnostic no-hint runs."
+    fi
 }
 
 build_llama_args() {
@@ -522,6 +625,10 @@ run_one() {
     cp "$STATS_PATH" "$stats_after"
     write_record "$mode" "llama_cpp_end_to_end" "$prompt_tokens" "$gen_tokens" "$repetitions" \
         "$budget_bytes" "$cpu_pool_bytes" "$stdout_json" "$stderr_log" "$polarisd_log" "$stats_before" "$stats_after" "$rc"
+
+    if [[ "$rc" -eq 0 ]]; then
+        verify_llama_kv_hints_if_required "$mode" "$stderr_log"
+    fi
 
     if [[ "$rc" -ne 0 ]]; then
         tail -n 160 "$stderr_log" >&2 || true
