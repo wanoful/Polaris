@@ -19,23 +19,11 @@ Reference hardware: RTX 5070 Ti (16 GiB), driver 610.43.02, `v4-fault-hook`.
    spill/reload (5308 offloads / 5052 reloads each). The KV-only fault-driven
    path works end-to-end.
 
-2. **~5.9× prompt-throughput gain from hot-path optimizations** (2026-06-17 →
-   2026-06-30) on Qwen14B 16k @ 2560 MiB budget. The `driver_cache` in-kernel
-   fault short-circuit + eager shim reserve cut redundant bridge maps from
-   **2.17 M → 8,148**, taking prompt throughput from ~154 to **~736 tok/s**.
-
-3. **Eviction policy is not the right optimization axis** for this workload.
-   FIFO / LRU / PhaseAware / attention-stream converge within **0.5%** once the
-   module is reloaded between trials. Migration counts (offloads, reloads,
-   bridge maps) show **zero variance** across policies; working-set Jaccard =
-   1.000. The old "FIFO 115 vs LRU 70 tok/s" gap was a **module-state
-   confounder**, now eliminated.
-
-4. **OS-level COW for beam search works and is 38% faster** than independent
+2. **OS-level COW for beam search works and is 38% faster** than independent
    re-prefill (0.18 s vs 0.29 s), sharing 256 MiB across 7 children at ~37 µs
    per branch.
 
-5. **Multi-session scheduler scales cleanly** to 32 concurrent sessions
+3. **Multi-session scheduler scales cleanly** to 32 concurrent sessions
    sub-second; evictions are exactly `20 × N`.
 
 ## Throughput at a glance (Qwen2.5-14B Q4_K_M, 16384×32)
