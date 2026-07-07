@@ -599,12 +599,22 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             }
         }
 
-        if let Some(mapping) = polaris_find_logical_fault_mapping(
+        // Resolve the logical mapping and its materializability in a single
+        // locked pass over block_mappings. Previously this took the global
+        // lock and scanned the mapping list twice per fault (find_logical +
+        // can_materialize); on long prompts, where nearly every fault overflows
+        // the 16-slot fast-block cache, that was the dominant fault-path cost.
+        let resolution = polaris_resolve_logical_fault_mapping(
             gpu_id,
             rm_client_token,
             va_space_token,
             fault_address,
-        ) {
+        );
+        let fault_is_materializable = matches!(
+            resolution,
+            PolarisLogicalFaultResolution::Materializable
+        );
+        if let PolarisLogicalFaultResolution::Resident(mapping) = resolution {
             if polaris_driver_cache_enabled()
                 && mapping.mapped_gpu_va_space_ptr == gpu_va_space_ptr
             {
@@ -652,12 +662,7 @@ unsafe extern "C" fn polaris_uvm_handle_gpu_fault(
             }
         }
 
-        if polaris_can_materialize_logical_fault_mapping(
-            gpu_id,
-            rm_client_token,
-            va_space_token,
-            fault_address,
-        ) {
+        if fault_is_materializable {
             match polaris_resolve_gpu_fault(
                 gpu_id,
                 rm_client_token,
@@ -1313,47 +1318,89 @@ fn polaris_find_logical_fault_mapping(
     None
 }
 
-fn polaris_can_materialize_logical_fault_mapping(
+/// Outcome of a single locked pass that resolves a keyed logical fault.
+///
+/// Combines what used to be two separate locked scans of `block_mappings`
+/// (`polaris_find_logical_fault_mapping` + `polaris_can_materialize_logical_fault_mapping`)
+/// into one. A `Resident` result carries the mapping ready to bridge-map; a
+/// `Materializable` result means a matching mapping exists but its block is
+/// pending/offloaded and must be resolved via the daemon first.
+enum PolarisLogicalFaultResolution {
+    Resident(PolarisFaultMapping),
+    Materializable,
+    NotFound,
+}
+
+fn polaris_resolve_logical_fault_mapping(
     gpu_id: u32,
     rm_client_token: u64,
     va_space_token: u64,
     fault_address: u64,
-) -> bool {
+) -> PolarisLogicalFaultResolution {
     let guard = POLARIS_STATE.lock();
     let Some(inner) = guard.as_ref() else {
-        return false;
+        return PolarisLogicalFaultResolution::NotFound;
     };
+    let daemon_attached = inner.daemon_attached != 0;
 
-    if inner.daemon_attached == 0 {
-        return false;
-    }
-
-    inner.block_mappings.iter().any(|mapping| {
+    for mapping in &inner.block_mappings {
         if mapping.gpu_id != gpu_id
             || mapping.rm_client_token != rm_client_token
             || mapping.va_space_token != va_space_token
             || fault_address < mapping.base
             || fault_address >= mapping.base.saturating_add(mapping.length)
         {
-            return false;
+            continue;
         }
 
-        inner.blocks.iter().any(|block| {
-            block.block_id == mapping.block_id
-                && matches!(
-                    block.state,
-                    PolarisBlockState::Unmapped
-                        | PolarisBlockState::CpuOffloaded
-                        | PolarisBlockState::AllocPending
-                        | PolarisBlockState::OffloadPending
-                        | PolarisBlockState::ReloadPending
-                        | PolarisBlockState::CowPending
-                        | PolarisBlockState::FreePending
-                        | PolarisBlockState::Evicted
-                )
-        })
-    })
+        let Some(block) = inner.blocks.iter().find(|b| b.block_id == mapping.block_id) else {
+            continue;
+        };
+
+        // Resident + fully backed: ready to bridge-map immediately. This is
+        // the same acceptance test the old find_logical helper applied.
+        if block.home_gpu == gpu_id
+            && block.state == PolarisBlockState::Resident
+            && block.rm_h_memory != 0
+            && block.rm_h_client != 0
+            && block.rm_backing_length >= mapping.length
+        {
+            return PolarisLogicalFaultResolution::Resident(PolarisFaultMapping {
+                rm_client_token: mapping.rm_client_token,
+                va_space_token: mapping.va_space_token,
+                base: mapping.base,
+                length: mapping.length,
+                offset: block.rm_backing_offset,
+                rm_control_fd: block.rm_control_fd,
+                h_client: block.rm_h_client,
+                h_memory: block.rm_h_memory,
+                mapped_gpu_va_space_ptr: mapping.last_gpu_va_space_ptr,
+            });
+        }
+
+        // Not resident, but the daemon can materialize it (same state set the
+        // old can_materialize helper accepted). Only meaningful with a daemon.
+        if daemon_attached
+            && block.home_gpu == gpu_id
+            && matches!(
+                block.state,
+                PolarisBlockState::Unmapped
+                    | PolarisBlockState::CpuOffloaded
+                    | PolarisBlockState::AllocPending
+                    | PolarisBlockState::OffloadPending
+                    | PolarisBlockState::ReloadPending
+                    | PolarisBlockState::CowPending
+                    | PolarisBlockState::FreePending
+                    | PolarisBlockState::Evicted
+            )
+        {
+            return PolarisLogicalFaultResolution::Materializable;
+        }
+    }
+
+    PolarisLogicalFaultResolution::NotFound
 }
+
 
 fn polaris_find_single_observed_fault_mapping(
     gpu_id: u32,
