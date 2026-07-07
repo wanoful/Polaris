@@ -1,3 +1,4 @@
+mod async_offload;
 mod cuda_vmm;
 mod decision;
 mod gpu;
@@ -12,7 +13,6 @@ use libpolaris::ioctl;
 use libpolaris::types::*;
 use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("polarisd: starting POLARIS daemon");
@@ -205,7 +205,41 @@ fn decision_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut decision_arg = PolarisGetDecisionArg::default();
 
+    // Async offload pool: gated behind POLARISD_ASYNC_OFFLOAD. When disabled the
+    // pool is None and every decision runs on the original synchronous path,
+    // leaving default behavior byte-for-byte unchanged. When enabled, eligible
+    // RM offloads have only their rm_copy ioctl run on worker threads; all
+    // GpuState/CpuPool/RmBackend mutation still happens here in the main thread.
+    let mut async_pool = if env_enabled("POLARISD_ASYNC_OFFLOAD") {
+        let workers: usize = std::env::var("POLARISD_ASYNC_OFFLOAD_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4);
+        eprintln!("polarisd: async offload enabled ({workers} workers)");
+        Some(async_offload::AsyncOffloadPool::new(fd, workers))
+    } else {
+        None
+    };
+
     loop {
+        // Finalize any offload copies workers have completed since last iteration
+        // before doing anything else, so the CPU pool / RM backing are reclaimed
+        // promptly for subsequent reloads.
+        if let (Some(pool), Some(backend)) = (async_pool.as_mut(), rm_backend.as_deref_mut()) {
+            for done in pool.drain_completed() {
+                let exec = offload::finalize_rm_offload(
+                    &done.job,
+                    gpu,
+                    cpu_pool,
+                    backend,
+                    done.copy_result,
+                    done.bytes_copied,
+                );
+                complete_operation(fd, done.job.decision_id, done.job.generation, &exec);
+            }
+        }
+
         match ioctl::ioctl_read(fd, ioctl::POLARIS_GET_DECISION, &mut decision_arg) {
             Ok(()) => {
                 let count = decision_arg.count as usize;
@@ -215,52 +249,45 @@ fn decision_loop(
 
                 eprintln!("polarisd: received {count} decision(s)");
                 for i in 0..count {
-                    let dec = &decision_arg.decisions[i];
+                    let dec = decision_arg.decisions[i];
+
+                    // Try to route an eligible RM offload to the async pool. On
+                    // any ineligibility (not RM-backed, pool full, pool disabled)
+                    // fall through to the synchronous executor below.
+                    if dec.op == PolarisDecisionOp::Offload as u32 && test_err == 0 {
+                        if let (Some(pool), Some(backend)) =
+                            (async_pool.as_mut(), rm_backend.as_deref_mut())
+                        {
+                            // Apply back-pressure: if the pool is saturated, wait
+                            // for and finalize at least one completion first.
+                            if pool.is_full() {
+                                for d in pool.wait_for_completion() {
+                                    let exec = offload::finalize_rm_offload(
+                                        &d.job, gpu, cpu_pool, backend, d.copy_result, d.bytes_copied,
+                                    );
+                                    complete_operation(fd, d.job.decision_id, d.job.generation, &exec);
+                                }
+                            }
+                            match offload::prepare_rm_offload(&dec, gpu, cpu_pool, backend) {
+                                Ok(job) => {
+                                    pool.submit(job);
+                                    // COMPLETE_OPERATION is emitted at finalize.
+                                    continue;
+                                }
+                                Err(_) => { /* fall back to synchronous path */ }
+                            }
+                        }
+                    }
+
                     let exec = decision::execute(
                         fd,
-                        dec,
+                        &dec,
                         gpu,
                         cpu_pool,
                         rm_backend.as_deref_mut(),
                         test_err,
                     );
-
-                    let complete = PolarisCompleteOperationArg {
-                        decision_id: dec.decision_id,
-                        generation: dec.generation,
-                        result: exec.result,
-                        rm_control_fd: exec.rm_control_fd,
-                        output_handle: exec.output_handle,
-                        output_cpu_addr: exec.output_cpu_addr,
-                        rm_h_client: exec.rm_h_client,
-                        rm_h_memory: exec.rm_h_memory,
-                        rm_backing_length: exec.rm_backing_length,
-                        phys_fb_addr: exec.phys_fb_addr,
-                        ..Default::default()
-                    };
-
-                    let complete_started = Instant::now();
-                    if let Err(e) =
-                        ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete)
-                    {
-                        decision::profile_elapsed(
-                            dec,
-                            "complete_operation_ioctl",
-                            complete_started,
-                            Some(-e),
-                        );
-                        eprintln!(
-                            "polarisd: COMPLETE_OPERATION ioctl failed for decision {}: errno {e}",
-                            dec.decision_id
-                        );
-                    } else {
-                        decision::profile_elapsed(
-                            dec,
-                            "complete_operation_ioctl",
-                            complete_started,
-                            Some(0),
-                        );
-                    }
+                    complete_operation(fd, dec.decision_id, dec.generation, &exec);
 
                     if exec.result == 0 {
                         eprintln!(
@@ -285,7 +312,52 @@ fn decision_loop(
         }
     }
 
+    // Drain and finalize any in-flight offloads before returning so shared state
+    // is consistent and nothing leaks.
+    if let (Some(pool), Some(backend)) = (async_pool.take(), rm_backend.as_deref_mut()) {
+        for done in pool.shutdown() {
+            let exec = offload::finalize_rm_offload(
+                &done.job,
+                gpu,
+                cpu_pool,
+                backend,
+                done.copy_result,
+                done.bytes_copied,
+            );
+            complete_operation(fd, done.job.decision_id, done.job.generation, &exec);
+        }
+    }
+
     Ok(())
+}
+
+/// Emit COMPLETE_OPERATION for a finished decision (sync result or async offload
+/// finalize). Kept as one helper so both paths report identically to the kernel.
+fn complete_operation(
+    fd: c_int,
+    decision_id: u64,
+    generation: u64,
+    exec: &decision::ExecutionResult,
+) {
+    let complete = PolarisCompleteOperationArg {
+        decision_id,
+        generation,
+        result: exec.result,
+        rm_control_fd: exec.rm_control_fd,
+        output_handle: exec.output_handle,
+        output_cpu_addr: exec.output_cpu_addr,
+        rm_h_client: exec.rm_h_client,
+        rm_h_memory: exec.rm_h_memory,
+        rm_backing_length: exec.rm_backing_length,
+        phys_fb_addr: exec.phys_fb_addr,
+        ..Default::default()
+    };
+
+    if let Err(e) = ioctl::ioctl_write(fd, ioctl::POLARIS_COMPLETE_OPERATION, &complete) {
+        eprintln!(
+            "polarisd: COMPLETE_OPERATION ioctl failed for decision {decision_id}: errno {e}"
+        );
+    }
 }
 
 fn env_enabled(name: &str) -> bool {

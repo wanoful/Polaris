@@ -389,6 +389,131 @@ pub fn execute_reload(
     (0, new_phys, 0)
 }
 
+/// Snapshot passed from the main thread to an async-offload worker. Carries
+/// only Copy/Send scalars — no shared daemon state — so the worker can run the
+/// `rm_copy` ioctl (the ~820 µs cost) without touching GpuState/CpuPool/RmBackend.
+#[derive(Clone, Copy)]
+pub struct RmOffloadJob {
+    pub decision_id: u64,
+    pub generation: u64,
+    pub block_id: u64,
+    pub size: u64,
+    pub cpu_addr: u64,
+}
+
+/// Pre-copy bookkeeping for an async RM offload, run in the main thread before
+/// the copy is handed to a worker. Allocates the CPU pool slot and snapshots
+/// the job. Returns `Err(errno)` when the block is not RM-backed (caller should
+/// fall back to the synchronous path) or the pool is exhausted.
+pub fn prepare_rm_offload(
+    dec: &PolarisDecision,
+    gpu: &mut gpu::GpuState,
+    cpu_pool: &mut CpuPool,
+    backend: &rm::RmBackend,
+) -> Result<RmOffloadJob, i32> {
+    let size = snap_up(dec.size_bytes, gpu.granule)
+        .max(gpu.get_va_alloc(dec.block_id).map(|v| v.size).unwrap_or(0));
+    if size == 0 {
+        return Err(libc::EINVAL as i32);
+    }
+    // Only daemon-RM-backed blocks use the async copy path; anything else
+    // (legacy handle path) stays on the synchronous executor.
+    if !backend.has_block(dec.block_id) {
+        return Err(libc::ENOENT as i32);
+    }
+    let cpu_addr = cpu_pool.allocate(size).ok_or(libc::ENOMEM as i32)?;
+    Ok(RmOffloadJob {
+        decision_id: dec.decision_id,
+        generation: dec.generation,
+        block_id: dec.block_id,
+        size,
+        cpu_addr,
+    })
+}
+
+/// The worker half of an async RM offload: runs only the `rm_copy` TO_CPU ioctl
+/// on `fd`. Touches no shared daemon state. Returns `(result, bytes_copied)`.
+pub fn copy_rm_offload(fd: i32, job: &RmOffloadJob) -> (i32, u64) {
+    let mut copy = PolarisRmCopyArg {
+        block_id: job.block_id,
+        offset: 0,
+        length: job.size,
+        user_cpu_addr: job.cpu_addr,
+        direction: POLARIS_RM_COPY_TO_CPU,
+        ..Default::default()
+    };
+    match ioctl::rm_copy(fd, &mut copy) {
+        Ok(()) => (0, copy.bytes_copied),
+        Err(errno) => (-errno, 0),
+    }
+}
+
+/// Finalize an async RM offload in the main thread once its worker copy has
+/// completed. Mirrors the post-copy half of `execute_rm_offload`: releases the
+/// daemon RM backing, records the CPU buffer, and updates GPU residency. On any
+/// copy failure the pre-allocated pool slot is released and the error returned.
+pub fn finalize_rm_offload(
+    job: &RmOffloadJob,
+    gpu: &mut gpu::GpuState,
+    cpu_pool: &mut CpuPool,
+    backend: &mut rm::RmBackend,
+    copy_result: i32,
+    bytes_copied: u64,
+) -> ExecutionResult {
+    if copy_result != 0 {
+        eprintln!(
+            "polarisd: ASYNC OFFLOAD copy block {} failed: result={copy_result}",
+            job.block_id
+        );
+        cpu_pool.free(job.cpu_addr, job.size);
+        return ExecutionResult {
+            result: copy_result,
+            ..Default::default()
+        };
+    }
+    if bytes_copied != job.size {
+        eprintln!(
+            "polarisd: ASYNC OFFLOAD short copy block {} bytes=0x{:x} expected=0x{:x}",
+            job.block_id, bytes_copied, job.size
+        );
+        cpu_pool.free(job.cpu_addr, job.size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    if let Err(e) = backend.free_block(job.block_id) {
+        eprintln!(
+            "polarisd: ASYNC OFFLOAD free RM backing failed for block {}: {e}",
+            job.block_id
+        );
+        cpu_pool.free(job.cpu_addr, job.size);
+        return ExecutionResult {
+            result: -(libc::EIO as i32),
+            ..Default::default()
+        };
+    }
+
+    cpu_pool.track(job.block_id, job.cpu_addr);
+    gpu.used_bytes = gpu.used_bytes.saturating_sub(job.size);
+    gpu.clear_handle(job.block_id);
+    if let Some(va) = gpu.get_va_alloc(job.block_id) {
+        gpu.track_va(job.block_id, va.vaddr, va.size, false);
+    }
+
+    eprintln!(
+        "polarisd: ASYNC OFFLOAD block {} complete: bytes=0x{:x} cpu_buf={:#x}",
+        job.block_id, bytes_copied, job.cpu_addr
+    );
+
+    ExecutionResult {
+        result: 0,
+        output_cpu_addr: job.cpu_addr,
+        ..Default::default()
+    }
+}
+
 /// Execute RM-backed OFFLOAD:
 ///   1. Allocate a CPU pool buffer
 ///   2. Copy RM backing -> CPU buffer through the kernel/UVM CE helper
