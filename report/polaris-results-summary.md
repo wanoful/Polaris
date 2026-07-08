@@ -50,9 +50,10 @@ Reference hardware: RTX 5070 Ti (16 GiB), driver 610.43.02, `v4-fault-hook`.
 - **The pressure penalty is a latency-hiding problem, not a copy-cost one.**
   Reload traffic is ~40 GB over a ~22 s prefill = ~1.8 GB/s vs ~25 GB/s of PCIe;
   transfers hide behind compute once reloads are made proactive (prefetch)
-  instead of fault-blocked. Both optimizations are **opt-in and off by default**
-  (`POLARISD_ASYNC_OFFLOAD=1`, `/sys/kernel/polaris/prefetch`); prefetch is a
-  clean no-op when the working set fits (verified no-pressure and 3072 MiB).
+  instead of fault-blocked. Both optimizations are now **on by default**
+  (disable with `POLARISD_ASYNC_OFFLOAD=0` / writing `0` to
+  `/sys/kernel/polaris/prefetch`); prefetch is a clean no-op when the working
+  set fits (verified no-pressure and 3072 MiB).
 - **Decode throughput is free only while the active KV fits the budget**
   (~75 vs 76 native at low pressure), unchanged by these prefill optimizations.
   Once decode itself must page, it falls to ~21–30% of native (see the pressure

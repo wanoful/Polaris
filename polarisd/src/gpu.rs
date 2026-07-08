@@ -37,7 +37,6 @@ pub struct GpuState {
     pub context: CudaContext,
     pub vas: GpuVaPool,
     pub granule: u64,
-    pub phys_handles: HashMap<u64, u64>,
     pub va_allocs: HashMap<u64, VaAlloc>,
 }
 
@@ -207,13 +206,8 @@ impl GpuState {
             context,
             vas: GpuVaPool::new(vas_base, vas_size),
             granule,
-            phys_handles: HashMap::new(),
             va_allocs: HashMap::new(),
         }
-    }
-
-    pub fn track_handle(&mut self, block_id: u64, phys_handle: u64) {
-        self.phys_handles.insert(block_id, phys_handle);
     }
 
     pub fn track_va(&mut self, block_id: u64, vaddr: u64, size: u64, from_pool: bool) {
@@ -223,49 +217,18 @@ impl GpuState {
         }
     }
 
-    pub fn get_handle(&self, block_id: u64) -> Option<u64> {
-        self.phys_handles.get(&block_id).copied()
-    }
-
     pub fn get_va_alloc(&self, block_id: u64) -> Option<&VaAlloc> {
         self.va_allocs.get(&block_id)
-    }
-
-    /// Find a block_id by its GPU VA.
-    pub fn find_block_by_vaddr(&self, vaddr: u64) -> Option<u64> {
-        self.va_allocs
-            .iter()
-            .find(|(_, va)| va.vaddr == vaddr)
-            .map(|(&bid, _)| bid)
-    }
-
-    /// Find a block_id by its physical handle (reverse lookup).
-    /// This is only a compatibility fallback when the kernel cannot provide
-    /// the source GPU VA directly.
-    pub fn find_block_by_phys(&self, phys_handle: u64) -> Option<u64> {
-        self.phys_handles
-            .iter()
-            .find(|(_, &ph)| ph == phys_handle)
-            .map(|(&bid, _)| bid)
-    }
-
-    pub fn contains_va(&self, vaddr: u64, size: u64) -> bool {
-        size > 0 && vaddr >= self.vas.base && vaddr.saturating_add(size) <= self.vas.base + self.vas.size
     }
 
     /// Remove block tracking and return its VA to the pool if it was
     /// pool-allocated.  Kernel-assigned VAs (from fault path) are NOT
     /// returned to the pool — the kernel owns VA assignment for those.
     pub fn remove_block(&mut self, block_id: u64) {
-        self.phys_handles.remove(&block_id);
         if let Some(va) = self.va_allocs.remove(&block_id) {
             if va.from_pool {
                 self.vas.free(va.vaddr, va.size);
             }
         }
-    }
-
-    pub fn clear_handle(&mut self, block_id: u64) {
-        self.phys_handles.remove(&block_id);
     }
 }

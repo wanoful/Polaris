@@ -43,9 +43,26 @@ Polaris pointers remain guarded.
   block-to-worker mappings, bridge-map telemetry, spill/reload decisions, and
   cleanup rules.
 - **polarisd**: executes daemon-owned RM allocation/free plus RM-backed
-  offload/reload/COW copies through `POLARIS_RM_COPY`.
+  offload/reload/COW copies through `POLARIS_RM_COPY`. Daemon-owned RM backing
+  is the only residency executor: the legacy CUDA-VMM (`cuMemCreate`/`cuMemMap`)
+  offload/reload path and the standalone `polaris-runtime` crate have been
+  removed.
 - **libpolaris-shim.so**: bootstraps the fault-capable RM/UVM VA-space and
   selects llama.cpp KV-cache allocations without source changes.
+
+## Performance defaults
+
+The high-throughput paths are on by default (they were previously opt-in):
+
+- **Daemon RM backing** — always enabled; there is no CUDA-VMM fallback.
+- **Async offload pool** — on by default; set `POLARISD_ASYNC_OFFLOAD=0` to
+  force synchronous offloads. (~+15.6% under pressure.)
+- **Speculative sequential reload prefetch** — kernel default on; write `0` to
+  `/sys/kernel/polaris/prefetch` to disable. (~+20% prompt throughput under
+  pressure, no-op when the KV set fits in budget.)
+
+`POLARISD_RM_BACKING=1` still appears in test/benchmark launchers; it is now a
+no-op since RM backing is unconditional.
 - **tests/m2/**: root/GPU bring-up and hardening gates for the UVM bridge,
   daemon-backed RM spill/reload, COW, OOM pressure, and module unload stress.
 - **integrations/llama.cpp/**: current llama.cpp operating contract and

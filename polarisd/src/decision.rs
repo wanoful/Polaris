@@ -192,11 +192,11 @@ fn dispatch(
     mut rm_backend: Option<&mut rm::RmBackend>,
 ) -> ExecutionResult {
     let mut result: i32 = 0;
-    let mut output_handle: u64 = 0;
+    let output_handle: u64 = 0;
     let output_cpu_addr: u64 = dec.cpu_addr;
 
     match dec.op {
-        // ─── ALLOC: CUDA VMM by default, RM backing when explicitly enabled ──
+        // ─── ALLOC: daemon-owned RM backing ────────────────────────────────
         x if x == PolarisDecisionOp::Alloc as u32 => {
             let size = snap_up(dec.size_bytes, gpu.granule);
             let dst = match preferred_dst_vaddr(dec, gpu, size) {
@@ -214,62 +214,27 @@ fn dispatch(
             };
             let vaddr = dst.vaddr;
 
-            if let Some(backend) = rm_backend.as_mut() {
-                let alloc_started = Instant::now();
-                let allocation = match backend.alloc_for_block(dec.block_id, size) {
-                    Ok(allocation) => allocation,
-                    Err(e) => {
-                        profile_elapsed(
-                            dec,
-                            "rm_alloc_backing",
-                            alloc_started,
-                            Some(-(libc::ENOMEM as i32)),
-                        );
-                        eprintln!("polarisd: RM ALLOC failed for block {}: {e}", dec.block_id);
-                        if dst.release_to_pool {
-                            gpu.vas.free(vaddr, size);
-                        }
-                        return ExecutionResult {
-                            result: -(libc::ENOMEM as i32),
-                            ..Default::default()
-                        };
+            let backend = match rm_backend.as_mut() {
+                Some(backend) => backend,
+                None => {
+                    if dst.release_to_pool {
+                        gpu.vas.free(vaddr, size);
                     }
-                };
-                profile_elapsed(dec, "rm_alloc_backing", alloc_started, Some(0));
+                    return rm_backing_required(dec);
+                }
+            };
 
-                gpu.track_va(dec.block_id, vaddr, size, dst.release_to_pool);
-                gpu.used_bytes += size;
-                eprintln!(
-                    "polarisd: ALLOC block {} -> RM hClient=0x{:x} hMemory=0x{:x} va={vaddr:#x} size={size}",
-                    dec.block_id,
-                    backend.h_client,
-                    allocation.h_memory
-                );
-                return ExecutionResult {
-                    result: 0,
-                    rm_control_fd: backend.rm_control_fd(),
-                    rm_h_client: backend.h_client,
-                    rm_h_memory: allocation.h_memory,
-                    rm_backing_length: allocation.size,
-                    phys_fb_addr: allocation.phys_fb_addr,
-                    ..Default::default()
-                };
-            }
-
-            let create_started = Instant::now();
-            let phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
-                Ok(h) => h,
+            let alloc_started = Instant::now();
+            let allocation = match backend.alloc_for_block(dec.block_id, size) {
+                Ok(allocation) => allocation,
                 Err(e) => {
                     profile_elapsed(
                         dec,
-                        "alloc_create_physical",
-                        create_started,
+                        "rm_alloc_backing",
+                        alloc_started,
                         Some(-(libc::ENOMEM as i32)),
                     );
-                    eprintln!(
-                        "polarisd: cuMemCreate failed for block {}: {e}",
-                        dec.block_id
-                    );
+                    eprintln!("polarisd: RM ALLOC failed for block {}: {e}", dec.block_id);
                     if dst.release_to_pool {
                         gpu.vas.free(vaddr, size);
                     }
@@ -279,128 +244,44 @@ fn dispatch(
                     };
                 }
             };
-            profile_elapsed(dec, "alloc_create_physical", create_started, Some(0));
+            profile_elapsed(dec, "rm_alloc_backing", alloc_started, Some(0));
 
-            let map_started = Instant::now();
-            if let Err(e) = cuda_vmm::map_memory(vaddr, phys, size) {
-                profile_elapsed(
-                    dec,
-                    "alloc_map_memory",
-                    map_started,
-                    Some(-(libc::EINVAL as i32)),
-                );
-                eprintln!("polarisd: cuMemMap failed for block {}: {e}", dec.block_id);
-                if let Err(re) = cuda_vmm::release_physical(phys) {
-                    eprintln!(
-                        "polarisd: cuMemRelease cleanup failed for block {}: {re}",
-                        dec.block_id
-                    );
-                }
-                if dst.release_to_pool {
-                    gpu.vas.free(vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EINVAL as i32),
-                    ..Default::default()
-                };
-            }
-            profile_elapsed(dec, "alloc_map_memory", map_started, Some(0));
-
-            let access_started = Instant::now();
-            if let Err(e) = cuda_vmm::set_access(vaddr, size, gpu.device_ordinal) {
-                profile_elapsed(
-                    dec,
-                    "alloc_set_access",
-                    access_started,
-                    Some(-(libc::EINVAL as i32)),
-                );
-                eprintln!(
-                    "polarisd: cuMemSetAccess failed for block {}: {e}",
-                    dec.block_id
-                );
-                let _ = cuda_vmm::unmap_memory(vaddr, size);
-                if let Err(re) = cuda_vmm::release_physical(phys) {
-                    eprintln!(
-                        "polarisd: cuMemRelease cleanup failed for block {}: {re}",
-                        dec.block_id
-                    );
-                }
-                if dst.release_to_pool {
-                    gpu.vas.free(vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EINVAL as i32),
-                    ..Default::default()
-                };
-            }
-            profile_elapsed(dec, "alloc_set_access", access_started, Some(0));
-
-            gpu.track_handle(dec.block_id, phys);
             gpu.track_va(dec.block_id, vaddr, size, dst.release_to_pool);
             gpu.used_bytes += size;
-            output_handle = phys;
-
             eprintln!(
-                "polarisd: ALLOC block {} -> phys={phys:#x} va={vaddr:#x} size={size}",
-                dec.block_id
+                "polarisd: ALLOC block {} -> RM hClient=0x{:x} hMemory=0x{:x} va={vaddr:#x} size={size}",
+                dec.block_id,
+                backend.h_client,
+                allocation.h_memory
             );
+            return ExecutionResult {
+                result: 0,
+                rm_control_fd: backend.rm_control_fd(),
+                rm_h_client: backend.h_client,
+                rm_h_memory: allocation.h_memory,
+                rm_backing_length: allocation.size,
+                phys_fb_addr: allocation.phys_fb_addr,
+                ..Default::default()
+            };
         }
 
-        // ─── FREE: release CUDA VMM or daemon-owned RM backing + CPU pool ──
+        // ─── FREE: release daemon-owned RM backing + CPU pool slot ─────────
         x if x == PolarisDecisionOp::Free as u32 => {
-            let phys = if dec.src_handle != 0 {
-                dec.src_handle
-            } else {
-                gpu.get_handle(dec.block_id).unwrap_or(0)
+            let backend = match rm_backend.as_mut() {
+                Some(backend) => backend,
+                None => return rm_backing_required(dec),
             };
-            let vaddr = match dec.src_vaddr {
-                0 => gpu.get_va_alloc(dec.block_id).map(|v| v.vaddr).unwrap_or(0),
-                v => v,
-            };
-
-            if let Some(backend) = rm_backend.as_mut() {
-                if let Err(e) = backend.free_block(dec.block_id) {
-                    eprintln!("polarisd: RM FREE failed for block {}: {e}", dec.block_id);
-                    result = -(libc::EIO as i32);
-                }
+            if let Err(e) = backend.free_block(dec.block_id) {
+                eprintln!("polarisd: RM FREE failed for block {}: {e}", dec.block_id);
+                result = -(libc::EIO as i32);
             }
 
-            if phys == 0 && rm_backend.is_some() {
-                if let Some(va) = gpu.get_va_alloc(dec.block_id) {
-                    let size = va.size;
-                    let vaddr = va.vaddr;
-                    gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
-                    eprintln!(
-                        "polarisd: FREE block {} -> RM backing va={:#x}",
-                        dec.block_id, vaddr
-                    );
-                }
-            } else if let Some(va) = gpu.get_va_alloc(dec.block_id) {
-                let size = va.size;
-                let _ = cuda_vmm::unmap_memory(vaddr, size);
-                if phys != 0 {
-                    if let Err(e) = cuda_vmm::release_physical(phys) {
-                        eprintln!(
-                            "polarisd: FREE cuMemRelease failed for block {}: {e}",
-                            dec.block_id
-                        );
-                    }
-                }
+            if let Some(va) = gpu.get_va_alloc(dec.block_id) {
+                let (size, vaddr) = (va.size, va.vaddr);
                 gpu.used_bytes = gpu.used_bytes.saturating_sub(size);
                 eprintln!(
-                    "polarisd: FREE block {} -> phys={phys:#x} va={vaddr:#x}",
-                    dec.block_id
-                );
-            } else if phys != 0 {
-                if let Err(e) = cuda_vmm::release_physical(phys) {
-                    eprintln!(
-                        "polarisd: FREE cuMemRelease failed for block {}: {e}",
-                        dec.block_id
-                    );
-                }
-                eprintln!(
-                    "polarisd: FREE block {} -> phys={phys:#x} (no VA track)",
-                    dec.block_id
+                    "polarisd: FREE block {} -> RM backing va={:#x}",
+                    dec.block_id, vaddr
                 );
             }
 
@@ -417,235 +298,48 @@ fn dispatch(
             gpu.remove_block(dec.block_id);
         }
 
-        // ─── MAP_EXISTING: cuMemMap + cuMemSetAccess (COW sharing) ───
-        x if x == PolarisDecisionOp::MapExisting as u32 => {
-            let size = snap_up(dec.size_bytes, gpu.granule);
-            if dec.src_handle == 0 || dec.dst_vaddr == 0 {
-                result = -(libc::EINVAL as i32);
-            } else if let Err(e) = cuda_vmm::map_memory(dec.dst_vaddr, dec.src_handle, size) {
-                eprintln!("polarisd: MAP failed: {e}");
-                result = -(libc::EINVAL as i32);
-            } else if let Err(e) = cuda_vmm::set_access(dec.dst_vaddr, size, gpu.device_ordinal) {
-                eprintln!("polarisd: MAP set_access failed: {e}");
-                let _ = cuda_vmm::unmap_memory(dec.dst_vaddr, size);
-                result = -(libc::EINVAL as i32);
-            } else {
-                gpu.track_va(dec.block_id, dec.dst_vaddr, size, false);
-                eprintln!(
-                    "polarisd: MAP_EXISTING block {} -> phys={:#x} va={:#x}",
-                    dec.block_id, dec.src_handle, dec.dst_vaddr
-                );
-            }
-        }
-
-        // ─── UNMAP: cuMemUnmap ─────────────────────────────────────
-        x if x == PolarisDecisionOp::Unmap as u32 => {
-            let vaddr = if dec.dst_vaddr != 0 {
-                dec.dst_vaddr
-            } else {
-                gpu.get_va_alloc(dec.block_id).map(|v| v.vaddr).unwrap_or(0)
-            };
-            let size = dec
-                .size_bytes
-                .max(gpu.get_va_alloc(dec.block_id).map(|v| v.size).unwrap_or(0));
-            if vaddr != 0 {
-                if let Err(e) = cuda_vmm::unmap_memory(vaddr, size) {
-                    eprintln!("polarisd: UNMAP failed: {e}");
-                    result = -(libc::EINVAL as i32);
-                } else {
-                    eprintln!("polarisd: UNMAP block {} -> va={vaddr:#x}", dec.block_id);
-                }
-            }
-        }
-
-        // ─── OFFLOAD: copy GPU VA→CPU, unmap VA, report CPU buffer addr ──
-        x if x == PolarisDecisionOp::Offload as u32 => {
-            if let Some(backend) = rm_backend.as_mut() {
-                if backend.has_block(dec.block_id) && dec.src_handle == 0 {
-                    return crate::offload::execute_rm_offload(fd, dec, gpu, cpu_pool, backend);
-                }
-            }
-            let (res, handle, cpu_addr) = crate::offload::execute_offload(dec, gpu, cpu_pool);
-            result = res;
-            output_handle = handle;
-            return ExecutionResult {
-                result,
-                output_handle,
-                output_cpu_addr: cpu_addr,
-                ..Default::default()
-            };
-        }
-
-        // ─── RELOAD: alloc + map + copy CPU→GPU VA, report new phys handle ──
-        x if x == PolarisDecisionOp::Reload as u32 => {
-            if let Some(backend) = rm_backend.as_mut() {
-                if dec.src_handle == 0 {
-                    return crate::offload::execute_rm_reload(fd, dec, gpu, cpu_pool, backend);
-                }
-            }
-            let (res, handle, cpu_addr) = crate::offload::execute_reload(dec, gpu, cpu_pool);
-            result = res;
-            output_handle = handle;
-            return ExecutionResult {
-                result,
-                output_handle,
-                output_cpu_addr: cpu_addr,
-                ..Default::default()
-            };
-        }
-
-        // ─── COW_BREAK: alloc new + copy old VA→new VA (GPU DtoD) ───
-        x if x == PolarisDecisionOp::CowBreak as u32 => {
-            let size = snap_up(dec.size_bytes, gpu.granule);
-            let sz_usize = size as usize;
-
-            if let Some(backend) = rm_backend.as_mut() {
-                if dec._reserved[1] & POLARIS_DECISION_FLAG_SOURCE_BLOCK_ID_VALID != 0
-                    || backend.has_block(dec.block_id)
-                    || dec.src_handle == 0
-                {
-                    return crate::offload::execute_rm_cow_break(fd, dec, gpu, cpu_pool, backend);
-                }
-            }
-
-            let src_vaddr = match dec.src_vaddr {
-                0 => {
-                    let src_phys = dec.src_handle;
-                    let src_block_id = match gpu.find_block_by_phys(src_phys) {
-                        Some(bid) => bid,
-                        None => {
-                            eprintln!(
-                                "polarisd: COW_BREAK block {} — no source VA or source handle match for {src_phys:#x}",
-                                dec.block_id
-                            );
-                            return ExecutionResult {
-                                result: -(libc::EINVAL as i32),
-                                ..Default::default()
-                            };
-                        }
-                    };
-                    match gpu.get_va_alloc(src_block_id) {
-                        Some(va) => va.vaddr,
-                        None => {
-                            eprintln!(
-                                "polarisd: COW_BREAK block {} — source block {src_block_id} has no VA mapping",
-                                dec.block_id
-                            );
-                            return ExecutionResult {
-                                result: -(libc::EINVAL as i32),
-                                ..Default::default()
-                            };
-                        }
-                    }
-                }
-                v => v,
-            };
-
-            let dst = match preferred_dst_vaddr(dec, gpu, size) {
-                Some(dst) => dst,
-                None => {
-                    eprintln!(
-                        "polarisd: COW_BREAK block {} VA pool exhausted",
-                        dec.block_id
-                    );
-                    return ExecutionResult {
-                        result: -(libc::ENOMEM as i32),
-                        ..Default::default()
-                    };
-                }
-            };
-            let dst_vaddr = dst.vaddr;
-
-            if let Some(existing) = gpu.get_va_alloc(dec.block_id) {
-                if existing.vaddr != dst_vaddr {
-                    gpu.vas.free(existing.vaddr, existing.size);
-                }
-            }
-
-            // Create new physical memory handle.
-            let new_phys = match cuda_vmm::create_physical(size, gpu.device_ordinal) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!(
-                        "polarisd: COW_BREAK cuMemCreate failed for block {}: {e}",
-                        dec.block_id
-                    );
-                    if dst.release_to_pool {
-                        gpu.vas.free(dst_vaddr, size);
-                    }
-                    return ExecutionResult {
-                        result: -(libc::ENOMEM as i32),
-                        ..Default::default()
-                    };
-                }
-            };
-
-            // Map new physical into the destination VA.
-            if let Err(e) = cuda_vmm::map_memory(dst_vaddr, new_phys, size) {
-                eprintln!(
-                    "polarisd: COW_BREAK cuMemMap failed for block {}: {e}",
-                    dec.block_id
-                );
-                if let Err(re) = cuda_vmm::release_physical(new_phys) {
-                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
-                }
-                if dst.release_to_pool {
-                    gpu.vas.free(dst_vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EINVAL as i32),
-                    ..Default::default()
-                };
-            }
-
-            // Set access for the destination mapping.
-            if let Err(e) = cuda_vmm::set_access(dst_vaddr, size, gpu.device_ordinal) {
-                eprintln!(
-                    "polarisd: COW_BREAK cuMemSetAccess failed for block {}: {e}",
-                    dec.block_id
-                );
-                let _ = cuda_vmm::unmap_memory(dst_vaddr, size);
-                if let Err(re) = cuda_vmm::release_physical(new_phys) {
-                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
-                }
-                if dst.release_to_pool {
-                    gpu.vas.free(dst_vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EINVAL as i32),
-                    ..Default::default()
-                };
-            }
-
-            // GPU-to-GPU copy: old (source) VA → new (destination) VA.
-            if let Err(e) = cuda_vmm::copy_device_to_device(dst_vaddr, src_vaddr, sz_usize) {
-                eprintln!(
-                    "polarisd: COW_BREAK cuMemcpyDtoD failed for block {}: {e}",
-                    dec.block_id
-                );
-                let _ = cuda_vmm::unmap_memory(dst_vaddr, size);
-                if let Err(re) = cuda_vmm::release_physical(new_phys) {
-                    eprintln!("polarisd: COW_BREAK cuMemRelease cleanup failed: {re}");
-                }
-                if dst.release_to_pool {
-                    gpu.vas.free(dst_vaddr, size);
-                }
-                return ExecutionResult {
-                    result: -(libc::EFAULT as i32),
-                    ..Default::default()
-                };
-            }
-
-            // Success: track the new block.
-            gpu.track_handle(dec.block_id, new_phys);
-            gpu.track_va(dec.block_id, dst_vaddr, size, dst.release_to_pool);
-            gpu.used_bytes += size;
-            output_handle = new_phys;
-
+        // ─── MAP_EXISTING / UNMAP: legacy CUDA-VMM COW sharing, unsupported ──
+        // In the RM-backed path all PTE (un)mapping is done by the kernel
+        // through the UVM bridge, so the daemon never programs mappings itself.
+        // The kernel only emits MAP_EXISTING for blocks carrying a legacy
+        // gpu_phys_handle, which RM-backed allocation never creates, and never
+        // emits UNMAP as a decision.
+        x if x == PolarisDecisionOp::MapExisting as u32
+            || x == PolarisDecisionOp::Unmap as u32 =>
+        {
             eprintln!(
-                "polarisd: COW_BREAK block {} complete: src_va={src_vaddr:#x} → new phys={new_phys:#x} va={dst_vaddr:#x} size={size}",
+                "polarisd: {} decision for block {} unsupported in RM-backed path",
+                decision_name(dec.op),
                 dec.block_id
             );
+            result = -(libc::ENOSYS as i32);
+        }
+
+        // ─── OFFLOAD: copy RM backing → CPU pool, release RM backing ───────
+        x if x == PolarisDecisionOp::Offload as u32 => {
+            let backend = match rm_backend.as_mut() {
+                Some(backend) => backend,
+                None => return rm_backing_required(dec),
+            };
+            return crate::offload::execute_rm_offload(fd, dec, gpu, cpu_pool, backend);
+        }
+
+        // ─── RELOAD: alloc fresh RM backing, copy CPU pool → RM backing ────
+        x if x == PolarisDecisionOp::Reload as u32 => {
+            let backend = match rm_backend.as_mut() {
+                Some(backend) => backend,
+                None => return rm_backing_required(dec),
+            };
+            return crate::offload::execute_rm_reload(fd, dec, gpu, cpu_pool, backend);
+        }
+
+        // ─── COW_BREAK: stage source RM backing → fresh child RM backing ───
+        x if x == PolarisDecisionOp::CowBreak as u32 => {
+            let backend = match rm_backend.as_mut() {
+                Some(backend) => backend,
+                None => return rm_backing_required(dec),
+            };
+            return crate::offload::execute_rm_cow_break(fd, dec, gpu, cpu_pool, backend);
         }
 
         _ => {
@@ -661,6 +355,21 @@ fn dispatch(
         result,
         output_handle,
         output_cpu_addr,
+        ..Default::default()
+    }
+}
+
+/// The v4 path requires daemon-owned RM backing; every launcher sets it up at
+/// startup. This is the defensive result if a decision somehow arrives without
+/// a backend (which cannot happen once `main` has initialized one).
+fn rm_backing_required(dec: &PolarisDecision) -> ExecutionResult {
+    eprintln!(
+        "polarisd: {} decision for block {} requires daemon RM backing",
+        decision_name(dec.op),
+        dec.block_id
+    );
+    ExecutionResult {
+        result: -(libc::ENOSYS as i32),
         ..Default::default()
     }
 }

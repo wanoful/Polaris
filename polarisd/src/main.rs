@@ -163,16 +163,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("polarisd: [TEST] error injection mode enabled (POLARIS_TEST_ERROR={test_err})");
     }
 
-    let rm_backing_enabled = env_enabled("POLARISD_RM_BACKING");
-    let mut rm_backend = if rm_backing_enabled {
-        eprintln!("polarisd: daemon-owned RM backing enabled (POLARISD_RM_BACKING=1)");
-        Some(
-            rm::RmBackend::new(info.index as i32)
-                .map_err(|e| format!("RM backing initialization failed: {e}"))?,
-        )
-    } else {
-        None
-    };
+    // Daemon-owned RM backing is the only residency executor in the v4 path:
+    // per-block RM allocations paged through the kernel/UVM CE copy helper. The
+    // old CUDA-VMM fallback has been removed, so RM backing is always required.
+    eprintln!("polarisd: daemon-owned RM backing enabled");
+    let mut rm_backend = Some(
+        rm::RmBackend::new(info.index as i32)
+            .map_err(|e| format!("RM backing initialization failed: {e}"))?,
+    );
 
     // Reconcile state with the kernel module.
     lifecycle::reconcile();
@@ -205,12 +203,13 @@ fn decision_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut decision_arg = PolarisGetDecisionArg::default();
 
-    // Async offload pool: gated behind POLARISD_ASYNC_OFFLOAD. When disabled the
-    // pool is None and every decision runs on the original synchronous path,
-    // leaving default behavior byte-for-byte unchanged. When enabled, eligible
-    // RM offloads have only their rm_copy ioctl run on worker threads; all
-    // GpuState/CpuPool/RmBackend mutation still happens here in the main thread.
-    let mut async_pool = if env_enabled("POLARISD_ASYNC_OFFLOAD") {
+    // Async offload pool: on by default (+15.6% under pressure). Set
+    // POLARISD_ASYNC_OFFLOAD=0 to force the synchronous path. When disabled the
+    // pool is None and every decision runs on the synchronous path. When
+    // enabled, eligible RM offloads have only their rm_copy ioctl run on worker
+    // threads; all GpuState/CpuPool/RmBackend mutation still happens here in the
+    // main thread. Reloads and COW stay synchronous regardless (fault-critical).
+    let mut async_pool = if env_enabled_default_on("POLARISD_ASYNC_OFFLOAD") {
         let workers: usize = std::env::var("POLARISD_ASYNC_OFFLOAD_WORKERS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -219,6 +218,7 @@ fn decision_loop(
         eprintln!("polarisd: async offload enabled ({workers} workers)");
         Some(async_offload::AsyncOffloadPool::new(fd, workers))
     } else {
+        eprintln!("polarisd: async offload disabled (POLARISD_ASYNC_OFFLOAD=0)");
         None
     };
 
@@ -360,16 +360,16 @@ fn complete_operation(
     }
 }
 
-fn env_enabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
+/// Returns whether an opt-out flag leaves a feature enabled. The feature is on
+/// unless the env var is explicitly set to a falsey value (`0`/`false`/`no`).
+fn env_enabled_default_on(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
             let v = v.trim();
-            !v.is_empty()
-                && v != "0"
-                && !v.eq_ignore_ascii_case("false")
-                && !v.eq_ignore_ascii_case("no")
-        })
-        .unwrap_or(false)
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
+        }
+        Err(_) => true,
+    }
 }
 
 fn env_bytes(name: &str) -> Option<u64> {
