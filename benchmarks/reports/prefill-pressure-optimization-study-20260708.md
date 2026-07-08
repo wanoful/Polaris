@@ -22,6 +22,20 @@ bottleneck is by attacking it from four independent angles.
 | 8 MiB blocks (async) | fault/copy count | 709 | 9856 | **−17% ✗** |
 | UVM staging cache | per-copy overhead | (hangs) | — | **✗ net regression** |
 | eager reserve (async) | fault avoidance | (732 uvm_errors) | — | **✗ fails under pressure** |
+| **prefetch (async, 4 MiB)** | **fault-round-trip latency** | **1042 (n=3)** | 14526 | **+20.2% ✓ shipped** |
+
+## Full stack vs native
+
+| config | prompt tok/s | vs native (1317) | cumulative |
+|---|---:|---:|---:|
+| baseline (sync, 2 MiB) | 736 | −44% | — |
+| + async offloads | 851 | −35% | +15.6% |
+| + 4 MiB blocks | 867 | −34% | +17.8% |
+| + prefetch | **1042** | **−21%** | **+41.5%** |
+
+The pressure prefill gap went from −44% to −21% vs native — **82% of the
+no-pressure ceiling (~1268)**, which is the practical target since native
+llama.cpp cannot run this oversubscribed case at all (its KV would not fit).
 
 ## Key finding: the bottleneck is round-trip latency, not copy cost
 
@@ -47,14 +61,21 @@ prefill = ~1.8 GB/s, against ~25 GB/s of PCIe Gen4. Transfers *should* hide
 behind compute; they don't only because reloads are **reactive** (fault-blocked
 one at a time), not prefetched.
 
-## Recommendation
+## Outcome
 
-The remaining ~−35% pressure gap is a **latency-hiding** problem, not a
-bandwidth or copy-efficiency one. The highest-value next step is **speculative
-reload prefetch**: prefill reads KV blocks in near-sequential order, so the
-kernel (or shim) can reload blocks *ahead* of the fault so the GPU never stalls
-— the same principle that made async offloads work, applied to the reload side.
-This is a kernel fault-path change and is scoped as separate follow-up work.
+The diagnosis (latency-hiding, not bandwidth or copy-efficiency) was confirmed
+and then acted on: **speculative reload prefetch** exploits the ~73% sequential
+access to materialize block N+1 before the GPU faults on it, turning a blocking
+round-trip into a cheap bridge-map. Gated behind `/sys/kernel/polaris/prefetch`,
+it delivered **+20.2%** (867 → 1042 tok/s) — the single largest lever, exactly
+because it attacks the diagnosed bottleneck. Combined with async offloads it
+closes the pressure prefill gap from −44% to −21% vs native (82% of the
+no-pressure ceiling).
+
+The arithmetic that predicted this: reload traffic is ~40 GB over a ~22 s
+prefill = ~1.8 GB/s, against ~25 GB/s of PCIe Gen4 — transfers *can* hide behind
+compute; they only failed to because reloads were **reactive** (fault-blocked
+one at a time). Prefetch makes them proactive.
 
 4 MiB blocks (`POLARIS_SHIM_BLOCK_SIZE=0x400000`) are a safe, workload-specific
 +1.9% and can be set per-run; not changed as a global default because 8 MiB
