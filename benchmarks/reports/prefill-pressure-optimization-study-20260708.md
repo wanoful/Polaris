@@ -37,6 +37,31 @@ The pressure prefill gap went from −44% to −21% vs native — **82% of the
 no-pressure ceiling (~1268)**, which is the practical target since native
 llama.cpp cannot run this oversubscribed case at all (its KV would not fit).
 
+## Prefetch broader validation
+
+Prefetch validated across the pressure spectrum and workload shapes (Qwen14B,
+async offloads on, 4 MiB blocks, fresh module per run):
+
+| case | budget | pf=off | pf=on | delta | note |
+|---|---|---:|---:|---:|---|
+| no-pressure 16k/32 | 16 GiB | 1285.4 | 1282.8 | −0.2% | no-op: 0 reloads |
+| pressure 16k/32 | 3072 MiB | 1285.1 | 1282.3 | −0.2% | no-op: working set fits |
+| pressure 16k/32 | 2560 MiB | 864.5 | 1036.2 | **+19.9%** | headline case |
+| pressure 16k/512 | 2560 MiB | 861.0 | 1038.9 | **+20.7%** | decode-heavy |
+| pressure 16k/32 | 2048 MiB | — | — | — | thrash floor: neither arm completes |
+
+- **Clean no-op when the working set fits** (no-pressure and 3072 MiB): prefetch
+  correctly does nothing — 0 reloads, throughput within noise. No regression.
+- **+20% holds under long decode** (16k/512): the prefill gain is unchanged and
+  **decode throughput (gen) is identical (~75.8) with or without prefetch** — the
+  decode tail stays mostly resident, so prefetch neither helps nor harms it.
+- **2048 MiB is a pre-existing thrash floor** (>14k reloads, never completes)
+  for both arms — prefetch does not change that boundary.
+- `uvm_errors = 0` in every completing run. Note: budget-marginal setup has an
+  intermittent `BLOCK_RESERVE: Invalid argument` flake at token ≈18 (before any
+  prefetch fires — prefetch triggers only on reload *completion*); it hit both
+  arms and clean retries succeed, so it is unrelated to prefetch.
+
 ## Key finding: the bottleneck is round-trip latency, not copy cost
 
 Four experiments triangulate the same conclusion — **reload copy cost (count or
