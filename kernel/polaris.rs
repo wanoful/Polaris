@@ -178,6 +178,21 @@ static POLARIS_DRIVER_CACHE_ENABLED: Atomic<u32> = Atomic::new(1);
 fn polaris_driver_cache_enabled() -> bool {
     POLARIS_DRIVER_CACHE_ENABLED.load(Relaxed) != 0
 }
+
+// Speculative reload prefetch. When a Reload completes, if the next sequential
+// block in the same session is still CpuOffloaded, schedule its reload ahead of
+// the GPU faulting on it — turning a fault-blocked round-trip into a cheap
+// bridge-map on eventual access. 0 = disabled (default). Writable via
+// /sys/kernel/polaris/prefetch. Prefill KV access is ~73% sequential
+// (block_id +1/+2), which is what makes one-ahead prefetch effective.
+static POLARIS_PREFETCH_ENABLED: Atomic<u32> = Atomic::new(0);
+static POLARIS_PREFETCH_SCHEDULED: Atomic<u64> = Atomic::new(0);
+
+#[inline]
+fn polaris_prefetch_enabled() -> bool {
+    POLARIS_PREFETCH_ENABLED.load(Relaxed) != 0
+}
+
 static POLARIS_UVM_LAST_GPU_ID: Atomic<u32> = Atomic::new(0);
 static POLARIS_UVM_LAST_RM_CLIENT_TOKEN: Atomic<u64> = Atomic::new(0);
 static POLARIS_UVM_LAST_VA_SPACE_TOKEN: Atomic<u64> = Atomic::new(0);
@@ -1918,6 +1933,94 @@ fn polaris_publish_prepared_offload(
     }
 }
 
+/// Speculative reload prefetch: given a block that just became Resident (via a
+/// completed Reload), schedule a reload of the next sequential block in the same
+/// session if it is still CpuOffloaded. Prefill KV access is ~73% sequential by
+/// token_start, so materializing block N+1 before the GPU faults on it turns a
+/// blocking daemon round-trip into a cheap bridge-map on eventual access.
+///
+/// Best-effort and non-fatal: any obstacle (no successor, not offloaded, queue
+/// full, no CPU buffer) simply skips prefetch. Called with the state lock held.
+/// One block ahead only — deeper prefetch risks evicting the very block we just
+/// reloaded under a tight budget.
+fn polaris_schedule_prefetch_after_reload(inner: &mut PolarisInner, completed_block_id: u64) {
+    // Identify the completed block's session and sequential position.
+    let (session_id, token_start, home_gpu) = match inner
+        .blocks
+        .iter()
+        .find(|b| b.block_id == completed_block_id)
+    {
+        Some(b) => (b.session_id, b.token_start, b.home_gpu),
+        None => return,
+    };
+
+    // Find the next offloaded block in this session: smallest token_start that is
+    // strictly greater than the completed block's, in CpuOffloaded state.
+    let mut best_idx: Option<usize> = None;
+    let mut best_token = u32::MAX;
+    for (idx, b) in inner.blocks.iter().enumerate() {
+        if b.session_id == session_id
+            && b.state == PolarisBlockState::CpuOffloaded
+            && b.token_start > token_start
+            && b.token_start < best_token
+            && b.cpu_buf_addr != 0
+        {
+            best_token = b.token_start;
+            best_idx = Some(idx);
+        }
+    }
+    let block_idx = match best_idx {
+        Some(i) => i,
+        None => return,
+    };
+
+    // Respect the queue bound; leave headroom for real fault-driven decisions.
+    if inner.pending_decisions.len() >= POLARIS_MAX_PENDING_DECISIONS {
+        return;
+    }
+
+    let decision_id = inner.next_decision_id;
+    let decision = {
+        let block = &inner.blocks[block_idx];
+        PolarisDecision {
+            decision_id,
+            fault_id: 0,
+            generation: 0,
+            op: PolarisDecisionOp::Reload as u32,
+            gpu_id: home_gpu,
+            block_id: block.block_id,
+            session_id: block.session_id,
+            src_handle: 0,
+            dst_handle: 0,
+            src_vaddr: 0,
+            dst_vaddr: block.gpu_vaddr,
+            size_bytes: block.size_bytes,
+            cpu_addr: block.cpu_buf_addr,
+            access_flags: 0,
+            timeout_ms: 0,
+            _reserved: [0u64; 4],
+        }
+    };
+
+    // Only commit the queue push if it succeeds; on failure leave the block
+    // untouched (it will reload normally on demand).
+    match inner.pending_decisions.push(decision, GFP_KERNEL) {
+        Ok(()) => {
+            inner.next_decision_id += 1;
+            let block = &mut inner.blocks[block_idx];
+            block.state = PolarisBlockState::ReloadPending;
+            block.pending_decision_id = decision_id;
+            block.pending_fault_id = 0;
+            block.pending_generation = 0;
+            // No completion_ptr / fault waiter: this is speculative, so nothing
+            // is blocked waiting on it. COMPLETE_OPERATION transitions it to
+            // Resident, and a later real fault on it hits the cheap bridge-map.
+            POLARIS_PREFETCH_SCHEDULED.fetch_add(1, Relaxed);
+        }
+        Err(_) => {}
+    }
+}
+
 fn polaris_cancel_prepared_offload(inner: &mut PolarisInner, prepared: PolarisPreparedOffload) {
     if let Some(block) = inner
         .blocks
@@ -2587,6 +2690,7 @@ impl core::fmt::Write for BufWriter<'_> {
 // may not work if as_char_ptr is not const fn.
 const STATS_NAME_BYTES: &[u8] = b"stats\0";
 const DRIVER_CACHE_NAME_BYTES: &[u8] = b"driver_cache\0";
+const PREFETCH_NAME_BYTES: &[u8] = b"prefetch\0";
 
 // Newtype wrapper so we can safely mark the kobj_attribute as Sync.
 // The attribute is write-once (at module init) then read-only forever;
@@ -2650,6 +2754,51 @@ unsafe extern "C" fn polaris_driver_cache_store(
     };
     POLARIS_DRIVER_CACHE_ENABLED.store(val, Relaxed);
     pr_info!("POLARIS: driver_cache = {}\n", val);
+    count as isize
+}
+
+static POLARIS_PREFETCH_ATTR: PolarisStatsAttr = PolarisStatsAttr(bindings::kobj_attribute {
+    attr: bindings::attribute {
+        name: PREFETCH_NAME_BYTES.as_ptr() as *const kernel::ffi::c_char,
+        mode: 0o644,
+    },
+    show: Some(polaris_prefetch_show),
+    store: Some(polaris_prefetch_store),
+});
+
+unsafe extern "C" fn polaris_prefetch_show(
+    _kobj: *mut bindings::kobject,
+    _attr: *mut bindings::kobj_attribute,
+    buf: *mut kernel::ffi::c_char,
+) -> isize {
+    let v = POLARIS_PREFETCH_ENABLED.load(Relaxed);
+    // SAFETY: sysfs guarantees buf is at least PAGE_SIZE bytes.
+    let buf_slice = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, 16) };
+    let s = if v != 0 { b"1\n\0" } else { b"0\n\0" };
+    buf_slice[..s.len()].copy_from_slice(s);
+    (s.len() - 1) as isize
+}
+
+unsafe extern "C" fn polaris_prefetch_store(
+    _kobj: *mut bindings::kobject,
+    _attr: *mut bindings::kobj_attribute,
+    buf: *const kernel::ffi::c_char,
+    count: usize,
+) -> isize {
+    const NEG_EINVAL: isize = -22;
+    if buf.is_null() || count == 0 {
+        return NEG_EINVAL;
+    }
+    // SAFETY: sysfs gives us a kernel buffer of `count` bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+    let first = bytes.iter().find(|&&b| b != b' ' && b != b'\t').copied();
+    let val: u32 = match first {
+        Some(b'0') => 0,
+        Some(b'1') => 1,
+        _ => return NEG_EINVAL,
+    };
+    POLARIS_PREFETCH_ENABLED.store(val, Relaxed);
+    pr_info!("POLARIS: prefetch = {}\n", val);
     count as isize
 }
 
@@ -2740,6 +2889,7 @@ unsafe extern "C" fn polaris_stats_show(
     let uvm_rejected = POLARIS_UVM_FAULT_REJECTED.load(Relaxed);
     let uvm_errors = POLARIS_UVM_FAULT_ERRORS.load(Relaxed);
     let uvm_cached_map_hits = POLARIS_UVM_CACHED_MAP_HITS.load(Relaxed);
+    let prefetch_scheduled = POLARIS_PREFETCH_SCHEDULED.load(Relaxed);
     let uvm_acct_calls = POLARIS_UVM_ACCESS_COUNTER_CALLS.load(Relaxed);
     let uvm_acct_touches = POLARIS_UVM_ACCESS_COUNTER_TOUCHES.load(Relaxed);
     let uvm_vab_dumps = POLARIS_UVM_VAB_DUMPS.load(Relaxed);
@@ -2846,6 +2996,7 @@ uvm_deferred:   {uvm_deferred}
 uvm_rejected:   {uvm_rejected}
 uvm_errors:     {uvm_errors}
 uvm_cached_map_hits:{uvm_cached_map_hits}
+prefetch_scheduled:{prefetch_scheduled}
 uvm_acct_calls: {uvm_acct_calls}
 uvm_acct_touches:{uvm_acct_touches}
 uvm_vab_dumps:  {uvm_vab_dumps}
@@ -2916,6 +3067,7 @@ uvm_recent3:    fault=0x{recent3_fault:x} result={recent3_result} access={recent
                 uvm_rejected = uvm_rejected,
                 uvm_errors = uvm_errors,
                 uvm_cached_map_hits = uvm_cached_map_hits,
+                prefetch_scheduled = prefetch_scheduled,
                 uvm_acct_calls = uvm_acct_calls,
                 uvm_acct_touches = uvm_acct_touches,
                 uvm_vab_dumps = uvm_vab_dumps,
@@ -3025,6 +3177,21 @@ fn init_polaris_sysfs() -> Result<*mut bindings::kobject> {
     }
 
     pr_info!("POLARIS: /sys/kernel/polaris/{{stats,driver_cache}} created\n");
+
+    // Best-effort: the prefetch toggle is optional. If creation fails the module
+    // still functions (prefetch simply stays unavailable), so don't unwind.
+    // SAFETY: polaris_kobj is valid; POLARIS_PREFETCH_ATTR is 'static.
+    let ret = unsafe {
+        bindings::sysfs_create_file_ns(
+            polaris_kobj,
+            &raw const POLARIS_PREFETCH_ATTR.0.attr as *const bindings::attribute,
+            core::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        pr_err!("POLARIS: failed to create sysfs prefetch attribute (err {ret})\n");
+    }
+
     Ok(polaris_kobj)
 }
 
@@ -3134,6 +3301,11 @@ impl PinnedDrop for PolarisModule {
             // in-flight readers, so after it returns no one can call
             // polaris_stats_show anymore.
             unsafe {
+                bindings::sysfs_remove_file_ns(
+                    self.polaris_kobj,
+                    &raw const POLARIS_PREFETCH_ATTR.0.attr as *const bindings::attribute,
+                    core::ptr::null(),
+                );
                 bindings::sysfs_remove_file_ns(
                     self.polaris_kobj,
                     &raw const POLARIS_DRIVER_CACHE_ATTR.0.attr as *const bindings::attribute,
@@ -4501,6 +4673,12 @@ impl PolarisDevice {
                     if let Some(gpu) = inner.gpus.iter_mut().find(|g| g.gpu_id == gpu_id) {
                         gpu.used_bytes += sz;
                         gpu.cpu_pool_used_bytes = gpu.cpu_pool_used_bytes.saturating_sub(sz);
+                    }
+                    // A reload just finished — if prefetch is enabled, speculatively
+                    // schedule the next sequential block so the GPU doesn't stall
+                    // faulting on it. Best-effort; runs under the same lock.
+                    if polaris_prefetch_enabled() {
+                        polaris_schedule_prefetch_after_reload(inner, completed_block_id);
                     }
                 }
                 PolarisBlockState::OffloadPending => {
