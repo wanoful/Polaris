@@ -1,6 +1,6 @@
 # POLARIS — Results Summary
 
-*Concise synthesis of the POLARIS v4 experiments. Last data: 2026-07-02.*
+*Concise synthesis of the POLARIS v4 experiments. Last data: 2026-07-08.*
 
 ## What POLARIS is
 
@@ -19,29 +19,44 @@ Reference hardware: RTX 5070 Ti (16 GiB), driver 610.43.02, `v4-fault-hook`.
    spill/reload (5308 offloads / 5052 reloads each). The KV-only fault-driven
    path works end-to-end.
 
-2. **OS-level COW for beam search works and is 38% faster** than independent
+2. **Prefill-under-pressure closed from −44% to −21% vs native** (2026-07-08).
+   Two opt-in optimizations, +41.5% cumulative on Qwen14B 16k @ 2560 MiB:
+   **async offloads** (run eviction copies off the fault-critical path, +15.6%)
+   and **speculative reload prefetch** (exploit ~73% sequential KV access to
+   materialize block N+1 before the GPU faults on it, +20.2%). The bottleneck
+   was the *serialized GPU-fault round-trip latency*, not copy cost — proven by
+   four experiments (a staging cache that made copies 1.8× faster *regressed*).
+
+3. **OS-level COW for beam search works and is 38% faster** than independent
    re-prefill (0.18 s vs 0.29 s), sharing 256 MiB across 7 children at ~37 µs
    per branch.
 
-3. **Multi-session scheduler scales cleanly** to 32 concurrent sessions
+4. **Multi-session scheduler scales cleanly** to 32 concurrent sessions
    sub-second; evictions are exactly `20 × N`.
 
 ## Throughput at a glance (Qwen2.5-14B Q4_K_M, 16384×32)
 
 | mode | prompt tok/s | gen tok/s | notes |
 |---|---:|---:|---|
-| native CUDA | 1310.95 | 76.48 | baseline, no paging |
-| POLARIS no-pressure (16 GiB) | ~820 | ~75.5 | fault-mapping overhead only |
-| POLARIS pressure (2560 MiB, **optimized 06-30**) | **~736** | ~75.0 | real spill/reload |
-| POLARIS pressure (2560 MiB, pre-opt 06-17) | ~154 (FIFO) | ~74 | before short-circuit |
+| native CUDA | ~1310 | 76.5 | baseline, no paging |
+| POLARIS no-pressure (16 GiB) | **~1285** | ~75.7 | near-native; fault-mapping overhead only |
+| POLARIS pressure 2560 MiB — sync baseline | 736 | ~75 | pre-optimization (2026-06-30) |
+| POLARIS pressure 2560 MiB — + async offloads | 851 | ~75 | +15.6% |
+| POLARIS pressure 2560 MiB — + prefetch (4 MiB blocks) | **1042** | ~75.7 | **+41.5% cumulative; −21% vs native** |
 
+- **No-pressure prefill is already near-native (~1285, −2%).** The old "~820 /
+  −37%" figure was pre-06-30 data; the `driver_cache` short-circuit + eager shim
+  reserve closed that gap. The remaining prefill penalty is only under *pressure*.
+- **The pressure penalty is a latency-hiding problem, not a copy-cost one.**
+  Reload traffic is ~40 GB over a ~22 s prefill = ~1.8 GB/s vs ~25 GB/s of PCIe;
+  transfers hide behind compute once reloads are made proactive (prefetch)
+  instead of fault-blocked. Both optimizations are **opt-in and off by default**
+  (`POLARISD_ASYNC_OFFLOAD=1`, `/sys/kernel/polaris/prefetch`); prefetch is a
+  clean no-op when the working set fits (verified no-pressure and 3072 MiB).
 - **Decode throughput is free only while the active KV fits the budget**
-  (~75 vs 76 native at low pressure) — the paging cost is paid in prefill. Once
-  decode itself must page, it falls to ~21–30% of native (see the pressure rows
-  in "Compared with plain llama.cpp" below).
-- Prefill overhead vs native reflects the fault-driven mapping path; the
-  short-circuit fires ~46–47k times/run on long prompts (it is dead code on
-  short-prompt SmolLM2 workloads, where UVM's own PTE cache absorbs the faults).
+  (~75 vs 76 native at low pressure), unchanged by these prefill optimizations.
+  Once decode itself must page, it falls to ~21–30% of native (see the pressure
+  rows in "Compared with plain llama.cpp" below) — this case is not yet addressed.
 
 ## Compared with plain llama.cpp: gains and losses
 
@@ -72,32 +87,35 @@ is same-engine (llama.cpp on both sides); only the KV allocator differs.
 
 | metric | plain llama.cpp | POLARIS | delta |
 |---|---:|---:|---:|
-| Qwen14B prefill, no-pressure (16 GiB) | 1310.95 | 820.32 | **−37%** |
-| Qwen14B prefill, under spill (2560 MiB, optimized) | 1310.95 | ~736 | **−44%** |
+| Qwen14B prefill, no-pressure (16 GiB) | ~1310 | ~1285 | **−2%** |
+| Qwen14B prefill, under spill (2560 MiB, async+prefetch) | ~1310 | ~1042 | **−21%** |
 | Qwen14B **decode, no-pressure** | 76.81 | 75.65 | −1.5% |
 | Qwen14B **decode, under budget pressure** | 76.81 | 22.83 | **−70% (→30% of native)** |
 | SmolLM2 **decode, no-pressure** | 921.77 | 750.73 | −19% |
 | SmolLM2 **decode, under budget pressure** | 921.77 | 196.38 | **−79% (→21% of native)** |
 
-- **Prefill is 1.6–1.8× slower** — fault-driven mapping + UVM bridge crossings
-  on first touch of each KV chunk. Even the ~266× bridge-map reduction
-  (§ headline #2) does not close this vs a pure in-VRAM allocator.
+- **Prefill is ~1.27× slower under spill** (was ~1.6–1.8× before the 2026-07-08
+  optimizations), and near-native (−2%) when the KV fits. The gap that remains
+  under pressure is the residual fault-servicing cost the sequential prefetch
+  cannot fully hide.
 - **Decode is not improved — and collapses under pressure.** It is near-native
   *only when the active KV fits the residency budget* (no spill). Once decode
-  itself must page, throughput falls to **~21–30% of native**, because the run
-  spends most of its time in daemon RM copy / offload / reload. The RM copy path
-  is the throughput limiter, not the policy.
+  itself must page, throughput falls to **~21–30% of native**. The prefill
+  optimizations do not touch this — decode-under-pressure remains open work.
 - **Long-context *generation* under pressure is essentially untested.** The
-  near-native decode numbers come from 32-token decode tails where most KV stays
+  near-native decode numbers come from decode tails where most KV stays
   resident. Sustained long-generation with a spilled KV history — the
   thrashing-prone case — is listed as open work in the README.
-- **There is a thrashing floor.** Too small a budget (1 GiB on the 14B model)
-  drives runaway offload/reload — >27k migrations in ~4 min, never completing.
+- **There is a thrashing floor.** Too small a budget (1 GiB on the 14B model,
+  or 2048 MiB with these optimizations) drives runaway offload/reload that never
+  completes — the prefetch/async wins apply in the *productive* paging regime,
+  not the pathological one.
 - **Operational cost:** patched NVIDIA UVM, root, an out-of-tree kernel module +
   daemon, and `uvm_enable_builtin_tests=1`. Plain llama.cpp needs none of this.
 
 **Net:** POLARIS buys *KV-aware, shareable, controllable* off-VRAM KV residency —
-not speed. Prefill costs ~1.6–1.8×; decode is near-native only while the working
+not speed. Prefill is near-native when the KV fits (−2%) and ~1.27× under spill
+after the 2026-07-08 optimizations; decode is near-native only while the working
 set fits the budget and degrades to ~1/3–1/5 native once decode itself pages.
 Whether this beats plain UVM-managed KV is not yet measured.
 
@@ -119,19 +137,29 @@ access-phase hint is wired through yet (`KV hint epoch = 0`).
 
 The KV-only paging path is **correct and functional** for the llama.cpp
 integration: a 14B model runs at 16k context on a 16 GiB card under forced
-spill/reload with no correctness errors, and decode stays near-native **as long
-as the active KV fits the residency budget**. It does not make llama.cpp faster
-— prefill costs ~1.6–1.8× and decode collapses to ~1/3–1/5 native once decode
-itself pages. The oversubscription capability itself is UVM's; POLARIS's
-contribution is the KV-aware control, sharing, and eviction layered on top —
-whose value over plain UVM-managed KV is **not yet benchmarked**. The next gains
-are **not** in eviction policy but in cutting RM copy / offload cost and in
-exposing **workload-aware KV access hints** (prefill/decode phase, active
-window) so the policy can protect the true working set — see the
-[Vidmem Access Bit Buffer] direction.
+spill/reload with no correctness errors. Prefill is near-native when the KV fits
+and, after the 2026-07-08 optimizations, ~1.27× under spill (gap −44% → −21% vs
+native); decode stays near-native **as long as the active KV fits the residency
+budget** and still collapses to ~1/3–1/5 native once decode itself pages. The
+oversubscription capability itself is UVM's; POLARIS's contribution is the
+KV-aware control, sharing, and eviction layered on top — whose value over plain
+UVM-managed KV is **not yet benchmarked**.
+
+The optimization study **corrected the earlier forward-look**: cutting RM copy
+*cost* is **not** the lever — a UVM staging cache that made each copy 1.8× faster
+regressed overall, because the daemon is ~90% idle and copies are ~8% of wall
+time. The bottleneck is the **serialized GPU-fault round-trip latency**, and the
+wins came from hiding migration behind compute: **async offloads** (off the
+critical path) and **sequential-access prefetch** (a concrete realization of the
+workload-aware-hint direction). Remaining open work: **decode-under-pressure**
+(untouched by these prefill optimizations), a "don't-prefetch-when-budget-
+critical" guard, and the intermittent setup-time `BLOCK_RESERVE` flake.
 
 ## Sources
 
+- `benchmarks/reports/prefill-pressure-optimization-study-20260708.md` (async
+  offloads, block-size sweep, staging cache, eager reserve, prefetch, and the
+  broader validation across budgets/shapes)
 - `benchmarks/reports/2026-06-30-final-experiments.md` (driver_cache ablation,
   clean policy compare, concurrent scheduler, beam COW)
 - `benchmarks/analysis/policy-trace-attention-stream-r3-20260702T113904Z/summary.md`
