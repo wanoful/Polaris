@@ -84,16 +84,23 @@ is same-engine (llama.cpp on both sides); only the KV allocator differs.
 - **Correctness under real spill** is demonstrated: Qwen14B @ 16k on a 16 GiB
   card under a 2560 MiB budget, 5308 offloads / 5052 reloads, `uvm_errors = 0`.
 
-### What you losez
+### What you lose
+
+Budget context matters: the prefill rows below are at a **2560 MiB** budget
+(n=3); the **decode-under-pressure** rows are at a deliberately pathological
+**4 MiB** budget, `llama-bench -p 128 -n 32` capability probe (SmolLM2 n=3;
+Qwen effectively n=1) — a "does it survive extreme oversubscription" result,
+not a tuned-performance result. The two "under pressure" regimes are not
+comparable.
 
 | metric | plain llama.cpp | POLARIS | delta |
 |---|---:|---:|---:|
 | Qwen14B prefill, no-pressure (16 GiB) | ~1310 | ~1285 | **−2%** |
-| Qwen14B prefill, under spill (2560 MiB, async+prefetch) | ~1310 | ~1042 | **−21%** |
+| Qwen14B prefill, under spill (2560 MiB, async+prefetch, n=3) | ~1310 | ~1042 | **−21%** |
 | Qwen14B **decode, no-pressure** | 76.81 | 75.65 | −1.5% |
-| Qwen14B **decode, under budget pressure** | 76.81 | 22.83 | **−70% (→30% of native)** |
+| Qwen14B **decode, 4 MiB budget capability probe (n=1)** | 76.81 | 22.83 | **−70% (→30% of native)** |
 | SmolLM2 **decode, no-pressure** | 921.77 | 750.73 | −19% |
-| SmolLM2 **decode, under budget pressure** | 921.77 | 196.38 | **−79% (→21% of native)** |
+| SmolLM2 **decode, 4 MiB budget capability probe (n=3)** | 921.77 | 196.38 | **−79% (→21% of native)** |
 
 - **Prefill is ~1.27× slower under spill** (was ~1.6–1.8× before the 2026-07-08
   optimizations), and near-native (−2%) when the KV fits. The gap that remains
@@ -167,5 +174,5 @@ critical" guard, and the intermittent setup-time `BLOCK_RESERVE` flake.
 - `benchmarks/reports/qwen14b-polaris-policy-compare-20260617.md`
 - `benchmarks/reports/qwen14b-polaris-kv-16k-20260616.md`
 - `benchmarks/reports/llama-polaris-vs-original-frameworks-20260616.md`
-
-[Vidmem Access Bit Buffer]: ../benchmarks/README.md
+- `docs/llm-serving-polaris-injection-comparison-20260619.md` (decode-under-
+  pressure 4 MiB capability probe numbers in the "What you lose" table)

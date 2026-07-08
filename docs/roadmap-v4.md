@@ -293,13 +293,12 @@ Keep most of v3's identity; change the control surface.
   - The "require_resident → lease → launch → release" cycle. Keep code
     behind a feature flag for diagnostics only.
 
-### polaris-runtime
+### polaris-runtime (removed)
 
-- Keep CUDA VMM wrappers for diagnostic and v3-fallback paths.
-- Add a minimal init/shutdown surface the shim can call.
-- The framework-visible runtime is mostly *not* the v4 integration point —
-  the shim is. polaris-runtime becomes a library the shim links, not a
-  thing frameworks call directly.
+- **Removed.** This crate held the v3 explicit-lease CUDA-VMM runtime. It had
+  no production callers (the shim never linked it), so it was deleted along
+  with the rest of the v3 CUDA-VMM fallback. Daemon-owned RM backing is now the
+  only residency executor. See the README "Performance defaults" section.
 
 ### Integrations
 
@@ -570,8 +569,9 @@ Still to do on the Polaris side for M1/M2:
   refaults successfully. This closes the kernel ABI gap for daemon/runtime
   executors to publish UVM-bridge-mapable residency, but the executor still
   needs real daemon-owned RM allocation and host/device copy wiring.
-- Daemon-owned RM allocation/free slice wired: `polarisd` now has an opt-in
-  `POLARISD_RM_BACKING=1` backend that opens RM, creates a root client/device/
+- Daemon-owned RM allocation/free slice wired: `polarisd`'s RM backend (since
+  made the unconditional default; the `POLARISD_RM_BACKING=1` flag it was
+  introduced behind is now a no-op) opens RM, creates a root client/device/
   subdevice, allocates `NV01_MEMORY_LOCAL_USER` per `ALLOC` decision, and
   returns the real daemon-owned `(rm_control_fd, h_client, h_memory, length)`
   tuple through `POLARIS_COMPLETE_OPERATION`. `FREE` decisions release the
@@ -686,14 +686,14 @@ Still to do on the Polaris side for M1/M2:
   rejection (`--spill-validation`); positive RM-backed copy coverage now lives
   in the RM roundtrip and llama gates below because real RM copy requires an
   observed UVM VA-space context.
-- Positive daemon/runtime spill test wired: the ignored root/GPU
-  `polaris-runtime` fault-smoke creates a resident logical block through the
-  runtime decision worker, writes a CUDA-visible pattern, calls
-  `POLARIS_SPILL_BLOCK`, verifies the OFFLOAD completion moves the block to
-  `CpuOffloaded`, reloads the same VA through overwrite reserve, and checks
-  the bytes survive the device → host → device cycle. A separate long-running
-  `polarisd` process soak remains useful, but the production decision path is
-  no longer covered only by fake executor state-machine tests.
+- Positive daemon/runtime spill test (removed with `polaris-runtime`): an
+  ignored root/GPU `polaris-runtime` fault-smoke previously created a resident
+  logical block through the runtime decision worker, wrote a CUDA-visible
+  pattern, called `POLARIS_SPILL_BLOCK`, and checked bytes survived the
+  device → host → device cycle. That crate has been deleted; the same
+  production decision path is now covered by the daemon-backed RM spill/reload
+  gates in `tests/m2/` (e.g. `--daemon-rm-spill-reload-roundtrip`), which do
+  not depend on `polaris-runtime` or fake executor state-machine tests.
 - Positive RM harness spill/reload test wired:
   `tests/m2/m2_static_block_setup --rm-spill-reload-roundtrip` writes a
   deterministic userspace pattern into RM backing with `POLARIS_RM_COPY`,
@@ -1287,11 +1287,13 @@ beats the v3 lease path on a real workload.
 
 ## Migration From v3
 
-- v3 explicit-lease API: keep behind `--legacy-lease` for diagnostics.
+- v3 explicit-lease API: removed (was never ported to a `--legacy-lease` flag).
 - v3 kernel block-state machine: keep, polaris.ko v4 builds on it.
-- v3 offload/reload mechanics in polaris-runtime: keep for diagnostic
-  shell. Production reload now goes through `uvm_polaris_map_external_allocation`.
-- v3 llama.cpp fault-worker mode: delete.
+- v3 offload/reload mechanics in polaris-runtime: removed with the crate.
+  Production reload goes through `uvm_polaris_map_external_allocation` and
+  daemon-owned RM backing.
+- v3 llama.cpp fault-worker mode: deleted (lives only on a stale llama.cpp
+  branch, not on the integration path).
 - v3 README claims about production replayable-fault paging: rewrite
   once M5 lands.
 

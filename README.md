@@ -49,6 +49,10 @@ Polaris pointers remain guarded.
   removed.
 - **libpolaris-shim.so**: bootstraps the fault-capable RM/UVM VA-space and
   selects llama.cpp KV-cache allocations without source changes.
+- **tests/m2/**: root/GPU bring-up and hardening gates for the UVM bridge,
+  daemon-backed RM spill/reload, COW, OOM pressure, and module unload stress.
+- **integrations/llama.cpp/**: current llama.cpp operating contract and
+  root/GPU regression instructions.
 
 ## Performance defaults
 
@@ -63,10 +67,6 @@ The high-throughput paths are on by default (they were previously opt-in):
 
 `POLARISD_RM_BACKING=1` still appears in test/benchmark launchers; it is now a
 no-op since RM backing is unconditional.
-- **tests/m2/**: root/GPU bring-up and hardening gates for the UVM bridge,
-  daemon-backed RM spill/reload, COW, OOM pressure, and module unload stress.
-- **integrations/llama.cpp/**: current llama.cpp operating contract and
-  root/GPU regression instructions.
 
 ## Build Checks
 
