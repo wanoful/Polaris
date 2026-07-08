@@ -97,6 +97,13 @@ sudo -E make m6-module-unload-stress NVIDIA_KO_DIR=../open-gpu-kernel-modules
 
 llama.cpp/POLARIS benchmark:
 
+> Note: `POLARIS_LLAMA_KV_HINTS=1` and `POLARIS_BENCH_EVICTION_POLICY=phase_aware`
+> below do not currently change behavior — KV active-window hints are wired but
+> **inert** (`KV hint epoch = 0` in all recorded runs; see the KV-hint note in
+> `docs/roadmap-v4.md`). Also use a hint-capable llama.cpp binary
+> (`../llama.cpp/build/bin/llama-bench`), not the stale `build-polaris` one,
+> or the runner will refuse the hint flag.
+
 ```sh
 sudo env \
   NVIDIA_KO_DIR=../open-gpu-kernel-modules \

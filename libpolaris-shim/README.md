@@ -182,6 +182,13 @@ Freed token spans are coalesced and reused by later allocations, so a workload
 can repeatedly allocate/free within the configured managed window without
 monotonically exhausting it.
 The shim also exposes a KV active-window hint surface for policy experiments.
+**Note: KV hints are wired but currently inert — they do not work in practice.**
+In every recorded run the hint never reaches the kernel (`KV hint epoch = 0`),
+because the benchmarked `build-polaris` llama.cpp binary predates the hint
+commit, the default eviction policy (FIFO) ignores hints, and `token_start` is
+a Polaris chunk index rather than a model token index (so `phase_aware` falls
+back to FIFO). Treat the surface below as a not-yet-effective experiment.
+
 Framework-aware adapters can call `polaris_shim_set_kv_active_window()` and
 `polaris_shim_clear_kv_active_window()` to publish prefill/decode read/write
 token ranges for the shim-owned Polaris session. Framework adapters that know

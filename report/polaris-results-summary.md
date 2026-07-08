@@ -138,8 +138,11 @@ Whether this beats plain UVM-managed KV is not yet measured.
 
 All four are statistically indistinguishable. The prefill-dominated workload
 carries no victim-selection signal the kernel can currently act on:
-`token_start` is a Polaris chunk index, not a model token position, and no KV
-access-phase hint is wired through yet (`KV hint epoch = 0`).
+`token_start` is a Polaris chunk index, not a model token position, and **KV
+active-window hints do not work in practice** — the hint never reaches the
+kernel (`KV hint epoch = 0` in every run), so `phase_aware`/`attention_stream`
+score an empty window and behave like FIFO. Making KV hints effective is open
+work.
 
 ## Bottom line
 
